@@ -27,6 +27,7 @@ import { getVerbosityForModelSync } from '../common/chatModelCapabilities';
 import { rawPartAsCompactionData } from '../common/compactionDataContainer';
 import { rawPartAsPhaseData } from '../common/phaseDataContainer';
 import { getIndexOfStatefulMarker, getStatefulMarkerAndIndex } from '../common/statefulMarkerContainer';
+import { CustomDataPartMimeTypes } from '../common/endpointTypes';
 import { rawPartAsThinkingData } from '../common/thinkingDataContainer';
 import { IChatWebSocketManager } from '../../networking/node/chatWebSocketManager';
 
@@ -330,7 +331,11 @@ function extractThinkingData(content: Raw.ChatCompletionContentPart[]): OpenAI.R
 				return {
 					type: 'reasoning',
 					id: thinkingData.id,
-					summary: [],
+					summary: thinkingData.text
+						? (Array.isArray(thinkingData.text)
+							? thinkingData.text.map(t => ({ type: 'summary_text' as const, text: t }))
+							: [{ type: 'summary_text' as const, text: thinkingData.text }])
+						: [],
 					encrypted_content: thinkingData.encrypted,
 				} satisfies OpenAI.Responses.ResponseReasoningItem;
 			}
@@ -456,15 +461,20 @@ export function responseApiInputToRawMessagesForLogging(body: OpenAI.Responses.R
 					break;
 				}
 				case 'reasoning':
-					// We can't perfectly reconstruct the original thinking data
-					// but we can add a placeholder for logging
 					flushPendingFunctionCalls();
 					messages.push({
 						role: Raw.ChatRole.Assistant,
 						content: [{
-							type: Raw.ChatCompletionContentPartKind.Text,
-							text: `Reasoning summary: ${item.summary.map(s => s.text).join('\n\n')}`
-						}]
+							type: Raw.ChatCompletionContentPartKind.Opaque,
+							value: {
+								type: CustomDataPartMimeTypes.ThinkingData,
+								thinking: {
+									id: item.id,
+									text: item.summary.map(s => s.text),
+									encrypted: item.encrypted_content,
+								}
+							}
+						} as Raw.ChatCompletionContentPartOpaque]
 					});
 					break;
 			}
@@ -868,13 +878,28 @@ export class OpenAIResponsesProcessor {
 					finishReason: FinishedCompletionReason.Stop,
 					message: {
 						role: Raw.ChatRole.Assistant,
-						content: normalizedOutput.map((item): Raw.ChatCompletionContentPart | undefined => {
-							if (item.type === 'message') {
-								return { type: Raw.ChatCompletionContentPartKind.Text, text: item.content.map(c => c.type === 'output_text' ? c.text : c.refusal).join('') };
-							} else if (item.type === 'image_generation_call' && item.result) {
-								return { type: Raw.ChatCompletionContentPartKind.Image, imageUrl: { url: item.result } };
-							}
-						}).filter(isDefined),
+						content: [
+							// Include thinking/reasoning data as Opaque parts for telemetry
+							...normalizedOutput.filter(item => item.type === 'reasoning').map((item): Raw.ChatCompletionContentPart => ({
+								type: Raw.ChatCompletionContentPartKind.Opaque,
+								value: {
+									type: CustomDataPartMimeTypes.ThinkingData,
+									thinking: {
+										id: item.id,
+										text: item.summary?.map(s => s.text) ?? [],
+										encrypted: item.encrypted_content,
+									}
+								}
+							} as Raw.ChatCompletionContentPartOpaque)),
+							// Include text and image content
+							...normalizedOutput.map((item): Raw.ChatCompletionContentPart | undefined => {
+								if (item.type === 'message') {
+									return { type: Raw.ChatCompletionContentPartKind.Text, text: item.content.map(c => c.type === 'output_text' ? c.text : c.refusal).join('') };
+								} else if (item.type === 'image_generation_call' && item.result) {
+									return { type: Raw.ChatCompletionContentPartKind.Image, imageUrl: { url: item.result } };
+								}
+							}).filter(isDefined),
+						],
 					}
 				};
 			}

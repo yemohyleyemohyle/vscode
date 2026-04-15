@@ -191,8 +191,14 @@ export function rawMessageToCAPI(message: Raw.ChatMessage[] | Raw.ChatMessage, c
 	for (const content of message.content) {
 		if (content.type === Raw.ChatCompletionContentPartKind.Opaque) {
 			const data = rawPartAsThinkingData(content);
-			if (callback && data) {
-				callback(out, data);
+			if (data) {
+				if (callback) {
+					callback(out, data);
+				} else {
+					// Default behavior for telemetry path: set CAPI fields directly
+					out.reasoning_opaque = data.id;
+					out.reasoning_text = Array.isArray(data.text) ? data.text.join('') : data.text;
+				}
 			}
 		}
 	}

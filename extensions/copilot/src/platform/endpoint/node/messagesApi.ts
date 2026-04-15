@@ -22,6 +22,7 @@ import { sendEngineMessagesTelemetry } from '../../networking/node/chatStream';
 import { IExperimentationService } from '../../telemetry/common/nullExperimentationService';
 import { ITelemetryService } from '../../telemetry/common/telemetry';
 import { TelemetryData } from '../../telemetry/common/telemetryData';
+import { CustomDataPartMimeTypes } from '../common/endpointTypes';
 
 /**
  * Build the `input_schema` for an Anthropic tool from an arbitrary JSON Schema
@@ -1070,10 +1071,25 @@ export class AnthropicMessagesProcessor {
 					finishReason,
 					message: {
 						role: Raw.ChatRole.Assistant,
-						content: this.textAccumulator ? [{
-							type: Raw.ChatCompletionContentPartKind.Text,
-							text: this.textAccumulator
-						}] : [],
+						content: [
+							// Include thinking data as Opaque parts for telemetry
+							...[...this.thinkingAccumulator.entries()].map(([index, thinking]): Raw.ChatCompletionContentPart => ({
+								type: Raw.ChatCompletionContentPartKind.Opaque,
+								value: {
+									type: CustomDataPartMimeTypes.ThinkingData,
+									thinking: {
+										id: `thinking_${index}`,
+										text: thinking.thinking,
+										encrypted: thinking.signature || undefined,
+									}
+								}
+							} as Raw.ChatCompletionContentPartOpaque)),
+							// Include text content
+							...(this.textAccumulator ? [{
+								type: Raw.ChatCompletionContentPartKind.Text as const,
+								text: this.textAccumulator
+							}] : []),
+						],
 						...(this.completedToolCalls.length > 0 ? {
 							toolCalls: this.completedToolCalls.map(tc => ({
 								id: tc.id,
