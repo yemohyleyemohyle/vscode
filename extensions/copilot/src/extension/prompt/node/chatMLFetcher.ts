@@ -1415,6 +1415,9 @@ export class ChatMLFetcherImpl extends AbstractChatMLFetcher {
 			// This ID is hopefully the one the same as ourRequestId, but it is not guaranteed.
 			// If they are different then we will override the original one we set in telemetryData above.
 			const modelRequestId = getRequestId(response.headers);
+			// >>> DEBUG: trace requestId in _fetchWithInstrumentation — REMOVE THIS BLOCK <<<
+			this._logService.info(`[_fetchWithInstrumentation][DEBUG] ourRequestId=${ourRequestId}, server x-request-id=${modelRequestId.headerRequestId || '(empty)'}, server x-github-request-id=${modelRequestId.gitHubRequestId || '(empty)'}`);
+			// >>> END DEBUG BLOCK <<<
 			// Preserve ourRequestId as headerRequestId if the server didn't echo x-request-id
 			modelRequestId.headerRequestId = modelRequestId.headerRequestId || ourRequestId;
 			telemetryData.extendWithRequestId(modelRequestId);
@@ -1733,6 +1736,9 @@ export class ChatMLFetcherImpl extends AbstractChatMLFetcher {
 		const completions: ChatCompletion[] = [];
 
 		for await (const chatCompletion of response.chatCompletions) {
+			// >>> DEBUG: trace chatCompletion.requestId in processSuccessfulResponse — REMOVE THIS BLOCK <<<
+			this._logService.info(`[processSuccessfulResponse][DEBUG] chatCompletion.requestId.headerRequestId=${chatCompletion.requestId.headerRequestId}, baseTelemetry.headerRequestId=${baseTelemetry.properties.headerRequestId}, ourRequestId(param)=${requestId}`);
+			// >>> END DEBUG BLOCK <<<
 			Telemetry.sendSuccessTelemetry(
 				this._telemetryService,
 				{

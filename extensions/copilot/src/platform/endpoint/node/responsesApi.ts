@@ -796,6 +796,9 @@ export async function processResponseFromChatEndpoint(instantiationService: IIns
 		const requestId = response.headers.get('X-Request-ID') ?? generateUuid();
 		const ghRequestId = response.headers.get('x-github-request-id') ?? '';
 		const { serverExperiments } = getRequestId(response.headers);
+		// >>> DEBUG: trace requestId origin from server response — REMOVE THIS BLOCK <<<
+		logService.info(`[responsesApi][DEBUG] processResponseFromChatEndpoint: X-Request-ID header=${response.headers.get('X-Request-ID')}, resolved requestId=${requestId}, baseTelemetry.headerRequestId=${telemetryData.properties.headerRequestId}`);
+		// >>> END DEBUG BLOCK <<<
 		const processor = instantiationService.createInstance(OpenAIResponsesProcessor, telemetryData, telemetryService, requestId, ghRequestId, serverExperiments, compactionThreshold);
 		const parser = new SSEParser((ev) => {
 			try {

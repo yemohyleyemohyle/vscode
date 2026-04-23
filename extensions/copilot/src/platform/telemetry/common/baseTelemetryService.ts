@@ -105,6 +105,11 @@ export class BaseTelemetryService implements ITelemetryService {
 
 	sendTelemetryEvent(eventName: string, destination: TelemetryDestination, properties?: TelemetryEventProperties | undefined, measurements?: TelemetryEventMeasurements | undefined): void {
 		properties = { ...properties, ...this._sharedProperties };
+		// >>> DEBUG: trace requestId through baseTelemetryService — REMOVE THIS BLOCK <<<
+		if (eventName === 'response.success' && properties) {
+			console.log(`[baseTelemetryService][DEBUG] response.success: requestId after sharedProperties merge=${properties['requestId']}, sharedProperties keys=${Object.keys(this._sharedProperties).join(',')}`);
+		}
+		// >>> END DEBUG BLOCK <<<
 		if (destination.github) {
 			this._ghTelemetrySender.sendTelemetryEvent(this._getEventName(eventName, destination.github), properties, measurements);
 		}

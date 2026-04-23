@@ -238,6 +238,7 @@ export class ChatMLFetcherTelemetrySender {
 				resumeEventSeen: resumeEventSeen ? 1 : 0,
 			};
 			console.log(`[response.success][DEBUG] event sent to GH+MSFT telemetry, properties: ${JSON.stringify(_props)}, measurements: ${JSON.stringify(_meas)}`);
+			console.log(`[response.success][DEBUG] requestId sources: chatCompletion.requestId.headerRequestId=${chatCompletion.requestId.headerRequestId}, baseTelemetry.properties.headerRequestId=${baseTelemetry?.properties.headerRequestId}, baseTelemetry.properties.messageId=${baseTelemetry?.properties.messageId}`);
 		}
 		// >>> END DEBUG BLOCK <<<
 	}

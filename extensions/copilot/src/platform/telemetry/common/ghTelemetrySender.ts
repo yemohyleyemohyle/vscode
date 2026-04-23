@@ -65,6 +65,16 @@ export class BaseGHTelemetrySender implements ITelemetrySender {
 	}
 
 	sendTelemetryEvent(eventName: string, properties?: TelemetryEventProperties | undefined, measurements?: TelemetryEventMeasurements | undefined): void {
+		// >>> DEBUG: trace requestId through GH telemetry sender — REMOVE THIS BLOCK <<<
+		if (eventName.includes('response.success') && properties) {
+			const incomingRequestId = properties['requestId'];
+			const prepared = this.markAsIssuedAndMakeReadyForSending(properties, measurements);
+			const outgoingRequestId = prepared.properties['requestId'];
+			console.log(`[ghTelemetrySender][DEBUG] response.success: incomingRequestId=${incomingRequestId}, outgoingRequestId=${outgoingRequestId instanceof Object ? (outgoingRequestId as any).value : outgoingRequestId}`);
+			this._standardTelemetryLogger.logUsage(eventName, prepared);
+			return;
+		}
+		// >>> END DEBUG BLOCK <<<
 		this._standardTelemetryLogger.logUsage(eventName, this.markAsIssuedAndMakeReadyForSending(properties, measurements));
 	}
 	sendTelemetryErrorEvent(eventName: string, properties?: TelemetryEventProperties | undefined, measurements?: TelemetryEventMeasurements | undefined): void {
