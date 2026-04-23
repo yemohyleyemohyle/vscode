@@ -448,6 +448,15 @@ export function sendEngineMessagesTelemetry(telemetryService: ITelemetryService,
 		messagesJson: JSON.stringify(messages),
 	});
 	telemetryService.sendEnhancedGHTelemetryEvent('engine.messages', multiplexProperties(telemetryDataWithPrompt.properties), telemetryDataWithPrompt.measurements);
+
+	// >>> DEBUG: log output engine.messages telemetry payload — REMOVE THIS BLOCK <<<
+	if (isOutput) {
+		const _props = multiplexProperties(telemetryDataWithPrompt.properties);
+		const _meas = telemetryDataWithPrompt.measurements;
+		logService?.info(`[engine.messages][DEBUG] output event sent to GH telemetry, properties: ${JSON.stringify(_props)}, measurements: ${JSON.stringify(_meas)}`);
+	}
+	// >>> END DEBUG BLOCK <<<
+
 	// Commenting this out to test a new deduplicated way to collect the same information using sendModelTelemetryEvents()
 	// TO DO remove this line completely if the new way allows for complete reconstruction of entire message arrays with much lower drop rate
 	//telemetryService.sendInternalMSFTTelemetryEvent('engine.messages', multiplexProperties(telemetryDataWithPrompt.properties), telemetryDataWithPrompt.measurements);
