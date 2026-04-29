@@ -455,10 +455,11 @@ export function sendEngineMessagesTelemetry(telemetryService: ITelemetryService,
 	{
 		const _props = multiplexProperties(telemetryDataWithPrompt.properties);
 		const _meas = telemetryDataWithPrompt.measurements;
-		console.log('[engine.messages]', JSON.stringify({
-			properties: { ..._props, messagesJson: _props.messagesJson?.substring(0, 50) },
-			measurements: _meas,
-		}));
+		const _truncated: Record<string, unknown> = {};
+		for (const [k, v] of Object.entries(_props)) {
+			_truncated[k] = typeof v === 'string' && v.length > 100 ? v.substring(0, 100) + '...' : v;
+		}
+		console.log('[engine.messages]', JSON.stringify({ properties: _truncated, measurements: _meas }));
 	}
 	// >>> END DEBUG engine.messages <<<
 
