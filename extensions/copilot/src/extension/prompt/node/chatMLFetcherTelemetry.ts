@@ -210,6 +210,59 @@ export class ChatMLFetcherTelemetrySender {
 			suspendEventSeen: suspendEventSeen ? 1 : 0,
 			resumeEventSeen: resumeEventSeen ? 1 : 0,
 		});
+
+		// >>> DEBUG: log response.success telemetry payload <<<
+		console.log('[response.success][DEBUG] Properties:', JSON.stringify({
+			reason: chatCompletion.finishReason,
+			filterReason: chatCompletion.filterReason,
+			source: baseTelemetry?.properties.messageSource ?? 'unknown',
+			initiatorType: userInitiatedRequest ? 'user' : 'agent',
+			requestKind: interactionType,
+			conversationId: baseTelemetry?.properties.conversationId,
+			model: chatEndpointInfo?.model,
+			modelInvoked: chatCompletion.model,
+			apiType: chatEndpointInfo?.apiType,
+			requestId: chatCompletion.requestId.headerRequestId,
+			gitHubRequestId: chatCompletion.requestId.gitHubRequestId,
+			associatedRequestId: baseTelemetry?.properties.associatedRequestId,
+			parentRequestId: baseTelemetry?.properties.parentRequestId,
+			reasoningEffort: requestBody.reasoning?.effort ?? requestBody.output_config?.effort,
+			reasoningSummary: requestBody.reasoning?.summary,
+			modelCallId,
+			subType: baseTelemetry?.properties.subType,
+			parentModelCallId: baseTelemetry?.properties.parentModelCallId,
+			iterationNumber: baseTelemetry?.properties.iterationNumber,
+			fetcher,
+			transport,
+			retryAfterError: baseTelemetry?.properties.retryAfterError,
+			retryAfterErrorGitHubRequestId: baseTelemetry?.properties.retryAfterErrorGitHubRequestId,
+			connectivityTestError: baseTelemetry?.properties.connectivityTestError,
+			connectivityTestErrorGitHubRequestId: baseTelemetry?.properties.connectivityTestErrorGitHubRequestId,
+			retryAfterFilterCategory: baseTelemetry?.properties.retryAfterFilterCategory,
+		}));
+		console.log('[response.success][DEBUG] Measures:', JSON.stringify({
+			totalTokenMax: chatEndpointInfo?.modelMaxPromptTokens ?? -1,
+			tokenCountMax: maxResponseTokens,
+			promptTokenCount: chatCompletion.usage?.prompt_tokens,
+			promptCacheTokenCount: chatCompletion.usage?.prompt_tokens_details?.cached_tokens,
+			clientPromptTokenCount: promptTokenCount,
+			tokenCount: chatCompletion.usage?.total_tokens,
+			reasoningTokens: chatCompletion.usage?.completion_tokens_details?.reasoning_tokens,
+			acceptedPredictionTokens: chatCompletion.usage?.completion_tokens_details?.accepted_prediction_tokens,
+			rejectedPredictionTokens: chatCompletion.usage?.completion_tokens_details?.rejected_prediction_tokens,
+			completionTokens: chatCompletion.usage?.completion_tokens,
+			timeToFirstToken,
+			timeToFirstTokenEmitted,
+			timeToComplete: Date.now() - baseTelemetry.issuedTime,
+			issuedTime: baseTelemetry.issuedTime,
+			isVisionRequest: hasImageMessages ? 1 : -1,
+			isBYOK: isBYOKModel(chatEndpointInfo),
+			isAuto: isAutoModel(chatEndpointInfo),
+			bytesReceived,
+			suspendEventSeen: suspendEventSeen ? 1 : 0,
+			resumeEventSeen: resumeEventSeen ? 1 : 0,
+		}));
+		// >>> END DEBUG: log response.success telemetry payload <<<
 	}
 
 	public static sendCancellationTelemetry(
