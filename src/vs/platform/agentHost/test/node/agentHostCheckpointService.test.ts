@@ -176,6 +176,31 @@ suite('AgentHostCheckpointService', () => {
 		});
 	});
 
+	test('exposes a turn start after its queued capture completes', async () => {
+		const { chat, session, service, workingDirectory } = createTestService(async () => 'start-tree');
+
+		const capture = service.captureTurnStartCheckpoint(session, chat, 'turn-5', [workingDirectory]);
+		const state = await service.getTurnStartCheckpointState(session, chat, 'turn-5');
+		await capture;
+
+		assert.deepStrictEqual(state, [{ repository: workingDirectory, tree: 'start-tree' }]);
+	});
+
+	test('waits for queued end capture before resolving a checkpoint pair', async () => {
+		let capture = 0;
+		const { chat, session, service, workingDirectory } = createTestService(async () => `tree-${++capture}`);
+		await service.captureTurnStartCheckpoint(session, chat, 'turn-5', [workingDirectory]);
+
+		const endCapture = service.captureTurnCheckpoint(session, chat, 'turn-5', [workingDirectory]);
+		const pair = await service.waitForTurnCheckpointPair(session, chat, 'turn-5', workingDirectory);
+		await endCapture;
+
+		assert.deepStrictEqual(pair, {
+			parent: 'commit-1',
+			current: 'refs/agents/session/checkpoints/turn/5',
+		});
+	});
+
 	test('checks an existing baseline once per repository in each operation', async () => {
 		const { gitService, session, service, workingDirectory } = createTestService(async () => 'tree');
 		let lookups = 0;

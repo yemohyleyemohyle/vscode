@@ -27,6 +27,7 @@ import { PersistedFailedTurnsContribution } from './persistedFailedTurns/persist
 import { PullRequestChatContribution } from './pullRequest/pullRequestChatContribution.js';
 import { SessionWorkspaceConversionContribution } from './sessionWorkspaceConversion/sessionWorkspaceConversionContribution.js';
 import { QueueDrainContribution } from './queueDrain/queueDrainContribution.js';
+import { RequestDiffSurvivalContribution } from './requestDiffSurvival/requestDiffSurvivalContribution.js';
 import { RemoteSessionOriginContribution } from './remoteSessionOrigin/remoteSessionOriginContribution.js';
 import { ScheduledChatMovesContribution } from './scheduledChatMoves/scheduledChatMovesContribution.js';
 import { SessionFlagsContribution } from './sessionFlags/sessionFlagsContribution.js';
@@ -57,6 +58,7 @@ export function registerBuiltInChatContributions(
 	registrations.add(contributions.registerContribution(PersistedFailedTurnsContribution));
 	registrations.add(contributions.registerContribution(WorktreeAnnouncementContribution));
 	registrations.add(contributions.registerContribution(CheckpointAndChangesetContribution));
+	registrations.add(contributions.registerContribution(RequestDiffSurvivalContribution));
 	registrations.add(contributions.registerContribution(SessionWorkspaceConversionContribution));
 	registrations.add(contributions.registerContribution(ScheduledChatMovesContribution));
 	registrations.add(contributions.registerContribution(QueueDrainContribution));

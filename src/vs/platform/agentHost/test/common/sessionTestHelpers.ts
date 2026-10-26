@@ -930,10 +930,12 @@ export class RecordingCheckpointService implements IAgentHostCheckpointService {
 		this.baselineCalls.push({ session: sessionUri.toString(), workingDirectories: workingDirectories?.map(w => w.toString()) });
 	}
 	async captureTurnStartCheckpoint(): Promise<void> { }
+	async getTurnStartCheckpointState(): Promise<undefined> { return undefined; }
 	async captureTurnCheckpoint(): Promise<void> { }
 	async discardTurnStartCheckpoint(): Promise<void> { }
 	async discardChatTurnStartCheckpoints(): Promise<void> { }
 	async getTurnCheckpointPair(): Promise<{ parent: string; current: string } | undefined> { return undefined; }
+	async waitForTurnCheckpointPair(): Promise<{ parent: string; current: string } | undefined> { return undefined; }
 	async getBaselineCheckpoint(): Promise<string | undefined> { return undefined; }
 	async deleteCheckpoints(): Promise<void> { }
 }

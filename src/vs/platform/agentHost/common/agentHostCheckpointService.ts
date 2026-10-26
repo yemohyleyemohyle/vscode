@@ -80,6 +80,11 @@ export interface IAgentHostCheckpointService {
 	captureTurnStartCheckpoint(sessionUri: URI, chatUri: URI, turnId: string, workingDirectories: readonly URI[] | undefined): Promise<void>;
 
 	/**
+	 * Waits for the turn-start capture and returns its repository trees.
+	 */
+	getTurnStartCheckpointState(sessionUri: URI, chatUri: URI, turnId: string): Promise<readonly { readonly repository: URI; readonly tree: string }[] | undefined>;
+
+	/**
 	 * Captures an end-of-turn checkpoint in each of `workingDirectories`,
 	 * chained to the matching turn-start checkpoint when available.
 	 * Persists the ref against the turn via `ISessionDatabase.setTurnCheckpointRef`
@@ -114,6 +119,11 @@ export interface IAgentHostCheckpointService {
 	 * turn's checkpoint row; `undefined` stands for the session's default chat.
 	 */
 	getTurnCheckpointPair(sessionUri: URI, chat: URI | undefined, turnId: string, workingDirectory?: URI): Promise<{ parent: string; current: string } | undefined>;
+
+	/**
+	 * Waits for pending checkpoint capture before returning the turn's pair.
+	 */
+	waitForTurnCheckpointPair(sessionUri: URI, chat: URI, turnId: string, workingDirectory?: URI): Promise<{ parent: string; current: string } | undefined>;
 
 	/**
 	 * Returns the session's baseline checkpoint ref, or `undefined` when
@@ -161,10 +171,12 @@ export const NULL_CHECKPOINT_SERVICE: IAgentHostCheckpointService = {
 	_serviceBrand: undefined,
 	captureBaselineCheckpoint: async () => { },
 	captureTurnStartCheckpoint: async () => { },
+	getTurnStartCheckpointState: async () => undefined,
 	captureTurnCheckpoint: async () => { },
 	discardTurnStartCheckpoint: async () => { },
 	discardChatTurnStartCheckpoints: async () => { },
 	getTurnCheckpointPair: async () => undefined,
+	waitForTurnCheckpointPair: async () => undefined,
 	getBaselineCheckpoint: async () => undefined,
 	deleteCheckpoints: async () => { },
 };

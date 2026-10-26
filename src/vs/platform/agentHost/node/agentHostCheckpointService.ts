@@ -145,6 +145,18 @@ export class AgentHostCheckpointService extends Disposable implements IAgentHost
 		});
 	}
 
+	getTurnStartCheckpointState(sessionUri: URI, chatUri: URI, turnId: string): Promise<readonly { readonly repository: URI; readonly tree: string }[] | undefined> {
+		const turnKey = this._turnKey(chatUri.toString(), turnId);
+		const queueSession = this._turnQueueSession(sessionUri, chatUri, turnId);
+		return this._sequencer.queue(queueSession.toString(), async () => {
+			const checkpoint = this._turnStartCheckpoints.get(turnKey);
+			if (!checkpoint?.gitEligible || checkpoint.trees.size === 0) {
+				return undefined;
+			}
+			return [...checkpoint.trees].map(([repository, tree]) => ({ repository: URI.parse(repository), tree }));
+		});
+	}
+
 	/** The session a turn's start was queued under, else `session`. */
 	private _turnQueueSession(session: URI, chat: URI, turnId: string): URI {
 		return this._turnStartSessions.get(this._turnKey(chat.toString(), turnId)) ?? session;
@@ -464,6 +476,7 @@ export class AgentHostCheckpointService extends Disposable implements IAgentHost
 			if (!workingDirectories || workingDirectories.length === 0) {
 				return undefined;
 			}
+
 			workingDirectory = URI.parse(workingDirectories[0]);
 		}
 
@@ -502,6 +515,11 @@ export class AgentHostCheckpointService extends Disposable implements IAgentHost
 		} finally {
 			ref.dispose();
 		}
+	}
+
+	waitForTurnCheckpointPair(sessionUri: URI, chat: URI, turnId: string, workingDirectory?: URI): Promise<{ parent: string; current: string } | undefined> {
+		const queueSession = this._turnQueueSession(sessionUri, chat, turnId);
+		return this._sequencer.queue(queueSession.toString(), () => this.getTurnCheckpointPair(sessionUri, chat, turnId, workingDirectory));
 	}
 
 	async getBaselineCheckpoint(sessionUri: URI, workingDirectory?: URI): Promise<string | undefined> {
