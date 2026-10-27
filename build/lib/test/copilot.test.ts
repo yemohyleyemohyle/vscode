@@ -32,6 +32,20 @@ function createPinnedCopilotWin32Tarball(dir: string): { tarball: string; integr
 	return { tarball, integrity };
 }
 
+test('skips the built-in Copilot shim when the legacy SDK is not packaged', () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-shim-'));
+	try {
+		assert.doesNotThrow(() => prepareBuiltInCopilotRipgrepShim(
+			'darwin',
+			'arm64',
+			path.join(root, 'extensions', 'copilot'),
+			path.join(root, 'node_modules.asar.unpacked'),
+		));
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
 suite('copilot', () => {
 	test('reads the runtime version owned by the SDK', () => {
 		const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'vscode-copilot-version-test-'));
