@@ -82,6 +82,9 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		@IAgentHostGitService private readonly _gitService: IAgentHostGitService,
 	) {
 		super();
+		if (this._enabled) {
+			this._logService.info('[RequestDiffSurvival] Enabled for Agent Host chats');
+		}
 	}
 
 	onOutgoingTurn(turn: IOutgoingTurn): undefined {
