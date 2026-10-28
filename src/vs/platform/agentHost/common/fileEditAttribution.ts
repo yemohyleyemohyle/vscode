@@ -76,11 +76,30 @@ export interface IAgentEditAttribution {
 
 export const IAgentEditAttributionService = createDecorator<IAgentEditAttributionService>('agentEditAttributionService');
 
+export interface IEditAttributionSnapshotParams {
+	readonly sessionUri: string;
+	readonly chatUri: string;
+}
+
+export interface IEditAttributionSnapshotSource {
+	readonly sourceKey: string;
+	readonly modelId: string | null;
+	readonly deltaModifiedCount: number;
+	readonly modifiedCount: number;
+}
+
+export interface IEditAttributionSnapshot {
+	readonly trackingEpoch: number;
+	readonly sources: readonly IEditAttributionSnapshotSource[];
+}
+
 export interface IAgentEditAttributionService {
 	readonly _serviceBrand: undefined;
 	/** Disabling attribution is permanent for the lifetime of the service. */
 	setEnabled(enabled: boolean): void;
 	recordEdit(edit: IAgentEditAttribution): Promise<IFileEditAttributionMarker | undefined>;
+	/** Reconciles and reads the cumulative attribution state without flushing it. */
+	snapshot(params: IEditAttributionSnapshotParams): Promise<IEditAttributionSnapshot>;
 	flushSession(sessionUri: string): Promise<void>;
 	prepareFlush(params: IPrepareEditAttributionFlushParams): Promise<IPreparedEditAttributionFlush | undefined>;
 	commitFlush(params: ICommitEditAttributionFlushParams): Promise<IEditAttributionFlushResult>;
@@ -94,6 +113,10 @@ export class NullAgentEditAttributionService implements IAgentEditAttributionSer
 
 	async recordEdit(_edit: IAgentEditAttribution): Promise<IFileEditAttributionMarker | undefined> {
 		return undefined;
+	}
+
+	async snapshot(_params: IEditAttributionSnapshotParams): Promise<IEditAttributionSnapshot> {
+		return { trackingEpoch: 0, sources: [] };
 	}
 
 	async flushSession(_sessionUri: string): Promise<void> { }

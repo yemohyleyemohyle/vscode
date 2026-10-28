@@ -11,16 +11,19 @@ import { ILogService } from '../../../../log/common/log.js';
 import { IAgentHostCheckpointService } from '../../../common/agentHostCheckpointService.js';
 import { createChatMementoKey, type IAgentHostChatContribution, type IAgentHostChatContributionContext, type IOutgoingTurn, type ITurnEnd } from '../../../common/agentHostChatContributionsService.js';
 import { IAgentHostGitService } from '../../../common/agentHostGitService.js';
+import { IAgentEditAttributionService, type IEditAttributionSnapshotSource } from '../../../common/fileEditAttribution.js';
 import type { ISessionFileDiff, URI as ProtocolURI } from '../../../common/state/sessionState.js';
 import { computeRequestDiffFile, computeRequestDiffSurvivalMetric, type IRequestRepositoryDiff } from './requestDiffSurvival.js';
 
 const requestDiffSurvivalState = createChatMementoKey<IRequestDiffSurvivalState>('requestDiffSurvival.state', () => ({
 	starts: new Map(),
 	trackers: [],
+	characterInitial: undefined,
 }));
 
 const MAXIMUM_OBSERVATION_COUNT = 10;
 const LOG_PREFIX = '[RequestDiffSurvivalObservation] ';
+const CHARACTER_LOG_PREFIX = '[RequestCharacterSurvivalSnapshot] ';
 const ENABLED_ENVIRONMENT_VARIABLE = 'VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG';
 
 interface IRepositoryState {
@@ -28,40 +31,72 @@ interface IRepositoryState {
 	readonly ref: string;
 }
 
+interface IRequestDiffSurvivalRequestStart {
+	readonly repositories: readonly IRepositoryState[];
+	readonly model: string | null;
+	readonly timestamp: string;
+}
+
 interface IRequestDiffSurvivalTracker {
 	readonly originatingRequestId: string;
 	readonly baseline: readonly IRepositoryState[];
 	readonly requestResult: readonly IRepositoryState[];
 	readonly originalRequest: IRequestRepositoryDiff;
+	readonly baseModel: string | null;
+	readonly baseStartTimestamp: string;
+	readonly baseEndTimestamp: string;
 	observationCount: number;
 }
 
 interface IRequestDiffSurvivalState {
-	readonly starts: Map<string, readonly IRepositoryState[]>;
+	readonly starts: Map<string, IRequestDiffSurvivalRequestStart>;
 	readonly trackers: IRequestDiffSurvivalTracker[];
+	characterInitial: IRequestCharacterSurvivalInitial | undefined;
+}
+
+interface IRequestCharacterSurvivalInitial {
+	readonly trackingEpoch: number;
+	readonly requestId: string;
+	readonly requestBoundary: 'requestStart' | 'requestEnd';
+	readonly timestamp: string;
+}
+
+interface IRequestCharacterSurvivalObservation {
+	readonly schemaVersion: 1;
+	readonly recordKind: 'requestCharacterSurvivalSnapshot';
+	readonly sessionId: ProtocolURI;
+	readonly chatId: ProtocolURI;
+	readonly trackingEpoch: number;
+	readonly initialRequestId: string;
+	readonly initialRequestBoundary: 'requestStart' | 'requestEnd';
+	readonly initialTimestamp: string;
+	readonly observationRequestId: string;
+	readonly observationBoundary: 'requestStart' | 'requestEnd';
+	readonly observationTimestamp: string;
+	readonly sources: readonly IEditAttributionSnapshotSource[];
 }
 
 interface IRequestDiffSurvivalObservation {
-	readonly schemaVersion: 1;
+	readonly schemaVersion: 2;
 	readonly recordKind: 'requestDiffSurvivalObservation';
 	readonly sessionId: ProtocolURI;
 	readonly chatId: ProtocolURI;
 	readonly originatingRequestId: string;
 	readonly observationRequestId: string;
+	readonly baseModel: string | null;
+	readonly observationModel: string | null;
+	readonly baseStartTimestamp: string;
+	readonly baseEndTimestamp: string;
+	readonly observationTimestamp: string;
 	readonly observationBoundary: 'requestStart' | 'requestEnd';
 	readonly observationIndex: number;
 	readonly maximumObservationCount: number;
 	readonly isFinalObservation: boolean;
 	readonly complete: boolean;
-	readonly states: {
-		readonly baseline: string;
-		readonly requestResult: string;
-		readonly latestAvailable: string;
-	};
 	readonly diffs: {
-		readonly originalRequest: IRequestRepositoryDiff;
-		readonly baselineToLatest: IRequestRepositoryDiff;
-		readonly requestResultToLatest: IRequestRepositoryDiff;
+		readonly originalRequest: Pick<IRequestRepositoryDiff, 'files' | 'errors'>;
+		readonly baselineToLatest: Pick<IRequestRepositoryDiff, 'files' | 'errors'>;
+		readonly requestResultToLatest: Pick<IRequestRepositoryDiff, 'files' | 'errors'>;
 	};
 	readonly survival: ReturnType<typeof computeRequestDiffSurvivalMetric>;
 }
@@ -80,6 +115,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		@ILogService private readonly _logService: ILogService,
 		@IAgentHostCheckpointService private readonly _checkpointService: IAgentHostCheckpointService,
 		@IAgentHostGitService private readonly _gitService: IAgentHostGitService,
+		@IAgentEditAttributionService private readonly _editAttributionService: IAgentEditAttributionService,
 	) {
 		super();
 		if (this._enabled) {
@@ -91,7 +127,10 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		if (!this._enabled) {
 			return undefined;
 		}
+		const observationModel = turn.message.model?.id ?? null;
+		const observationTimestamp = new Date().toISOString();
 		this._schedule(turn.chat, async () => {
+			await this._tryEmitCharacterSnapshot(turn.session, turn.chat, turn.turnId, observationTimestamp, 'requestStart');
 			const start = await this._checkpointService.getTurnStartCheckpointState(URI.parse(turn.session), URI.parse(turn.chat), turn.turnId);
 			if (!start) {
 				this._logService.warn(`[RequestDiffSurvival] No Git start checkpoint for ${turn.chat}/${turn.turnId}; skipping request tracking`);
@@ -99,8 +138,8 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 			}
 			const state = this._state(turn.chat);
 			const latest = start.map(checkpoint => ({ repository: checkpoint.repository, ref: checkpoint.tree }));
-			state.starts.set(turn.turnId, latest);
-			await this._observeExistingTrackers(turn.session, turn.chat, turn.turnId, 'requestStart', latest, state);
+			state.starts.set(turn.turnId, { repositories: latest, model: observationModel, timestamp: observationTimestamp });
+			await this._observeExistingTrackers(turn.session, turn.chat, turn.turnId, observationModel, observationTimestamp, 'requestStart', latest, state);
 		});
 		return undefined;
 	}
@@ -110,31 +149,36 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 			return;
 		}
 		const turnId = turn.turnId;
+		const observationTimestamp = new Date().toISOString();
 		this._schedule(turn.channel, async () => {
 			const state = this._state(turn.channel);
+			await this._tryEmitCharacterSnapshot(turn.session, turn.channel, turnId, observationTimestamp, 'requestEnd');
 			const start = state.starts.get(turnId);
 			if (!start) {
 				return;
 			}
 
-			const result = await this._getTurnResultState(turn.session, turn.channel, turnId, start);
+			const result = await this._getTurnResultState(turn.session, turn.channel, turnId, start.repositories);
 			if (!result) {
 				this._logService.warn(`[RequestDiffSurvival] No Git end checkpoint for ${turn.channel}/${turnId}; skipping request tracking`);
 				state.starts.delete(turnId);
 				return;
 			}
 
-			await this._observeExistingTrackers(turn.session, turn.channel, turnId, 'requestEnd', result, state);
-			const originalRequest = await this._computeDiff(turn.session, `${turnId}:start`, `${turnId}:end`, start, result);
+			await this._observeExistingTrackers(turn.session, turn.channel, turnId, start.model, observationTimestamp, 'requestEnd', result, state);
+			const originalRequest = await this._computeDiff(turn.session, `${turnId}:start`, `${turnId}:end`, start.repositories, result);
 			const tracker: IRequestDiffSurvivalTracker = {
 				originatingRequestId: turnId,
-				baseline: start,
+				baseline: start.repositories,
 				requestResult: result,
 				originalRequest,
+				baseModel: start.model,
+				baseStartTimestamp: start.timestamp,
+				baseEndTimestamp: observationTimestamp,
 				observationCount: 0,
 			};
 			state.trackers.push(tracker);
-			await this._emitObservation(turn.session, turn.channel, turnId, 'requestEnd', result, tracker);
+			await this._emitObservation(turn.session, turn.channel, turnId, start.model, observationTimestamp, 'requestEnd', result, tracker);
 			state.starts.delete(turnId);
 		});
 	}
@@ -153,6 +197,45 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 
 	private _state(chat: ProtocolURI): IRequestDiffSurvivalState {
 		return this._context.memento(requestDiffSurvivalState, chat).get();
+	}
+
+	private async _tryEmitCharacterSnapshot(
+		session: ProtocolURI,
+		chat: ProtocolURI,
+		requestId: string,
+		timestamp: string,
+		boundary: 'requestStart' | 'requestEnd',
+	): Promise<void> {
+		try {
+			const snapshot = await this._editAttributionService.snapshot({ sessionUri: session, chatUri: chat });
+			const state = this._state(chat);
+			if (!state.characterInitial || state.characterInitial.trackingEpoch !== snapshot.trackingEpoch) {
+				state.characterInitial = {
+					trackingEpoch: snapshot.trackingEpoch,
+					requestId,
+					requestBoundary: boundary,
+					timestamp,
+				};
+			}
+			const initial = state.characterInitial;
+			const observation: IRequestCharacterSurvivalObservation = {
+				schemaVersion: 1,
+				recordKind: 'requestCharacterSurvivalSnapshot',
+				sessionId: session,
+				chatId: chat,
+				trackingEpoch: snapshot.trackingEpoch,
+				initialRequestId: initial.requestId,
+				initialRequestBoundary: initial.requestBoundary,
+				initialTimestamp: initial.timestamp,
+				observationRequestId: requestId,
+				observationBoundary: boundary,
+				observationTimestamp: timestamp,
+				sources: snapshot.sources,
+			};
+			this._logService.info(`${CHARACTER_LOG_PREFIX}${JSON.stringify(observation)}`);
+		} catch (error) {
+			this._logService.warn(`[RequestDiffSurvival] Character survival snapshot failed for ${chat}/${requestId}/${boundary}: ${error instanceof Error ? error.message : String(error)}`);
+		}
 	}
 
 	private async _getTurnResultState(
@@ -176,13 +259,15 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		session: ProtocolURI,
 		chat: ProtocolURI,
 		observationRequestId: string,
+		observationModel: string | null,
+		observationTimestamp: string,
 		boundary: 'requestStart' | 'requestEnd',
 		latest: readonly IRepositoryState[],
 		state: IRequestDiffSurvivalState,
 	): Promise<void> {
 		for (let index = 0; index < state.trackers.length;) {
 			const tracker = state.trackers[index];
-			await this._emitObservation(session, chat, observationRequestId, boundary, latest, tracker);
+			await this._emitObservation(session, chat, observationRequestId, observationModel, observationTimestamp, boundary, latest, tracker);
 			if (tracker.observationCount >= MAXIMUM_OBSERVATION_COUNT) {
 				state.trackers.splice(index, 1);
 			} else {
@@ -195,6 +280,8 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		session: ProtocolURI,
 		chat: ProtocolURI,
 		observationRequestId: string,
+		observationModel: string | null,
+		observationTimestamp: string,
 		boundary: 'requestStart' | 'requestEnd',
 		latest: readonly IRepositoryState[],
 		tracker: IRequestDiffSurvivalTracker,
@@ -208,26 +295,26 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 			? emptyRepositoryDiff(`${tracker.originatingRequestId}:end`, latestState)
 			: await this._computeDiff(session, `${tracker.originatingRequestId}:end`, latestState, tracker.requestResult, latest);
 		const observation: IRequestDiffSurvivalObservation = {
-			schemaVersion: 1,
+			schemaVersion: 2,
 			recordKind: 'requestDiffSurvivalObservation',
 			sessionId: session,
 			chatId: chat,
 			originatingRequestId: tracker.originatingRequestId,
 			observationRequestId,
+			baseModel: tracker.baseModel,
+			observationModel,
+			baseStartTimestamp: tracker.baseStartTimestamp,
+			baseEndTimestamp: tracker.baseEndTimestamp,
+			observationTimestamp,
 			observationBoundary: boundary,
 			observationIndex,
 			maximumObservationCount: MAXIMUM_OBSERVATION_COUNT,
 			isFinalObservation: observationIndex === MAXIMUM_OBSERVATION_COUNT - 1,
 			complete: tracker.originalRequest.errors.length === 0 && baselineToLatest.errors.length === 0 && requestResultToLatest.errors.length === 0,
-			states: {
-				baseline: `${tracker.originatingRequestId}:start`,
-				requestResult: `${tracker.originatingRequestId}:end`,
-				latestAvailable: latestState,
-			},
 			diffs: {
-				originalRequest: tracker.originalRequest,
-				baselineToLatest,
-				requestResultToLatest,
+				originalRequest: toObservationDiff(tracker.originalRequest),
+				baselineToLatest: toObservationDiff(baselineToLatest),
+				requestResultToLatest: toObservationDiff(requestResultToLatest),
 			},
 			survival: computeRequestDiffSurvivalMetric(tracker.originalRequest, baselineToLatest, requestResultToLatest),
 		};
@@ -295,4 +382,8 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 
 function emptyRepositoryDiff(from: string, to: string): IRequestRepositoryDiff {
 	return { from, to, files: [], errors: [] };
+}
+
+function toObservationDiff(diff: IRequestRepositoryDiff): Pick<IRequestRepositoryDiff, 'files' | 'errors'> {
+	return { files: diff.files, errors: diff.errors };
 }

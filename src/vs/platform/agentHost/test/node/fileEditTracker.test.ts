@@ -325,6 +325,7 @@ suite('FileEditTracker', () => {
 					afterDigest: createFileEditContentDigest(edit.afterText),
 				};
 			},
+			snapshot: async () => ({ trackingEpoch: 0, sources: [] }),
 			flushSession: async () => { },
 			prepareFlush: async () => undefined,
 			commitFlush: async () => ({ outcome: 'missing', agentModifiedCount: 0 }),
@@ -377,6 +378,7 @@ suite('FileEditTracker', () => {
 			recordEdit: async () => {
 				throw new Error('Attribution failed');
 			},
+			snapshot: async () => ({ trackingEpoch: 0, sources: [] }),
 			flushSession: async () => { },
 			prepareFlush: async () => undefined,
 			commitFlush: async () => ({ outcome: 'missing', agentModifiedCount: 0 }),

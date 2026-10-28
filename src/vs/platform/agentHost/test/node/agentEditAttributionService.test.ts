@@ -29,6 +29,112 @@ import { TestDiffComputeService } from '../common/sessionTestHelpers.js';
 suite('Agent Edit Attribution Service', () => {
 	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
 
+	test('snapshots cumulative attribution without flushing and advances the epoch after a real flush', async () => {
+		const fileService = disposables.add(new FileService(new NullLogService()));
+		disposables.add(fileService.registerProvider('file', disposables.add(new InMemoryFileSystemProvider())));
+		const resource = URI.file('/workspace/snapshot.ts');
+		await fileService.writeFile(resource, VSBuffer.fromString('abc'));
+		const events: string[] = [];
+		const instantiationService = disposables.add(new TestInstantiationService());
+		instantiationService.stub(IFileService, fileService);
+		instantiationService.stub(IDiffComputeService, new TestDiffComputeService());
+		instantiationService.stub(ILogService, new NullLogService());
+		instantiationService.stub(ITelemetryService, {
+			telemetryLevel: TelemetryLevel.USAGE,
+			publicLog2: eventName => events.push(eventName),
+		});
+		const service = disposables.add(instantiationService.createInstance(AgentEditAttributionService, async () => undefined, undefined));
+		const ownerSessionUri = 'ahp-session:/owner';
+		const chatUri = buildChatUri(ownerSessionUri, 'chat');
+		const storageUri = 'copilotcli:/storage';
+		await service.recordEdit({
+			sessionUri: storageUri,
+			ownerSessionUri,
+			provider: 'copilotcli',
+			chatUri,
+			turnId: 'request-1',
+			toolCallId: 'tool-1',
+			filePath: resource.fsPath,
+			beforeText: 'a',
+			afterText: 'abc',
+			changes: computeDiffCounts('a', 'abc', 5000).changes,
+			modelId: 'kimi-k3',
+			toolName: 'edit',
+		});
+
+		const initial = await service.snapshot({ sessionUri: ownerSessionUri, chatUri });
+		await fileService.writeFile(resource, VSBuffer.fromString('ab'));
+		const reconciled = await service.snapshot({ sessionUri: ownerSessionUri, chatUri });
+		const repeated = await service.snapshot({ sessionUri: ownerSessionUri, chatUri });
+		const eventsBeforeFlush = [...events];
+		await service.flushSession(storageUri);
+		const afterFlush = await service.snapshot({ sessionUri: ownerSessionUri, chatUri });
+		await fileService.writeFile(resource, VSBuffer.fromString('abd'));
+		await service.recordEdit({
+			sessionUri: storageUri,
+			ownerSessionUri,
+			provider: 'copilotcli',
+			chatUri,
+			turnId: 'request-2',
+			toolCallId: 'tool-2',
+			filePath: resource.fsPath,
+			beforeText: 'ab',
+			afterText: 'abd',
+			changes: computeDiffCounts('ab', 'abd', 5000).changes,
+			modelId: 'kimi-k3',
+			toolName: 'edit',
+		});
+		const restarted = await service.snapshot({ sessionUri: ownerSessionUri, chatUri });
+
+		assert.deepStrictEqual({
+			initial,
+			reconciled,
+			repeated,
+			eventsBeforeFlush,
+			afterFlush,
+			restarted,
+		}, {
+			initial: {
+				trackingEpoch: 0,
+				sources: [{
+					sourceKey: 'source:Chat.applyEdits-$modelId:kimi-k3-$harness:copilotcli-$origin:agentHost',
+					modelId: 'kimi-k3',
+					deltaModifiedCount: 3,
+					modifiedCount: 3,
+				}],
+			},
+			reconciled: {
+				trackingEpoch: 0,
+				sources: [{
+					sourceKey: 'source:Chat.applyEdits-$modelId:kimi-k3-$harness:copilotcli-$origin:agentHost',
+					modelId: 'kimi-k3',
+					deltaModifiedCount: 3,
+					modifiedCount: 0,
+				}],
+			},
+			repeated: {
+				trackingEpoch: 0,
+				sources: [{
+					sourceKey: 'source:Chat.applyEdits-$modelId:kimi-k3-$harness:copilotcli-$origin:agentHost',
+					modelId: 'kimi-k3',
+					deltaModifiedCount: 3,
+					modifiedCount: 0,
+				}],
+			},
+			eventsBeforeFlush: [],
+			afterFlush: { trackingEpoch: 1, sources: [] },
+			restarted: {
+				trackingEpoch: 1,
+				sources: [{
+					sourceKey: 'source:Chat.applyEdits-$modelId:kimi-k3-$harness:copilotcli-$origin:agentHost',
+					modelId: 'kimi-k3',
+					deltaModifiedCount: 1,
+					modifiedCount: 1,
+				}],
+			},
+		});
+	});
+
 	for (const scenario of ['precise', 'invalid agent diff', 'agent timeout', 'external fallback', 'agent and external fallback'] as const) {
 		test(`reports scope-wide coarse diff counts and preserves them across cancelled flushes: ${scenario}`, async () => {
 			const before = 'aaa\nmiddle\nzzz';
