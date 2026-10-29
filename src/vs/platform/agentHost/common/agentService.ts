@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import type { AgentChatMoveDestination } from './agentHostChatMove.js';
+import type { IRequestEditSurvivalBoundary, IRequestFocusWindowSurvivalSnapshot } from './requestEditSurvival.js';
 import type { IAgentHostWorktreeCleanupStatus } from './agentHostWorktreeCleanup.js';
 import type { CancellationToken } from '../../../base/common/cancellation.js';
 import type { VSBuffer } from '../../../base/common/buffer.js';
@@ -886,6 +887,8 @@ export interface IMissionControlCredentialSealingRequest {
 
 export interface IAgentHostManagementService {
 	readonly _serviceBrand: undefined;
+	readonly onDidRequestFocusWindowSnapshot: Event<IRequestEditSurvivalBoundary>;
+	logFocusWindowSnapshots(snapshots: readonly IRequestFocusWindowSurvivalSnapshot[]): Promise<void>;
 	/** Opt-in Mission Control ingress configured through trusted local IPC. */
 	configureMissionControl(options: IMissionControlOptions | undefined, withdrawingAccountId?: string): Promise<void>;
 	sealMissionControlCredential(request: IMissionControlCredentialSealingRequest): Promise<string>;
@@ -1564,6 +1567,9 @@ export const IAgentHostService = createDecorator<IAgentHostService>('agentHostSe
 export interface IAgentHostService extends IAgentConnection {
 
 	readonly _serviceBrand: undefined;
+	/** Optional local-only experiment logging bridge, not an AHP capability. */
+	readonly onDidRequestFocusWindowSnapshot?: Event<IRequestEditSurvivalBoundary>;
+	logFocusWindowSnapshots?(snapshots: readonly IRequestFocusWindowSurvivalSnapshot[]): Promise<void>;
 	/** Available only through the local native Agent Host management connection. */
 	configureMissionControl?(options: IMissionControlOptions | undefined, withdrawingAccountId?: string): Promise<void>;
 	sealMissionControlCredential?(request: IMissionControlCredentialSealingRequest): Promise<string>;

@@ -14,6 +14,8 @@ import { MissionControlEnvironment } from './missionControl/missionControlEnviro
 import { ISessionDataService } from '../common/sessionDataService.js';
 import { IAgentHostMacAccessibilityTrustService } from './agentHostMacAccessibilityTrustService.js';
 import { IAgentHostSystemWakeService } from './agentHostSystemWakeService.js';
+import { IAgentEditAttributionService } from '../common/fileEditAttribution.js';
+import type { IRequestFocusWindowSurvivalSnapshot } from '../common/requestEditSurvival.js';
 
 const SHUTDOWN_DRAIN_TIMEOUT_MS = 1000;
 const PROVIDER_SHUTDOWN_TIMEOUT_MS = 1500;
@@ -35,7 +37,16 @@ export class AgentHostManagementService implements IAgentHostManagementService {
 		@ILogService private readonly _logService: ILogService,
 		@IAgentHostSystemWakeService private readonly _systemWake: IAgentHostSystemWakeService,
 		@IAgentHostMacAccessibilityTrustService private readonly _macAccessibilityTrust: IAgentHostMacAccessibilityTrustService,
+		@IAgentEditAttributionService private readonly _editAttributionService: IAgentEditAttributionService,
 	) { }
+
+	get onDidRequestFocusWindowSnapshot() {
+		return this._editAttributionService.onDidRequestFocusWindowSnapshot;
+	}
+
+	async logFocusWindowSnapshots(snapshots: readonly IRequestFocusWindowSurvivalSnapshot[]): Promise<void> {
+		this._editAttributionService.logFocusWindowSnapshots(snapshots);
+	}
 
 	setMissionControl(service: MissionControlEnvironment | undefined): void {
 		this._missionControl = service;

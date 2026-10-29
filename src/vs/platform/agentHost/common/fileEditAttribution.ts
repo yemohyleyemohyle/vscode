@@ -9,6 +9,8 @@ import { IOffsetEdit } from './diffComputeService.js';
 import { ToolResultFileEditContent } from './state/sessionState.js';
 import { URI } from '../../../base/common/uri.js';
 import { EditTelemetryTrigger } from '../../telemetry/common/editTelemetry.js';
+import { Event } from '../../../base/common/event.js';
+import type { IRequestEditSurvivalBoundary, IRequestFocusWindowSurvivalSnapshot } from './requestEditSurvival.js';
 
 export const FILE_EDIT_ATTRIBUTION_PROPERTY = '_vscodeEditAttribution';
 // Workbench edit-source tracking reports a coverage gap when Agent Host attribution exceeds this cap.
@@ -95,6 +97,9 @@ export interface IEditAttributionSnapshot {
 
 export interface IAgentEditAttributionService {
 	readonly _serviceBrand: undefined;
+	readonly onDidRequestFocusWindowSnapshot: Event<IRequestEditSurvivalBoundary>;
+	requestFocusWindowSnapshot(boundary: IRequestEditSurvivalBoundary): void;
+	logFocusWindowSnapshots(snapshots: readonly IRequestFocusWindowSurvivalSnapshot[]): void;
 	/** Disabling attribution is permanent for the lifetime of the service. */
 	setEnabled(enabled: boolean): void;
 	recordEdit(edit: IAgentEditAttribution): Promise<IFileEditAttributionMarker | undefined>;
@@ -108,6 +113,9 @@ export interface IAgentEditAttributionService {
 
 export class NullAgentEditAttributionService implements IAgentEditAttributionService {
 	declare readonly _serviceBrand: undefined;
+	readonly onDidRequestFocusWindowSnapshot = Event.None;
+	requestFocusWindowSnapshot(_boundary: IRequestEditSurvivalBoundary): void { }
+	logFocusWindowSnapshots(_snapshots: readonly IRequestFocusWindowSurvivalSnapshot[]): void { }
 
 	setEnabled(_enabled: boolean): void { }
 

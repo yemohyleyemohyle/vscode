@@ -21,6 +21,7 @@ import { RequestDiffSurvivalContribution } from '../../node/chatContributions/re
 import { computeRequestDiffFile, computeRequestDiffSurvivalMetric, type IRequestRepositoryDiff, type IRequestDiffSurvivalMetric } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvival.js';
 import { createNoopGitService } from '../common/sessionTestHelpers.js';
 import type { IRequestCharacterRepositoryDiff } from '../../node/chatContributions/requestDiffSurvival/requestCharacterDiffSurvival.js';
+import type { IRequestEditSurvivalBoundary } from '../../common/requestEditSurvival.js';
 
 suite('Agent Host Request Diff Survival', () => {
 	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
@@ -98,12 +99,18 @@ suite('Agent Host Request Diff Survival', () => {
 				...createNoopGitService(),
 				computeFileDiffsBetweenRefs: async () => [],
 			};
+			const focusBoundaries: IRequestEditSurvivalBoundary[] = [];
+			const attributionService = new class extends NullAgentEditAttributionService {
+				override requestFocusWindowSnapshot(boundary: IRequestEditSurvivalBoundary): void {
+					focusBoundaries.push(boundary);
+				}
+			};
 			const contribution = disposables.add(new RequestDiffSurvivalContribution(
 				new TestContributionContext(),
 				logService,
 				checkpointService,
 				gitService,
-				new NullAgentEditAttributionService(),
+				attributionService,
 			));
 			const session = 'ahp-session:/session';
 			const chat = 'ahp-chat:/chat';
@@ -126,12 +133,20 @@ suite('Agent Host Request Diff Survival', () => {
 			const laterObservation = JSON.parse(await logService.secondObservation.p);
 
 			assert.deepStrictEqual({
+				focusBoundaries: focusBoundaries.map(boundary => ({ request: boundary.observationRequestId, boundary: boundary.observationBoundary })),
+				focusTimestampsMatch: focusBoundaries[1].observationTimestamp === baseObservation.observationTimestamp && focusBoundaries[2].observationTimestamp === laterObservation.observationTimestamp,
 				base: observationShape(baseObservation),
 				later: observationShape(laterObservation),
 				baseTimestampsMatchAcrossObservations:
 					baseObservation.baseStartTimestamp === laterObservation.baseStartTimestamp
 					&& baseObservation.baseEndTimestamp === laterObservation.baseEndTimestamp,
 			}, {
+				focusBoundaries: [
+					{ request: 'base-request', boundary: 'requestStart' },
+					{ request: 'base-request', boundary: 'requestEnd' },
+					{ request: 'later-request', boundary: 'requestStart' },
+				],
+				focusTimestampsMatch: true,
 				base: {
 					schemaVersion: 2,
 					originatingRequestId: 'base-request',

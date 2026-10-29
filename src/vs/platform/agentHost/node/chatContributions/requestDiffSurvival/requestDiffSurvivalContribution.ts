@@ -135,6 +135,9 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		}
 		const observationModel = turn.message.model?.id ?? null;
 		const observationTimestamp = new Date().toISOString();
+		this._editAttributionService.requestFocusWindowSnapshot({
+			sessionId: turn.session, chatId: turn.chat, observationRequestId: turn.turnId, observationTimestamp, observationBoundary: 'requestStart',
+		});
 		this._schedule(turn.chat, async () => {
 			await this._tryEmitCharacterSnapshot(turn.session, turn.chat, turn.turnId, observationTimestamp, 'requestStart');
 			const start = await this._checkpointService.getTurnStartCheckpointState(URI.parse(turn.session), URI.parse(turn.chat), turn.turnId);
@@ -156,6 +159,9 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		}
 		const turnId = turn.turnId;
 		const observationTimestamp = new Date().toISOString();
+		this._editAttributionService.requestFocusWindowSnapshot({
+			sessionId: turn.session, chatId: turn.channel, observationRequestId: turnId, observationTimestamp, observationBoundary: 'requestEnd',
+		});
 		this._schedule(turn.channel, async () => {
 			const state = this._state(turn.channel);
 			await this._tryEmitCharacterSnapshot(turn.session, turn.channel, turnId, observationTimestamp, 'requestEnd');

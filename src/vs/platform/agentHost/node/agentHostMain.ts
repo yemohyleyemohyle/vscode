@@ -510,7 +510,7 @@ async function startAgentHost(): Promise<void> {
 		},
 	);
 	management.setMissionControl(missionControl.environment);
-	server.registerChannel(AgentHostIpcChannels.Management, ProxyChannel.fromService(management, disposables));
+	server.registerChannel(AgentHostIpcChannels.Management, ProxyChannel.fromService(management, disposables, { unbufferedEvents: ['onDidRequestFocusWindowSnapshot'] }));
 	if (!(server instanceof UtilityProcessServer)) {
 		server.registerChannel(AgentHostIpcChannels.ConnectionTracker, ProxyChannel.fromService(connectionTrackerService, disposables));
 	}

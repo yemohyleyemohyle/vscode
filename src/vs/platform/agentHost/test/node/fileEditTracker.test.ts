@@ -10,6 +10,7 @@ import { stub } from 'sinon';
 import { DeferredPromise } from '../../../../base/common/async.js';
 import { VSBuffer } from '../../../../base/common/buffer.js';
 import { CancellationError } from '../../../../base/common/errors.js';
+import { Event } from '../../../../base/common/event.js';
 import { Disposable, DisposableStore } from '../../../../base/common/lifecycle.js';
 import { join } from '../../../../base/common/path.js';
 import { URI } from '../../../../base/common/uri.js';
@@ -314,6 +315,9 @@ suite('FileEditTracker', () => {
 		services.set(ISessionDataService, createSessionDataService(db));
 		services.set(IAgentEditAttributionService, {
 			_serviceBrand: undefined,
+			onDidRequestFocusWindowSnapshot: Event.None,
+			requestFocusWindowSnapshot: () => { },
+			logFocusWindowSnapshots: () => { },
 			setEnabled: () => { },
 			recordEdit: async edit => {
 				recordedEdit = edit;
@@ -374,6 +378,9 @@ suite('FileEditTracker', () => {
 		services.set(ISessionDataService, createSessionDataService(db));
 		services.set(IAgentEditAttributionService, {
 			_serviceBrand: undefined,
+			onDidRequestFocusWindowSnapshot: Event.None,
+			requestFocusWindowSnapshot: () => { },
+			logFocusWindowSnapshots: () => { },
 			setEnabled: () => { },
 			recordEdit: async () => {
 				throw new Error('Attribution failed');

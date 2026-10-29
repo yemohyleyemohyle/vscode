@@ -6,9 +6,9 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { sumBy } from '../../../../base/common/arrays.js';
-import { IntervalTimer, raceTimeout, SequencerByKey } from '../../../../base/common/async.js';
+import { IntervalTimer, raceTimeout, RunOnceScheduler, SequencerByKey } from '../../../../base/common/async.js';
 import { groupByMap } from '../../../../base/common/collections.js';
-import { Disposable } from '../../../../base/common/lifecycle.js';
+import { Disposable, DisposableMap } from '../../../../base/common/lifecycle.js';
 import { dirname } from '../../../../base/common/path.js';
 import { extUriBiasedIgnorePathCase } from '../../../../base/common/resources.js';
 import { URI } from '../../../../base/common/uri.js';
@@ -23,11 +23,14 @@ import { IDiffComputeService, IOffsetEdit } from '../../common/diffComputeServic
 import { createFileEditContentDigest, IAgentEditAttribution, IAgentEditAttributionService, ICancelEditAttributionFlushParams, ICommitEditAttributionFlushParams, IEditAttributionCoverageGapAcknowledgement, IEditAttributionFlushResult, IEditAttributionSnapshot, IEditAttributionSnapshotParams, IEditAttributionSnapshotSource, IFileEditAttributionMarker, IPrepareEditAttributionFlushParams, IPreparedEditAttributionFlush, ISkippedFileEditAttributionMarker, MAX_EDIT_ATTRIBUTION_FILE_SIZE } from '../../common/fileEditAttribution.js';
 import { isAhpChatChannel } from '../../common/state/sessionState.js';
 import { IAgentHostTelemetryService } from '../agentHostTelemetryService.js';
+import { Emitter } from '../../../../base/common/event.js';
+import { type IRequestEditSurvivalBoundary, type IRequestFocusWindowSurvivalSnapshot, unavailableRequestEditSurvivalSnapshots } from '../../common/requestEditSurvival.js';
 
 const MAX_TOTAL_TRACKED_TEXT = 20 * 1024 * 1024;
 const MAX_TRACKED_RESOURCES = 100;
 const MAX_INTERVALS_PER_RESOURCE = 10_000;
 const MAX_COVERAGE_GAP_SEQUENCES = 128;
+const FOCUS_WINDOW_SNAPSHOT_TRANSPORT_TIMEOUT_MS = 15_000;
 const MAX_COVERAGE_GAP_ACKNOWLEDGEMENTS_PER_FLUSH = 128;
 const MAX_SETTLED_FLUSHES = 1_000;
 const MAX_STANDALONE_ACKNOWLEDGEMENTS = 1_000;
@@ -123,8 +126,15 @@ interface IPreparedFlush {
 	readonly timestamp: number;
 }
 
+function focusWindowSnapshotBoundaryKey(boundary: IRequestEditSurvivalBoundary): string {
+	return JSON.stringify([boundary.sessionId, boundary.chatId, boundary.observationRequestId, boundary.observationBoundary, boundary.observationTimestamp]);
+}
+
 export class AgentEditAttributionService extends Disposable implements IAgentEditAttributionService {
 	declare readonly _serviceBrand: undefined;
+	private readonly _onDidRequestFocusWindowSnapshot = this._register(new Emitter<IRequestEditSurvivalBoundary>());
+	readonly onDidRequestFocusWindowSnapshot = this._onDidRequestFocusWindowSnapshot.event;
+	private readonly _pendingFocusWindowSnapshots = this._register(new DisposableMap<string, RunOnceScheduler>());
 
 	private readonly _resources = new Map<string, ITrackedResource>();
 	private readonly _claimedResources = new Set<ITrackedResource>();
@@ -158,6 +168,45 @@ export class AgentEditAttributionService extends Disposable implements IAgentEdi
 		this._register(new IntervalTimer()).cancelAndSet(() => {
 			void this.checkGitState();
 		}, GIT_STATE_POLL_INTERVAL);
+	}
+
+	requestFocusWindowSnapshot(boundary: IRequestEditSurvivalBoundary): void {
+		if (process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG !== '1') {
+			return;
+		}
+		if (!this._enabled || this._telemetryService.telemetryLevel < TelemetryLevel.USAGE) {
+			this._writeFocusWindowSnapshots(unavailableRequestEditSurvivalSnapshots(boundary, 'collectionDisabled'));
+		} else if (!this._onDidRequestFocusWindowSnapshot.hasListeners()) {
+			this._writeFocusWindowSnapshots(unavailableRequestEditSurvivalSnapshots(boundary, 'transportError', ['No renderer snapshot listener is connected']));
+		} else {
+			const key = focusWindowSnapshotBoundaryKey(boundary);
+			const timer = new RunOnceScheduler(() => {
+				this._pendingFocusWindowSnapshots.deleteAndDispose(key);
+				this._writeFocusWindowSnapshots(unavailableRequestEditSurvivalSnapshots(boundary, 'transportError', ['Renderer snapshot response timed out']));
+			}, FOCUS_WINDOW_SNAPSHOT_TRANSPORT_TIMEOUT_MS);
+			this._pendingFocusWindowSnapshots.set(key, timer);
+			timer.schedule();
+			this._onDidRequestFocusWindowSnapshot.fire(boundary);
+		}
+	}
+
+	logFocusWindowSnapshots(snapshots: readonly IRequestFocusWindowSurvivalSnapshot[]): void {
+		const acknowledged = new Set(snapshots.map(focusWindowSnapshotBoundaryKey).filter(key => this._pendingFocusWindowSnapshots.has(key)));
+		for (const key of acknowledged) {
+			this._pendingFocusWindowSnapshots.deleteAndDispose(key);
+		}
+		this._writeFocusWindowSnapshots(snapshots.filter(snapshot => acknowledged.has(focusWindowSnapshotBoundaryKey(snapshot))));
+	}
+
+	private _writeFocusWindowSnapshots(snapshots: readonly IRequestFocusWindowSurvivalSnapshot[]): void {
+		if (process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG !== '1') {
+			return;
+		}
+		for (const snapshot of snapshots) {
+			const collectionEnabled = this._enabled && this._telemetryService.telemetryLevel >= TelemetryLevel.USAGE;
+			const record = collectionEnabled ? snapshot : unavailableRequestEditSurvivalSnapshots(snapshot, 'collectionDisabled').find(record => record.mode === snapshot.mode)!;
+			this._logService.info(`[RequestFocusWindowSurvivalSnapshot] ${JSON.stringify(record)}`);
+		}
 	}
 
 	setEnabled(enabled: boolean): void {

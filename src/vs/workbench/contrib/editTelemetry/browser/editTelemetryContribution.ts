@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { Disposable } from '../../../../base/common/lifecycle.js';
+import { Disposable, toDisposable } from '../../../../base/common/lifecycle.js';
 import { autorun, derived } from '../../../../base/common/observable.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { CommandsRegistry } from '../../../../platform/commands/common/commands.js';
@@ -17,13 +17,18 @@ import { AiStatsFeature } from './editStats/aiStatsFeature.js';
 import { AI_STATS_SETTING_ID, EDIT_TELEMETRY_SETTING_ID } from './settingIds.js';
 import { IChatEntitlementService } from '../../../services/chat/common/chatEntitlementService.js';
 import { AiContributionFeature } from './aiContributionFeature.js';
+import { IAgentHostService } from '../../../../platform/agentHost/common/agentService.js';
+import { unavailableRequestEditSurvivalSnapshots } from '../../../../platform/agentHost/common/requestEditSurvival.js';
+import { ILogService } from '../../../../platform/log/common/log.js';
 
 export class EditTelemetryContribution extends Disposable {
 	constructor(
 		@IInstantiationService instantiationService: IInstantiationService,
 		@IConfigurationService configurationService: IConfigurationService,
 		@ITelemetryService telemetryService: ITelemetryService,
-		@IChatEntitlementService chatEntitlementService: IChatEntitlementService
+		@IChatEntitlementService chatEntitlementService: IChatEntitlementService,
+		@IAgentHostService agentHostService: IAgentHostService,
+		@ILogService logService: ILogService,
 	) {
 		super();
 
@@ -31,13 +36,32 @@ export class EditTelemetryContribution extends Disposable {
 		const annotatedDocuments = derived(reader => reader.store.add(instantiationService.createInstance(AnnotatedDocuments, workspace.read(reader))));
 
 		const editSourceTrackingEnabled = observableConfigValue(EDIT_TELEMETRY_SETTING_ID, true, configurationService);
+		let trackingFeature: EditTrackingFeature | undefined;
 		this._register(autorun(r => {
 			const enabled = editSourceTrackingEnabled.read(r);
 			if (!enabled || !telemetryLevelEnabled(telemetryService, TelemetryLevel.USAGE)) {
 				return;
 			}
-			r.store.add(instantiationService.createInstance(EditTrackingFeature, workspace.read(r), annotatedDocuments.read(r)));
+			trackingFeature = r.store.add(instantiationService.createInstance(EditTrackingFeature, workspace.read(r), annotatedDocuments.read(r)));
+			r.store.add(toDisposable(() => trackingFeature = undefined));
 		}));
+		if (agentHostService.onDidRequestFocusWindowSnapshot && agentHostService.logFocusWindowSnapshots) {
+			this._register(agentHostService.onDidRequestFocusWindowSnapshot(boundary => {
+				void (async () => {
+					let snapshots;
+					try {
+						snapshots = trackingFeature
+							? await trackingFeature.snapshot(boundary)
+							: unavailableRequestEditSurvivalSnapshots(boundary, 'collectionDisabled');
+					} catch (error) {
+						const message = error instanceof Error ? error.message : String(error);
+						logService.error('[EditTelemetryContribution] Failed to collect request focus-window snapshots', error);
+						snapshots = unavailableRequestEditSurvivalSnapshots(boundary, 'collectionError', [message]);
+					}
+					await agentHostService.logFocusWindowSnapshots!(snapshots);
+				})().catch(error => logService.error('[EditTelemetryContribution] Failed to return request focus-window snapshots', error));
+			}));
+		}
 
 		const aiStatsEnabled = observableConfigValue(AI_STATS_SETTING_ID, true, configurationService);
 		this._register(autorun(r => {
