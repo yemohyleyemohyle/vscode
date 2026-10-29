@@ -4,7 +4,10 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import sinon from 'sinon';
 import { DeferredPromise } from '../../../../base/common/async.js';
+import { VSBuffer } from '../../../../base/common/buffer.js';
+import { LcsDiff } from '../../../../base/common/diff/diff.js';
 import { observableValue, type ISettableObservable } from '../../../../base/common/observable.js';
 import { URI } from '../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
@@ -15,11 +18,13 @@ import { IAgentHostGitService } from '../../common/agentHostGitService.js';
 import { NullAgentEditAttributionService } from '../../common/fileEditAttribution.js';
 import { MessageKind, type URI as ProtocolURI } from '../../common/state/sessionState.js';
 import { RequestDiffSurvivalContribution } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalContribution.js';
-import { computeRequestDiffFile, computeRequestDiffSurvivalMetric, type IRequestRepositoryDiff } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvival.js';
+import { computeRequestDiffFile, computeRequestDiffSurvivalMetric, type IRequestRepositoryDiff, type IRequestDiffSurvivalMetric } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvival.js';
 import { createNoopGitService } from '../common/sessionTestHelpers.js';
+import type { IRequestCharacterRepositoryDiff } from '../../node/chatContributions/requestDiffSurvival/requestCharacterDiffSurvival.js';
 
 suite('Agent Host Request Diff Survival', () => {
 	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
+	teardown(() => sinon.restore());
 
 	test('matches the proposal survival examples', () => {
 		const scenarios = [
@@ -196,13 +201,92 @@ suite('Agent Host Request Diff Survival', () => {
 				await ended;
 			}
 			assert.deepStrictEqual(
-				logService.observations.filter(observation => observation.originatingRequestId === 'request-0').map(observation => ({
-					index: observation.observationIndex,
-					maximum: observation.maximumObservationCount,
-					final: observation.isFinalObservation,
-				})),
-				Array.from({ length: 20 }, (_, index) => ({ index, maximum: 20, final: index === 19 })),
+				[logService.observations, logService.characterObservations].map(observations =>
+					observations.filter(observation => observation.originatingRequestId === 'request-0').map(observation => ({
+						index: observation.observationIndex,
+						maximum: observation.maximumObservationCount,
+						final: observation.isFinalObservation,
+					}))),
+				Array.from({ length: 2 }, () => Array.from({ length: 20 }, (_, index) => ({ index, maximum: 20, final: index === 19 }))),
 			);
+		} finally {
+			if (previousValue === undefined) {
+				delete process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG;
+			} else {
+				process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG = previousValue;
+			}
+		}
+	});
+
+	test('logs character diffs with the same boundary metadata and without extra blob reads', async () => {
+		const previousValue = process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG;
+		process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG = '1';
+		try {
+			const repository = URI.file('/repo');
+			const logService = new RecordingObservationLogService();
+			let blobReads = 0;
+			let missingBlob = false;
+			const contribution = disposables.add(new RequestDiffSurvivalContribution(
+				new TestContributionContext(), logService,
+				{
+					...NULL_CHECKPOINT_SERVICE,
+					getTurnStartCheckpointState: async () => [{ repository, tree: 'before' }],
+					waitForTurnCheckpointPair: async () => ({ parent: 'before', current: 'after' }),
+				},
+				{
+					...createNoopGitService(),
+					computeFileDiffsBetweenRefs: async () => [{
+						before: { uri: 'file:///repo/file', content: { uri: 'before' } },
+						after: { uri: 'file:///repo/file', content: { uri: 'after' } },
+						diff: { added: 1, removed: 1 },
+					}],
+					showBlob: async (_repository, ref) => {
+						blobReads++;
+						return missingBlob ? undefined : VSBuffer.fromString(ref === 'before' ? 'base' : 'base中文');
+					},
+				},
+				new NullAgentEditAttributionService(),
+			));
+			const ended = logService.whenRequestEnds('request');
+			contribution.onOutgoingTurn({ session: 'session', chat: 'chat', turnId: 'request', message: { text: 'request', origin: { kind: MessageKind.User }, model: { id: 'model' } } });
+			contribution.onTurnEnd({ session: 'session', channel: 'chat', turnId: 'request', reason: { kind: 'success' } });
+			await ended;
+			const character = logService.characterObservations[0];
+			const line = logService.observations[0];
+			assert.deepStrictEqual({
+				blobReads,
+				shape: observationShape(character),
+				sameMetadata: observationShape(character).baseTimestampsOrdered === observationShape(line).baseTimestampsOrdered
+					&& character.observationTimestamp === line.observationTimestamp,
+				unit: character.unit,
+				complete: character.complete,
+				survival: character.survival,
+				ranges: character.diffs.originalRequest.files[0].plus,
+			}, {
+				blobReads: 2,
+				shape: { ...observationShape(line), schemaVersion: 1 },
+				sameMetadata: true,
+				unit: 'utf16CodeUnit', complete: true,
+				survival: { survivingAdditions: 2, survivingDeletions: 0, totalAdditions: 2, totalDeletions: 0, totalSurviving: 2, totalEdits: 2, ratio: 1 },
+				ranges: [{ path: `${repository.toString()}#file`, offset: 4, length: 2, text: '中文' }],
+			});
+			const failure = sinon.stub(LcsDiff.prototype, 'ComputeDiff').throws(new Error('character calculation failed'));
+			for (const requestId of ['character-error', 'blob-error']) {
+				missingBlob = requestId === 'blob-error';
+				const finished = logService.whenRequestEnds(requestId);
+				contribution.onOutgoingTurn({ session: 'session', chat: 'chat', turnId: requestId, message: { text: 'request', origin: { kind: MessageKind.User } } });
+				contribution.onTurnEnd({ session: 'session', channel: 'chat', turnId: requestId, reason: { kind: 'success' } });
+				await finished;
+			}
+			failure.restore();
+			assert.deepStrictEqual(['character-error', 'blob-error'].map(requestId => {
+				const line = logService.observations.find(record => record.originatingRequestId === requestId && record.observationIndex === 0)!;
+				const character = logService.characterObservations.find(record => record.originatingRequestId === requestId && record.observationIndex === 0)!;
+				return { lineComplete: line.complete, characterComplete: character.complete, hasCharacterErrors: character.diffs.originalRequest.errors.length > 0 };
+			}), [
+				{ lineComplete: true, characterComplete: false, hasCharacterErrors: true },
+				{ lineComplete: false, characterComplete: false, hasCharacterErrors: true },
+			]);
 		} finally {
 			if (previousValue === undefined) {
 				delete process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG;
@@ -370,15 +454,36 @@ class ObservationLogService extends NullLogService {
 }
 
 interface IRecordedObservation {
+	readonly schemaVersion: number;
+	readonly complete: boolean;
 	readonly originatingRequestId: string;
 	readonly observationRequestId: string;
 	readonly observationIndex: number;
 	readonly maximumObservationCount: number;
 	readonly isFinalObservation: boolean;
+	readonly baseModel: string | null;
+	readonly observationModel: string | null;
+	readonly baseStartTimestamp: string;
+	readonly baseEndTimestamp: string;
+	readonly observationTimestamp: string;
+	readonly observationBoundary: string;
+	readonly diffs: { readonly originalRequest: object };
+}
+
+interface IRecordedCharacterObservation extends IRecordedObservation {
+	readonly unit: string;
+	readonly complete: boolean;
+	readonly survival: IRequestDiffSurvivalMetric;
+	readonly diffs: {
+		readonly originalRequest: IRequestCharacterRepositoryDiff;
+		readonly baselineToLatest: IRequestCharacterRepositoryDiff;
+		readonly requestResultToLatest: IRequestCharacterRepositoryDiff;
+	};
 }
 
 class RecordingObservationLogService extends NullLogService {
 	readonly observations: IRecordedObservation[] = [];
+	readonly characterObservations: IRecordedCharacterObservation[] = [];
 	private readonly _requestEnds = new Map<string, DeferredPromise<void>>();
 
 	whenRequestEnds(requestId: string): Promise<void> {
@@ -388,6 +493,11 @@ class RecordingObservationLogService extends NullLogService {
 	}
 
 	override info(message: string): void {
+		const characterPrefix = '[RequestCharacterDiffSurvivalObservation] ';
+		if (message.startsWith(characterPrefix)) {
+			this.characterObservations.push(JSON.parse(message.slice(characterPrefix.length)));
+			return;
+		}
 		const prefix = '[RequestDiffSurvivalObservation] ';
 		if (!message.startsWith(prefix)) {
 			return;

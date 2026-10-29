@@ -14,6 +14,7 @@ import { IAgentHostGitService } from '../../../common/agentHostGitService.js';
 import { IAgentEditAttributionService, type IEditAttributionSnapshotSource } from '../../../common/fileEditAttribution.js';
 import type { ISessionFileDiff, URI as ProtocolURI } from '../../../common/state/sessionState.js';
 import { computeRequestDiffFile, computeRequestDiffSurvivalMetric, type IRequestRepositoryDiff } from './requestDiffSurvival.js';
+import { computeRequestCharacterDiffFile, computeRequestCharacterDiffSurvivalMetric, type IRequestCharacterRepositoryDiff } from './requestCharacterDiffSurvival.js';
 
 const requestDiffSurvivalState = createChatMementoKey<IRequestDiffSurvivalState>('requestDiffSurvival.state', () => ({
 	starts: new Map(),
@@ -24,6 +25,7 @@ const requestDiffSurvivalState = createChatMementoKey<IRequestDiffSurvivalState>
 const MAXIMUM_OBSERVATION_COUNT = 20;
 const LOG_PREFIX = '[RequestDiffSurvivalObservation] ';
 const CHARACTER_LOG_PREFIX = '[RequestCharacterSurvivalSnapshot] ';
+const CHARACTER_DIFF_LOG_PREFIX = '[RequestCharacterDiffSurvivalObservation] ';
 const ENABLED_ENVIRONMENT_VARIABLE = 'VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG';
 
 interface IRepositoryState {
@@ -41,11 +43,15 @@ interface IRequestDiffSurvivalTracker {
 	readonly originatingRequestId: string;
 	readonly baseline: readonly IRepositoryState[];
 	readonly requestResult: readonly IRepositoryState[];
-	readonly originalRequest: IRequestRepositoryDiff;
+	readonly originalRequest: IRequestSurvivalDiff;
 	readonly baseModel: string | null;
 	readonly baseStartTimestamp: string;
 	readonly baseEndTimestamp: string;
 	observationCount: number;
+}
+
+interface IRequestSurvivalDiff extends IRequestRepositoryDiff {
+	readonly characterDiff: IRequestCharacterRepositoryDiff;
 }
 
 interface IRequestDiffSurvivalState {
@@ -320,6 +326,20 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		};
 		tracker.observationCount++;
 		this._logService.info(`${LOG_PREFIX}${JSON.stringify(observation)}`);
+		const characterDiffs = {
+			originalRequest: tracker.originalRequest.characterDiff,
+			baselineToLatest: baselineToLatest.characterDiff,
+			requestResultToLatest: requestResultToLatest.characterDiff,
+		};
+		this._logService.info(`${CHARACTER_DIFF_LOG_PREFIX}${JSON.stringify({
+			...observation,
+			schemaVersion: 1,
+			recordKind: 'requestCharacterDiffSurvivalObservation',
+			unit: 'utf16CodeUnit',
+			complete: Object.values(characterDiffs).every(diff => diff.errors.length === 0),
+			diffs: characterDiffs,
+			survival: computeRequestCharacterDiffSurvivalMetric(characterDiffs.originalRequest, characterDiffs.baselineToLatest, characterDiffs.requestResultToLatest),
+		})}`);
 	}
 
 	private async _computeDiff(
@@ -328,14 +348,17 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		to: string,
 		before: readonly IRepositoryState[],
 		after: readonly IRepositoryState[],
-	): Promise<IRequestRepositoryDiff> {
+	): Promise<IRequestSurvivalDiff> {
 		const afterByRepository = new Map(after.map(state => [state.repository.toString(), state.ref]));
 		const files = [];
 		const errors: string[] = [];
+		const characterFiles = [];
+		const characterErrors: string[] = [];
 		for (const beforeRepository of before) {
 			const afterRef = afterByRepository.get(beforeRepository.repository.toString());
 			if (!afterRef) {
 				errors.push(`Missing latest state for repository ${beforeRepository.repository.toString()}`);
+				characterErrors.push(errors[errors.length - 1]);
 				continue;
 			}
 			const diffs = await this._gitService.computeFileDiffsBetweenRefs(beforeRepository.repository, {
@@ -345,17 +368,22 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 			});
 			if (!diffs) {
 				errors.push(`Failed to compute diff for repository ${beforeRepository.repository.toString()}`);
+				characterErrors.push(errors[errors.length - 1]);
 				continue;
 			}
 			for (const diff of diffs) {
 				try {
-					files.push(await this._materializeFileDiff(beforeRepository.repository, beforeRepository.ref, afterRef, diff));
+					const materialized = await this._materializeFileDiff(beforeRepository.repository, beforeRepository.ref, afterRef, diff);
+					files.push(materialized.line);
+					characterFiles.push(...materialized.character.files);
+					characterErrors.push(...materialized.character.errors);
 				} catch (error) {
 					errors.push(`Failed to materialize ${diff.after?.uri ?? diff.before?.uri ?? 'unknown file'}: ${error instanceof Error ? error.message : String(error)}`);
+					characterErrors.push(errors[errors.length - 1]);
 				}
 			}
 		}
-		return { from, to, files, errors };
+		return { from, to, files, errors, characterDiff: { files: characterFiles, errors: characterErrors } };
 	}
 
 	private async _materializeFileDiff(repository: URI, beforeRef: string, afterRef: string, diff: ISessionFileDiff) {
@@ -371,17 +399,23 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		if (afterPath && !after) {
 			throw new Error(`Missing after blob ${afterRef}:${afterPath}`);
 		}
-		return computeRequestDiffFile(
-			beforePath ? `${repository.toString()}#${beforePath}` : undefined,
-			afterPath ? `${repository.toString()}#${afterPath}` : undefined,
-			before?.toString() ?? '',
-			after?.toString() ?? '',
-		);
+		const originalPath = beforePath ? `${repository.toString()}#${beforePath}` : undefined;
+		const modifiedPath = afterPath ? `${repository.toString()}#${afterPath}` : undefined;
+		const originalText = before?.toString() ?? '';
+		const modifiedText = after?.toString() ?? '';
+		const line = computeRequestDiffFile(originalPath, modifiedPath, originalText, modifiedText);
+		let character: IRequestCharacterRepositoryDiff;
+		try {
+			character = { files: [computeRequestCharacterDiffFile(originalPath, modifiedPath, originalText, modifiedText)], errors: [] };
+		} catch (error) {
+			character = { files: [], errors: [`Failed to compute character diff for ${originalPath ?? modifiedPath}: ${error instanceof Error ? error.message : String(error)}`] };
+		}
+		return { line, character };
 	}
 }
 
-function emptyRepositoryDiff(from: string, to: string): IRequestRepositoryDiff {
-	return { from, to, files: [], errors: [] };
+function emptyRepositoryDiff(from: string, to: string): IRequestSurvivalDiff {
+	return { from, to, files: [], errors: [], characterDiff: { files: [], errors: [] } };
 }
 
 function toObservationDiff(diff: IRequestRepositoryDiff): Pick<IRequestRepositoryDiff, 'files' | 'errors'> {
