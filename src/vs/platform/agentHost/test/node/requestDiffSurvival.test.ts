@@ -166,6 +166,52 @@ suite('Agent Host Request Diff Survival', () => {
 		}
 	});
 
+	test('stops observing each originating request after index 19', async () => {
+		const previousValue = process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG;
+		process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG = '1';
+		try {
+			const repository = URI.file('/repo');
+			const logService = new RecordingObservationLogService();
+			const contribution = disposables.add(new RequestDiffSurvivalContribution(
+				new TestContributionContext(),
+				logService,
+				{
+					...NULL_CHECKPOINT_SERVICE,
+					getTurnStartCheckpointState: async (_session, _chat, turnId) => [{ repository, tree: `${turnId}-start` }],
+					waitForTurnCheckpointPair: async (_session, _chat, turnId) => ({ parent: `${turnId}-start`, current: `${turnId}-end` }),
+				},
+				{ ...createNoopGitService(), computeFileDiffsBetweenRefs: async () => [] },
+				new NullAgentEditAttributionService(),
+			));
+			for (let index = 0; index < 12; index++) {
+				const turnId = `request-${index}`;
+				const ended = logService.whenRequestEnds(turnId);
+				contribution.onOutgoingTurn({
+					session: 'ahp-session:/session',
+					chat: 'ahp-chat:/chat',
+					turnId,
+					message: { text: 'request', origin: { kind: MessageKind.User } },
+				});
+				contribution.onTurnEnd({ session: 'ahp-session:/session', channel: 'ahp-chat:/chat', turnId, reason: { kind: 'success' } });
+				await ended;
+			}
+			assert.deepStrictEqual(
+				logService.observations.filter(observation => observation.originatingRequestId === 'request-0').map(observation => ({
+					index: observation.observationIndex,
+					maximum: observation.maximumObservationCount,
+					final: observation.isFinalObservation,
+				})),
+				Array.from({ length: 20 }, (_, index) => ({ index, maximum: 20, final: index === 19 })),
+			);
+		} finally {
+			if (previousValue === undefined) {
+				delete process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG;
+			} else {
+				process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG = previousValue;
+			}
+		}
+	});
+
 	test('logs cumulative character snapshots with stable initial boundaries per tracking epoch', async () => {
 		const environmentVariable = 'VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG';
 		const previousValue = process.env[environmentVariable];
@@ -319,6 +365,38 @@ class ObservationLogService extends NullLogService {
 			this.firstObservation.complete(json);
 		} else if (!this.secondObservation.isSettled) {
 			this.secondObservation.complete(json);
+		}
+	}
+}
+
+interface IRecordedObservation {
+	readonly originatingRequestId: string;
+	readonly observationRequestId: string;
+	readonly observationIndex: number;
+	readonly maximumObservationCount: number;
+	readonly isFinalObservation: boolean;
+}
+
+class RecordingObservationLogService extends NullLogService {
+	readonly observations: IRecordedObservation[] = [];
+	private readonly _requestEnds = new Map<string, DeferredPromise<void>>();
+
+	whenRequestEnds(requestId: string): Promise<void> {
+		const ended = new DeferredPromise<void>();
+		this._requestEnds.set(requestId, ended);
+		return ended.p;
+	}
+
+	override info(message: string): void {
+		const prefix = '[RequestDiffSurvivalObservation] ';
+		if (!message.startsWith(prefix)) {
+			return;
+		}
+		const observation: IRecordedObservation = JSON.parse(message.slice(prefix.length));
+		this.observations.push(observation);
+		if (observation.observationIndex === 0) {
+			this._requestEnds.get(observation.originatingRequestId)?.complete();
+			this._requestEnds.delete(observation.originatingRequestId);
 		}
 	}
 }

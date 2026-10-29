@@ -21,7 +21,7 @@ const requestDiffSurvivalState = createChatMementoKey<IRequestDiffSurvivalState>
 	characterInitial: undefined,
 }));
 
-const MAXIMUM_OBSERVATION_COUNT = 10;
+const MAXIMUM_OBSERVATION_COUNT = 20;
 const LOG_PREFIX = '[RequestDiffSurvivalObservation] ';
 const CHARACTER_LOG_PREFIX = '[RequestCharacterSurvivalSnapshot] ';
 const ENABLED_ENVIRONMENT_VARIABLE = 'VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG';
