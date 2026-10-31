@@ -39,6 +39,7 @@ export class DocumentEditSourceTracker<T = void> extends Disposable {
 	private readonly _documentStore = this._register(new DisposableStore());
 	private readonly _representativePerKey: Map<string, TextModelEditSource> = new Map();
 	private readonly _sumAddedCharactersPerKey: Map</* key */string, number> = new Map();
+	private readonly _pendingAddedCharactersPerKey = new Map<string, number>();
 	private readonly _externalObservationIds = new Set<string>();
 	private readonly _ignoredInitialExternalObservationIds = new Set<string>();
 	private readonly _suppressedExternalObservationIds = new Set<string>();
@@ -80,13 +81,11 @@ export class DocumentEditSourceTracker<T = void> extends Disposable {
 							eComposed = eComposed.mapData(replacement => new EditKeySourceData(key, replacement.data.source, replacement.data.representative));
 						}
 						// queue pending external edits
+						this._recordInsertions(eComposed, this._pendingAddedCharactersPerKey);
 						this._pendingExternalEdits = this._pendingExternalEdits.compose(eComposed);
 					}
 				} else {
-					if (!this._pendingExternalEdits.isEmpty()) {
-						this._applyEdit(this._pendingExternalEdits);
-						this._pendingExternalEdits = AnnotatedStringEdit.empty;
-					}
+					this._applyPendingExternalEdits();
 					this._applyEdit(eComposed);
 				}
 
@@ -131,17 +130,17 @@ export class DocumentEditSourceTracker<T = void> extends Disposable {
 	}
 
 	private _applyEdit(e: AnnotatedStringEdit<EditKeySourceData>): void {
+		this._recordInsertions(e, this._sumAddedCharactersPerKey);
+		this._edits = this._edits.compose(e);
+	}
+
+	private _recordInsertions(e: AnnotatedStringEdit<EditKeySourceData>, counts: Map<string, number>): void {
 		for (const r of e.replacements) {
-			let existing = this._sumAddedCharactersPerKey.get(r.data.key);
-			if (existing === undefined) {
-				existing = 0;
+			if (!this._representativePerKey.has(r.data.key)) {
 				this._representativePerKey.set(r.data.key, r.data.representative);
 			}
-			const newCount = existing + r.getNewLength();
-			this._sumAddedCharactersPerKey.set(r.data.key, newCount);
+			counts.set(r.data.key, (counts.get(r.data.key) ?? 0) + r.getNewLength());
 		}
-
-		this._edits = this._edits.compose(e);
 	}
 
 	async waitForQueue(): Promise<void> {
@@ -154,10 +153,9 @@ export class DocumentEditSourceTracker<T = void> extends Disposable {
 			modifiedCount: 0,
 			deltaModifiedCount,
 		}]));
-		for (const replacement of this._pendingExternalEdits.replacements) {
-			const key = replacement.data.key;
-			const entry = counts.get(key) ?? { representative: this.getRepresentative(key) ?? replacement.data.representative, modifiedCount: 0, deltaModifiedCount: 0 };
-			entry.deltaModifiedCount += replacement.getNewLength();
+		for (const [key, insertedCount] of this._pendingAddedCharactersPerKey) {
+			const entry = counts.get(key) ?? { representative: this.getRepresentative(key)!, modifiedCount: 0, deltaModifiedCount: 0 };
+			entry.deltaModifiedCount += insertedCount;
 			counts.set(key, entry);
 		}
 		const edits = this._edits.compose(this._pendingExternalEdits);
@@ -196,12 +194,20 @@ export class DocumentEditSourceTracker<T = void> extends Disposable {
 	}
 
 	public applyPendingExternalEdits(): void {
-		if (this._pendingExternalEdits.isEmpty()) {
+		if (this._pendingAddedCharactersPerKey.size === 0 && this._pendingExternalEdits.isEmpty()) {
 			return;
 		}
-		this._applyEdit(this._pendingExternalEdits);
-		this._pendingExternalEdits = AnnotatedStringEdit.empty;
+		this._applyPendingExternalEdits();
 		this._update.trigger(undefined);
+	}
+
+	private _applyPendingExternalEdits(): void {
+		for (const [key, insertedCount] of this._pendingAddedCharactersPerKey) {
+			this._sumAddedCharactersPerKey.set(key, (this._sumAddedCharactersPerKey.get(key) ?? 0) + insertedCount);
+		}
+		this._pendingAddedCharactersPerKey.clear();
+		this._edits = this._edits.compose(this._pendingExternalEdits);
+		this._pendingExternalEdits = AnnotatedStringEdit.empty;
 	}
 
 	public getTrackedRanges(reader?: IReader, includeSuppressed = false): TrackedEdit[] {

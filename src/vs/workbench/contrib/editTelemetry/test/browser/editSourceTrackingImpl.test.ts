@@ -83,6 +83,38 @@ suite('Edit Source Tracking Windows', () => {
 		}
 	}));
 
+	test('both focus windows preserve gross insertions across successive external overwrites', () => runWithFakedTimers({}, async () => {
+		const visible = observableValue('visible', true);
+		const correlation = new TestExternalEditCorrelation();
+		const context = setup(visible, { createCorrelation: () => correlation, prepareFlush: async () => undefined }, false, '');
+		try {
+			await timeout(10);
+			context.document.applyEdit(diskReloadEdit('', 'abcdef'));
+			await timeout(1500);
+			correlation.resolve(EditSources.agentHostChatApplyEdits({
+				modelId: 'kimi-k3', sessionId: 'session-1', requestId: 'turn-1', harness: 'copilotcli',
+			}));
+			context.document.applyEdit(diskReloadEdit('abcdef', 'aXef'));
+			await timeout(1500);
+			const snapshots = await context.impl.snapshot(boundary);
+			visible.set(false, undefined);
+			await timeout(10);
+			assert.deepStrictEqual({
+				snapshots: snapshots.filter(record => record.mode !== 'longterm').map(record => ({
+					mode: record.mode, counts: record.sources.map(source => [source.deltaModifiedCount, source.modifiedCount]),
+				})),
+				reports: context.allDetails.filter(event => event.mode !== 'longterm').map(event => ({
+					mode: event.mode, inserted: event.deltaModifiedCount, retained: event.modifiedCount,
+				})),
+			}, {
+				snapshots: ['10minFocusWindow', '20minFocusWindow'].map(mode => ({ mode, counts: [[7, 4]] })),
+				reports: ['10minFocusWindow', '20minFocusWindow'].map(mode => ({ mode, inserted: 7, retained: 4 })),
+			});
+		} finally {
+			context.disposables.dispose();
+		}
+	}));
+
 	test('request snapshots do not create trackers for invisible documents', () => runWithFakedTimers({}, async () => {
 		const visible = observableValue('visible', false);
 		const context = setup(visible);
