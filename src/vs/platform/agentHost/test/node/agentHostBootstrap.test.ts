@@ -12,12 +12,13 @@ import { URI } from '../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { mock } from '../../../../base/test/common/mock.js';
 import { parseArgs, OPTIONS } from '../../../environment/node/argv.js';
+import { ByteSize } from '../../../files/common/files.js';
 import { NativeEnvironmentService } from '../../../environment/node/environmentService.js';
 import { LogLevel, NullLogService } from '../../../log/common/log.js';
 import { ITelemetryData, ITelemetryService, TelemetryLevel } from '../../../telemetry/common/telemetry.js';
 import { AgentHostGitHubService } from '../../node/agentHostGitHubService.js';
 import product from '../../../product/common/product.js';
-import { createAgentHostRuntime } from '../../node/agentHostBootstrap.js';
+import { createAgentHostRuntime, getAgentHostLogFileSize } from '../../node/agentHostBootstrap.js';
 import { NullByokLmBridgeRegistry } from '../../node/byokLmBridgeRegistry.js';
 import { AgentHostLaunchKind } from '../../common/agentHostTelemetry.js';
 import { IAgentSdkDownloader } from '../../node/agentSdkDownloader.js';
@@ -34,6 +35,13 @@ import { getGitHubClientInternals } from '../../../github/test/common/githubClie
 
 suite('agentHostBootstrap', () => {
 	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
+
+	test('increases log retention only for an enabled survival experiment', () => {
+		assert.deepStrictEqual(
+			[undefined, '0', 'true', '01', '1 ', '1'].map(getAgentHostLogFileSize),
+			[undefined, undefined, undefined, undefined, undefined, 100 * ByteSize.MB],
+		);
+	});
 
 	test('constructs the renderer BYOK runtime', async () => {
 		const testDisposables = disposables.add(new DisposableStore());

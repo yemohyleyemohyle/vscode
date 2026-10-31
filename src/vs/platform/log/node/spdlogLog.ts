@@ -76,10 +76,14 @@ export class SpdLogLogger extends AbstractMessageLogger implements ILogger {
 		rotating: boolean,
 		donotUseFormatters: boolean,
 		level: LogLevel,
+		maxFileSize?: number,
 	) {
+		if (maxFileSize !== undefined && (!Number.isSafeInteger(maxFileSize) || maxFileSize <= 0)) {
+			throw new RangeError('Maximum log file size must be a positive safe integer.');
+		}
 		super();
 		this.setLevel(level);
-		this._loggerCreationPromise = this._createSpdLogLogger(name, filepath, rotating, donotUseFormatters);
+		this._loggerCreationPromise = this._createSpdLogLogger(name, filepath, rotating, donotUseFormatters, maxFileSize);
 		this._register(this.onDidChangeLogLevel(level => {
 			if (this._logger) {
 				setLogLevel(this._logger, level);
@@ -87,9 +91,9 @@ export class SpdLogLogger extends AbstractMessageLogger implements ILogger {
 		}));
 	}
 
-	private async _createSpdLogLogger(name: string, filepath: string, rotating: boolean, donotUseFormatters: boolean): Promise<void> {
+	private async _createSpdLogLogger(name: string, filepath: string, rotating: boolean, donotUseFormatters: boolean, maxFileSize?: number): Promise<void> {
 		const filecount = rotating ? 6 : 1;
-		const filesize = (30 / filecount) * ByteSize.MB;
+		const filesize = maxFileSize ?? (30 / filecount) * ByteSize.MB;
 		const logger = await createSpdLogLogger(name, filepath, filesize, filecount, donotUseFormatters);
 		if (logger) {
 			this._logger = logger;

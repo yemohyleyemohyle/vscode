@@ -38,6 +38,18 @@ The host `requestCharacterSurvivalSnapshot` remains a separate session/chat aggr
 
 [requestFocusWindowSurvival.test.ts](./requestFocusWindowSurvival.test.ts) verifies coverage survives management IPC and distinguishes unavailable collection. The workbench `editTracker.test.ts` and `editSourceTrackingImpl.test.ts` suites cover exclusion counts, empty versus suppressed sources, unresolved correlation, and unchanged non-destructive sampling.
 
+## Request-survival experiment log retention
+
+With `VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG=1`, the utility-process Agent Host and non-quiet standalone Agent Host use a 100 MiB per-file limit with six rotated backups plus the current file (approximately 700 MiB of bounded retention). Without that exact flag value, their normal 5 MiB per-file limit remains unchanged. Other loggers keep their existing limits. This is local diagnostic retention, not a new telemetry consent or managed setting.
+
+Log rotation is size-based, not duration-based. Export all current and rotated Agent Host log files promptly after an experiment; sufficiently verbose or long runs can still rotate away early observations. Changing the limit requires rebuilding and restarting the host and cannot recover previously deleted history.
+
+The retention case in [agentHostBootstrap.test.ts](./agentHostBootstrap.test.ts) covers the flag gate used by both entry points. [loggerService.test.ts](../../../log/test/node/loggerService.test.ts) exercises the real native logger at the default 5 MiB and experiment 100 MiB thresholds, verifies the six-backup bound, and rejects invalid overrides.
+
+```bash
+./scripts/test.sh --run src/vs/platform/log/test/node/loggerService.test.ts --run src/vs/platform/agentHost/test/node/agentHostBootstrap.test.ts --grep 'Native logger retention|log retention' --reporter dot
+```
+
 ## Mission Control session configuration
 
 The Mission Control listener publishes Copilot Host's `approvalMode` vocabulary (`manual`, `assisted`, `allow-all`) in place of VS Code's native `autoApprove` vocabulary (`default`, `assisted`, `autoApprove`). The independent `mode` property advertises `interactive`, `plan`, and `autopilot`. Local clients and persisted configuration keep the native representation; Mission Control requests, snapshots, action echoes, and reconnect replay use the wire representation.

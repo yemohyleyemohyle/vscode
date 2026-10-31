@@ -252,6 +252,11 @@ export interface ILoggerOptions {
 	donotRotate?: boolean;
 
 	/**
+	 * Maximum size in bytes of each native log file. Defaults to the native logger's standard limit.
+	 */
+	maxFileSize?: number;
+
+	/**
 	 * Do not use formatters.
 	 */
 	donotUseFormatters?: boolean;

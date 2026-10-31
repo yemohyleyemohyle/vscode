@@ -31,7 +31,7 @@ import product from '../../product/common/product.js';
 import { IProductService } from '../../product/common/productService.js';
 import { shutdownAgentHostBeforeDispose } from './agentHostShutdown.js';
 import { ITelemetryService } from '../../telemetry/common/telemetry.js';
-import { createAgentHostRuntime } from './agentHostBootstrap.js';
+import { createAgentHostRuntime, getAgentHostLogFileSize } from './agentHostBootstrap.js';
 import { IAgentConfigurationService } from './agentConfigurationService.js';
 import { IAgentHostCompletions } from './agentHostCompletions.js';
 import { IAgentHostCustomizationEnablementService } from './agentHostCustomizationEnablementService.js';
@@ -176,7 +176,10 @@ async function main(): Promise<void> {
 		logService = disposables.add(new LogService(otlpLogger));
 	} else {
 		loggerService = new LoggerService(getLogLevel(environmentService), environmentService.logsHome);
-		const logger = loggerService.createLogger('agenthost-server', { name: localize('agentHostServer', "Agent Host Server") });
+		const logger = loggerService.createLogger('agenthost-server', {
+			name: localize('agentHostServer', "Agent Host Server"),
+			maxFileSize: getAgentHostLogFileSize(process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG),
+		});
 		logService = disposables.add(new LogService(logger, [otlpLogger]));
 		log('Starting standalone agent host server');
 	}

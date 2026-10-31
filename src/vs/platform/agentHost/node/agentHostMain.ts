@@ -52,7 +52,7 @@ import { IProductService } from '../../product/common/productService.js';
 import { localize } from '../../../nls.js';
 import { IFileService } from '../../files/common/files.js';
 import { IInstantiationService } from '../../instantiation/common/instantiation.js';
-import { createAgentHostRuntime, type IAgentHostRuntime } from './agentHostBootstrap.js';
+import { createAgentHostRuntime, getAgentHostLogFileSize, type IAgentHostRuntime } from './agentHostBootstrap.js';
 import { BANG_COMMAND_PREFIX } from './agentHostBangCommand.js';
 import { AgentHostClientFileSystemProvider } from '../common/agentHostClientFileSystemProvider.js';
 import { AGENT_CLIENT_SCHEME } from '../common/agentClientUri.js';
@@ -125,7 +125,10 @@ async function startAgentHost(): Promise<void> {
 	// Non-protocol management and logging IPC remain separate from the AHP data plane.
 	const loggerChannel = new LoggerChannel(loggerService, () => DefaultURITransformer);
 	utilityProcessServer?.registerChannel(AgentHostIpcChannels.Logger, loggerChannel);
-	const logger = loggerService.createLogger('agenthost', { name: localize('agentHost', "Agent Host") });
+	const logger = loggerService.createLogger('agenthost', {
+		name: localize('agentHost', "Agent Host"),
+		maxFileSize: getAgentHostLogFileSize(process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG),
+	});
 	// OTLP log fan-out: any consumer that subscribes to the host's
 	// `ahp-otlp://logs/{level}` channel will receive every log record this
 	// `ILogService` produces, in addition to the regular file logger. The

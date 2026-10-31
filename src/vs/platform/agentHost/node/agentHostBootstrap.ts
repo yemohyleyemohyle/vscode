@@ -10,7 +10,7 @@ import { joinPath } from '../../../base/common/resources.js';
 import { URI } from '../../../base/common/uri.js';
 import { Schemas } from '../../../base/common/network.js';
 import { INativeEnvironmentService } from '../../environment/common/environment.js';
-import { IFileService } from '../../files/common/files.js';
+import { ByteSize, IFileService } from '../../files/common/files.js';
 import { FileService } from '../../files/common/fileService.js';
 import { DiskFileSystemProvider } from '../../files/node/diskFileSystemProvider.js';
 import { IInstantiationService } from '../../instantiation/common/instantiation.js';
@@ -46,6 +46,11 @@ import { AgentHostLocalTurns, IAgentHostLocalTurns } from './agentHostLocalTurns
 import { IAgentHostGitHubService } from './agentHostGitHubService.js';
 import { IAgentHostUtilityModelService } from './agentHostUtilityModelService.js';
 import { AgentHostStartupMarks, IAgentHostStartupPerformance } from './agentHostStartupPerformance.js';
+
+/** Keeps verbose survival experiments from prematurely rotating away request history. */
+export function getAgentHostLogFileSize(survivalLoggingFlag: string | undefined): number | undefined {
+	return survivalLoggingFlag === '1' ? 100 * ByteSize.MB : undefined;
+}
 
 export interface ICreateAgentHostRuntimeOptions {
 	readonly environmentService: INativeEnvironmentService;

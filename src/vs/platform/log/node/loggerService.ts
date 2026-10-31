@@ -11,6 +11,6 @@ import { SpdLogLogger } from './spdlogLog.js';
 export class LoggerService extends AbstractLoggerService implements ILoggerService {
 
 	protected doCreateLogger(resource: URI, logLevel: LogLevel, options?: ILoggerOptions): ILogger {
-		return new SpdLogLogger(generateUuid(), resource.fsPath, !options?.donotRotate, !!options?.donotUseFormatters, logLevel);
+		return new SpdLogLogger(generateUuid(), resource.fsPath, !options?.donotRotate, !!options?.donotUseFormatters, logLevel, options?.maxFileSize);
 	}
 }
