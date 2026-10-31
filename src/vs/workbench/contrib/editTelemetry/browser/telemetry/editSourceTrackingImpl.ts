@@ -275,6 +275,7 @@ class TrackedDocumentInfo extends Disposable {
 				elapsedFocusTimeMs: this._userAttentionService.totalFocusTimeMs - metadata.startFocusTime,
 				elapsedWallTimeMs: capturedTime - metadata.startTime,
 				complete, status: complete ? 'complete' : 'incomplete', reason: complete ? undefined : 'correlationPending', errors: [],
+				excludedAgentHostObservationCount: snapshot.excludedAgentHostObservationCount,
 				sources: selectDetailsSources(grouped, mode).map(([, { representative, modifiedCount, deltaModifiedCount }]) => ({
 					sourceKey: representative.toKey(1), modelId: representative.props.$modelId ?? null, modifiedCount, deltaModifiedCount,
 					sourceSessionId: representative.props.$$sessionId, sourceAgentSessionId: representative.props.$$agentSessionId,

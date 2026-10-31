@@ -30,6 +30,14 @@ Outgoing contributions receive the explicit or inherited model selection capture
 
 The effective-selection cases in [requestDiffSurvival.test.ts](./requestDiffSurvival.test.ts) cover both line and character records, inherited selection, explicit override, unknown values, Auto/Fusion, and later model changes. The model-selection suite in [agentSideEffects.test.ts](./agentSideEffects.test.ts) verifies that the real send path forwards those facts without changing the outgoing message.
 
+## Request-survival attribution coverage
+
+Schema version 2 of `requestFocusWindowSurvivalSnapshot` separates collection success (`complete`/`status`) from attribution policy (`attributionCoverage`). Renderer longterm excludes correlated host-owned observations; 10/20-minute windows can reattribute them and are not human-only. `excludedAgentHostObservationCount` counts excluded correlated observations, including zero-survivor observations; it is null when no tracker was sampled. It is not a character count or a unique edit total across snapshots.
+
+The host `requestCharacterSurvivalSnapshot` remains a separate session/chat aggregate. Do not sum it with per-document renderer windows or treat an empty renderer component as zero agent survival. Old schema-1 records lack explicit coverage metadata and must remain legacy/unspecified in consumers. New collection metadata does not change consent, eligibility, suppression, or natural-report ownership.
+
+[requestFocusWindowSurvival.test.ts](./requestFocusWindowSurvival.test.ts) verifies coverage survives management IPC and distinguishes unavailable collection. The workbench `editTracker.test.ts` and `editSourceTrackingImpl.test.ts` suites cover exclusion counts, empty versus suppressed sources, unresolved correlation, and unchanged non-destructive sampling.
+
 ## Mission Control session configuration
 
 The Mission Control listener publishes Copilot Host's `approvalMode` vocabulary (`manual`, `assisted`, `allow-all`) in place of VS Code's native `autoApprove` vocabulary (`default`, `assisted`, `autoApprove`). The independent `mode` property advertises `interactive`, `plan`, and `autopilot`. Local clients and persisted configuration keep the native representation; Mission Control requests, snapshots, action echoes, and reconnect replay use the wire representation.

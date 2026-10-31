@@ -74,6 +74,18 @@ suite('Request Focus Window Survival', () => {
 				boundary, status: 'error', reason: 'transportError', sources: [], document: null,
 			}))),
 		});
+
+	});
+
+	test('distinguishes coverage policy from unavailable collection', () => {
+		assert.deepStrictEqual(unavailableRequestEditSurvivalSnapshots(boundary, 'noActiveTracker').map(record => ({
+			schema: record.schemaVersion, mode: record.mode, status: record.status, complete: record.complete,
+			scope: record.attributionScope, coverage: record.attributionCoverage, excluded: record.excludedAgentHostObservationCount,
+		})), ['10minFocusWindow', '20minFocusWindow', 'longterm'].map(mode => ({
+			schema: 2, mode, status: 'unavailable', complete: false, scope: 'includedSourcesInRendererTracker',
+			coverage: mode === 'longterm' ? 'rendererExcludingCorrelatedAgentHost' : 'rendererIncludingCorrelatedAgentHost',
+			excluded: null,
+		})));
 	});
 
 	test('reports a bounded transport timeout once and ignores late replies', () => runWithFakedTimers({}, async () => {
@@ -115,7 +127,7 @@ suite('Request Focus Window Survival', () => {
 
 	function measuredSnapshots(): IRequestFocusWindowSurvivalSnapshot[] {
 		return unavailableRequestEditSurvivalSnapshots(boundary, 'noActiveTracker').map(record => ({
-			...record, status: 'complete', complete: true, reason: undefined,
+			...record, status: 'complete', complete: true, reason: undefined, excludedAgentHostObservationCount: record.mode === 'longterm' ? 1 : 0,
 			documentUri: 'file:///open.ts', trackerInstanceId: `tracker-${record.mode}`,
 			windowStartTimestamp: boundary.observationTimestamp, elapsedFocusTimeMs: 100, elapsedWallTimeMs: 200,
 			sources: [{ sourceKey: 'source:cursor', modelId: null, modifiedCount: 2, deltaModifiedCount: 3 }],

@@ -17,19 +17,23 @@ export interface IRequestEditSurvivalBoundary {
 }
 
 export interface IRequestFocusWindowSurvivalSnapshot extends IRequestEditSurvivalBoundary {
-	readonly schemaVersion: 1;
+	readonly schemaVersion: 2;
 	readonly recordKind: 'requestFocusWindowSurvivalSnapshot';
 	readonly mode: RequestEditSurvivalMode;
 	readonly targetFocusTimeMs: number | null;
 	readonly unit: 'utf16CodeUnit';
 	readonly documentScope: 'existingEligibleRendererTrackers';
-	readonly attributionScope: 'allSourcesInRendererTracker';
+	readonly attributionScope: 'includedSourcesInRendererTracker';
+	/** Describes this component's inclusion policy, not complete coverage of host-owned edits. */
+	readonly attributionCoverage: 'rendererExcludingCorrelatedAgentHost' | 'rendererIncludingCorrelatedAgentHost';
+	readonly excludedAgentHostObservationCount: number | null;
 	readonly capturedTimestamp: string;
 	readonly documentUri: string | null;
 	readonly trackerInstanceId: string | null;
 	readonly windowStartTimestamp: string | null;
 	readonly elapsedFocusTimeMs: number | null;
 	readonly elapsedWallTimeMs: number | null;
+	/** Collection/drain success only; independent of attribution coverage. */
 	readonly complete: boolean;
 	readonly status: RequestEditSurvivalStatus;
 	readonly reason?: RequestEditSurvivalReason;
@@ -48,9 +52,11 @@ export interface IRequestFocusWindowSurvivalSnapshot extends IRequestEditSurviva
 
 export function unavailableRequestEditSurvivalSnapshots(boundary: IRequestEditSurvivalBoundary, reason: RequestEditSurvivalReason, errors: readonly string[] = []): IRequestFocusWindowSurvivalSnapshot[] {
 	return requestEditSurvivalModes.map(mode => ({
-		...boundary, schemaVersion: 1, recordKind: 'requestFocusWindowSurvivalSnapshot', mode,
+		...boundary, schemaVersion: 2, recordKind: 'requestFocusWindowSurvivalSnapshot', mode,
 		capturedTimestamp: new Date().toISOString(), targetFocusTimeMs: mode === 'longterm' ? null : mode === '10minFocusWindow' ? 600_000 : 1_200_000,
-		unit: 'utf16CodeUnit', documentScope: 'existingEligibleRendererTrackers', attributionScope: 'allSourcesInRendererTracker',
+		unit: 'utf16CodeUnit', documentScope: 'existingEligibleRendererTrackers', attributionScope: 'includedSourcesInRendererTracker',
+		attributionCoverage: mode === 'longterm' ? 'rendererExcludingCorrelatedAgentHost' : 'rendererIncludingCorrelatedAgentHost',
+		excludedAgentHostObservationCount: null,
 		documentUri: null, trackerInstanceId: null, windowStartTimestamp: null, elapsedFocusTimeMs: null, elapsedWallTimeMs: null,
 		complete: false, status: reason === 'transportError' || reason === 'collectionError' ? 'error' : 'unavailable', reason, errors, sources: [],
 	}));

@@ -115,6 +115,41 @@ suite('Edit Source Tracking Windows', () => {
 		}
 	}));
 
+	test('request snapshots distinguish empty, excluded and unresolved attribution from collection success', () => runWithFakedTimers({}, async () => {
+		const correlation = new TestExternalEditCorrelation();
+		const context = setup(observableValue('visible', true), { createCorrelation: () => correlation, prepareFlush: async () => undefined }, false, '');
+		try {
+			await timeout(10);
+			const project = (records: Awaited<ReturnType<EditSourceTrackingImpl['snapshot']>>) => records.map(record => ({
+				mode: record.mode, status: record.status, complete: record.complete, coverage: record.attributionCoverage,
+				excluded: record.excludedAgentHostObservationCount, sources: record.sources.length,
+			}));
+			const empty = project(await context.impl.snapshot(boundary));
+			context.document.applyEdit(diskReloadEdit('', 'abcdef'));
+			await timeout(1500);
+			const pending = project(await context.impl.snapshot(boundary));
+			correlation.resolve(EditSources.agentHostChatApplyEdits({
+				modelId: 'kimi-k3', sessionId: 'session-1', requestId: 'turn-1', harness: 'copilotcli',
+			}));
+			const resolved = project(await context.impl.snapshot(boundary));
+			const repeated = project(await context.impl.snapshot(boundary));
+			const modes = ['10minFocusWindow', '20minFocusWindow', 'longterm'];
+			const expected = modes.map(mode => ({
+				mode, status: 'complete', complete: true,
+				coverage: mode === 'longterm' ? 'rendererExcludingCorrelatedAgentHost' : 'rendererIncludingCorrelatedAgentHost',
+				excluded: 0, sources: 0,
+			}));
+			assert.deepStrictEqual({ empty, pending, resolved, repeated }, {
+				empty: expected,
+				pending: expected.map(record => ({ ...record, status: 'incomplete', complete: false, sources: record.mode === 'longterm' ? 0 : 1 })),
+				resolved: expected.map(record => ({ ...record, excluded: record.mode === 'longterm' ? 1 : 0, sources: record.mode === 'longterm' ? 0 : 1 })),
+				repeated: resolved,
+			});
+		} finally {
+			context.disposables.dispose();
+		}
+	}));
+
 	test('request snapshots do not create trackers for invisible documents', () => runWithFakedTimers({}, async () => {
 		const visible = observableValue('visible', false);
 		const context = setup(visible);

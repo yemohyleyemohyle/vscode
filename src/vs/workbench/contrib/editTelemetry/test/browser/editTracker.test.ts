@@ -131,16 +131,19 @@ suite('DocumentEditSourceTracker', () => {
 		correlation.suppress('observation-1');
 		correlation.suppress('observation-2');
 		const suppressed = tracker.snapshot().sources;
+		const excluded = tracker.snapshot().excludedAgentHostObservationCount;
 		tracker.applyPendingExternalEdits();
 		const fallback = snapshot(tracker, true);
 		correlation.invalidate('observation-1');
-		assert.deepStrictEqual({ suppressed, fallback, invalidated: snapshot(tracker) }, {
+		assert.deepStrictEqual({ suppressed, excluded, fallback, invalidated: snapshot(tracker), remainingExcluded: tracker.snapshot().excludedAgentHostObservationCount }, {
 			suppressed: [],
+			excluded: 2,
 			fallback: [
 				{ key: 'external-observation:observation-1', delta: 6, retained: 0, requestId: undefined },
 				{ key: 'external-observation:observation-2', delta: 0, retained: 0, requestId: undefined },
 			],
 			invalidated: [{ key: 'external-observation:observation-1', delta: 6, retained: 0, requestId: undefined }],
+			remainingExcluded: 1,
 		});
 	});
 
