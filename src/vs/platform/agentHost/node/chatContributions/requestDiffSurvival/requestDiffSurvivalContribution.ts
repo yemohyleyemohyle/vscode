@@ -133,7 +133,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		if (!this._enabled) {
 			return undefined;
 		}
-		const observationModel = turn.message.model?.id ?? null;
+		const observationModel = turn.message.model?.id ?? turn.effectiveModel?.id ?? null;
 		const observationTimestamp = new Date().toISOString();
 		this._editAttributionService.requestFocusWindowSnapshot({
 			sessionId: turn.session, chatId: turn.chat, observationRequestId: turn.turnId, observationTimestamp, observationBoundary: 'requestStart',

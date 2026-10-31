@@ -24,6 +24,12 @@ The `client plugins across chat launches` suite in [copilotAgent.test.ts](./copi
 
 The snapshot tests in [agentEditAttributionService.test.ts](./agentEditAttributionService.test.ts) separately verify cumulative counts across successive turns, repeated non-destructive reads, and epoch advancement after an explicit flush. They do not replace a live provider check of runtime refreshes and survival logs.
 
+## Request-survival model metadata
+
+Outgoing contributions receive the explicit or inherited model selection captured by the send path after selection updates. The survival logger captures that selection's identifier synchronously at the originating boundary and retains it independently of later chat model changes. `baseModel` and `observationModel` describe selections, not provider-resolved executing models; Auto/Fusion remains a selection and unresolved values stay null.
+
+The effective-selection cases in [requestDiffSurvival.test.ts](./requestDiffSurvival.test.ts) cover both line and character records, inherited selection, explicit override, unknown values, Auto/Fusion, and later model changes. The model-selection suite in [agentSideEffects.test.ts](./agentSideEffects.test.ts) verifies that the real send path forwards those facts without changing the outgoing message.
+
 ## Mission Control session configuration
 
 The Mission Control listener publishes Copilot Host's `approvalMode` vocabulary (`manual`, `assisted`, `allow-all`) in place of VS Code's native `autoApprove` vocabulary (`default`, `assisted`, `autoApprove`). The independent `mode` property advertises `interactive`, `plan`, and `autopilot`. Local clients and persisted configuration keep the native representation; Mission Control requests, snapshots, action echoes, and reconnect replay use the wire representation.

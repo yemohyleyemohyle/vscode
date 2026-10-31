@@ -12,7 +12,7 @@ import type { IAgent, IAgentChatUsageSignal } from './agent.js';
 import type { IAgentHostCredentialSource } from './agentHostCredentials.js';
 import type { AgentHostLaunchKind, AgentHostTurnFailureStage, IAgentHostClientTelemetryContext } from './agentHostTelemetry.js';
 import type { ActionOrigin, StateAction } from './state/sessionActions.js';
-import type { ChatConfigState, ErrorInfo, Message, Turn, URI as ProtocolURI } from './state/sessionState.js';
+import type { ChatConfigState, ErrorInfo, Message, ModelSelection, Turn, URI as ProtocolURI } from './state/sessionState.js';
 
 export const IAgentHostChatContributions = createDecorator<IAgentHostChatContributions>('agentHostChatContributions');
 
@@ -54,6 +54,8 @@ export interface IOutgoingTurn {
 	readonly chat: ProtocolURI;
 	readonly message: Message;
 	readonly turnId: string;
+	/** Explicit or inherited selection captured before dispatch, not the provider-resolved executing model. */
+	readonly effectiveModel?: ModelSelection;
 	/**
 	 * The directories the provider runs this turn in, after host-owned
 	 * resolution: an isolated worktree created on the first send, the worktree

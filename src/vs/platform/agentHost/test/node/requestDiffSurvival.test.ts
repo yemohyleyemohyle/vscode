@@ -83,6 +83,69 @@ suite('Agent Host Request Diff Survival', () => {
 		assert.strictEqual(metric.ratio, null);
 	});
 
+	for (const scenario of [
+		{ name: 'inherited', explicit: undefined, effective: 'kimi-k3', expected: 'kimi-k3' },
+		{ name: 'explicit override', explicit: 'gpt-5', effective: 'kimi-k3', expected: 'gpt-5' },
+		{ name: 'unknown', explicit: undefined, effective: undefined, expected: null },
+		{ name: 'Auto selection', explicit: undefined, effective: 'auto', expected: 'auto' },
+		{ name: 'Fusion selection', explicit: undefined, effective: 'hydrafusion', expected: 'hydrafusion' },
+	]) {
+		test(`captures effective model metadata at the request boundary: ${scenario.name}`, async () => {
+			const previousValue = process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG;
+			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG = '1';
+			try {
+				const repository = URI.file('/repo');
+				const logService = new RecordingObservationLogService();
+				const contribution = disposables.add(new RequestDiffSurvivalContribution(
+					new TestContributionContext(), logService,
+					{
+						...NULL_CHECKPOINT_SERVICE,
+						getTurnStartCheckpointState: async () => [{ repository, tree: 'before' }],
+						waitForTurnCheckpointPair: async () => ({ parent: 'before', current: 'after' }),
+					},
+					createNoopGitService(), new NullAgentEditAttributionService(),
+				));
+				const ended = logService.whenRequestEnds('base');
+				const effectiveModel = scenario.effective === undefined ? undefined : { id: scenario.effective };
+				contribution.onOutgoingTurn({
+					session: 'session', chat: 'chat', turnId: 'base', effectiveModel,
+					message: { text: 'base', origin: { kind: MessageKind.User }, model: scenario.explicit === undefined ? undefined : { id: scenario.explicit } },
+				});
+				if (effectiveModel) {
+					effectiveModel.id = 'changed-after-boundary';
+				}
+				contribution.onTurnEnd({ session: 'session', channel: 'chat', turnId: 'base', reason: { kind: 'success' } });
+				await ended;
+				const laterEnded = logService.whenRequestEnds('later');
+				contribution.onOutgoingTurn({
+					session: 'session', chat: 'chat', turnId: 'later', effectiveModel: { id: 'later-model' },
+					message: { text: 'later', origin: { kind: MessageKind.User } },
+				});
+				contribution.onTurnEnd({ session: 'session', channel: 'chat', turnId: 'later', reason: { kind: 'success' } });
+				await laterEnded;
+				const project = (records: readonly IRecordedObservation[]) => records.map(record => ({
+					base: record.baseModel, observing: record.observationModel, origin: record.originatingRequestId,
+					request: record.observationRequestId, boundary: record.observationBoundary,
+				}));
+				const expected = [
+					{ base: scenario.expected, observing: scenario.expected, origin: 'base', request: 'base', boundary: 'requestEnd' },
+					{ base: scenario.expected, observing: 'later-model', origin: 'base', request: 'later', boundary: 'requestStart' },
+					{ base: scenario.expected, observing: 'later-model', origin: 'base', request: 'later', boundary: 'requestEnd' },
+					{ base: 'later-model', observing: 'later-model', origin: 'later', request: 'later', boundary: 'requestEnd' },
+				];
+				assert.deepStrictEqual({ line: project(logService.observations), character: project(logService.characterObservations) }, {
+					line: expected, character: expected,
+				});
+			} finally {
+				if (previousValue === undefined) {
+					delete process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG;
+				} else {
+					process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG = previousValue;
+				}
+			}
+		});
+	}
+
 	test('logs models and timestamps without derived state labels', async () => {
 		const environmentVariable = 'VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG';
 		const previousValue = process.env[environmentVariable];

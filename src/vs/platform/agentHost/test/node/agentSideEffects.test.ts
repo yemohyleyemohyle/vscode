@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import sinon from 'sinon';
 import { readChatUsage } from '../../common/meta/agentUsageMeta.js';
 import { VSBuffer } from '../../../../base/common/buffer.js';
 import { DeferredPromise, SequencerByKey, timeout } from '../../../../base/common/async.js';
@@ -4048,6 +4049,38 @@ suite('AgentSideEffects', () => {
 	// ---- handleAction: chat/turnStarted model selection --------------------
 
 	suite('handleAction — chat/turnStarted model selection', () => {
+		for (const scenario of [
+			{ name: 'inherited', explicit: undefined, inherited: 'kimi-k3', expected: 'kimi-k3' },
+			{ name: 'explicit', explicit: 'gpt-5', inherited: 'kimi-k3', expected: 'gpt-5' },
+			{ name: 'unknown', explicit: undefined, inherited: undefined, expected: undefined },
+			{ name: 'Auto', explicit: undefined, inherited: 'auto', expected: 'auto' },
+			{ name: 'Fusion', explicit: undefined, inherited: 'hydrafusion', expected: 'hydrafusion' },
+		]) {
+			test(`forwards the effective model selection to contributions: ${scenario.name}`, async () => {
+				setupSession();
+				agent.chatModel = scenario.inherited === undefined ? undefined : { id: scenario.inherited };
+				const outgoing = sinon.spy(AgentHostChatContributions.prototype, 'outgoingTurn');
+				try {
+					const sent = new DeferredPromise<void>();
+					agent.sendMessage = async () => { sent.complete(); };
+					sideEffects.handleAction(defaultChatUri, {
+						type: ActionType.ChatTurnStarted, turnId: 'selection', startedAt: '2026-01-01T00:00:00.000Z',
+						message: {
+							text: 'hello', origin: { kind: MessageKind.User },
+							model: scenario.explicit === undefined ? undefined : { id: scenario.explicit },
+						},
+					});
+					await sent.p;
+					const turn = outgoing.lastCall.args[0];
+					assert.deepStrictEqual({
+						effective: turn.effectiveModel?.id, explicit: turn.message.model?.id, chat: turn.chat,
+					}, { effective: scenario.expected, explicit: scenario.explicit, chat: defaultChatUri });
+				} finally {
+					outgoing.restore();
+				}
+			});
+		}
+
 		function createCodexTurnHarness(meta?: Record<string, unknown>) {
 			const codexAgent = new MockAgent('codex');
 			disposables.add(toDisposable(() => codexAgent.dispose()));
