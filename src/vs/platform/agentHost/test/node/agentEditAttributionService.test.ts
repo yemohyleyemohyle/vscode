@@ -135,6 +135,61 @@ suite('Agent Edit Attribution Service', () => {
 		});
 	});
 
+	test('request-boundary snapshots preserve cumulative insertions across successive turns', async () => {
+		const fileService = disposables.add(new FileService(new NullLogService()));
+		disposables.add(fileService.registerProvider('file', disposables.add(new InMemoryFileSystemProvider())));
+		const resource = URI.file('/workspace/successive-turns.ts');
+		await fileService.writeFile(resource, VSBuffer.fromString(''));
+		const events: string[] = [];
+		const instantiationService = disposables.add(new TestInstantiationService());
+		instantiationService.stub(IFileService, fileService);
+		instantiationService.stub(IDiffComputeService, new TestDiffComputeService());
+		instantiationService.stub(ILogService, new NullLogService());
+		instantiationService.stub(ITelemetryService, {
+			telemetryLevel: TelemetryLevel.USAGE,
+			publicLog2: eventName => events.push(eventName),
+		});
+		const service = disposables.add(instantiationService.createInstance(AgentEditAttributionService, async () => undefined, undefined));
+		const ownerSessionUri = 'ahp-session:/owner';
+		const chatUri = buildChatUri(ownerSessionUri, 'chat');
+		const snapshots: Awaited<ReturnType<AgentEditAttributionService['snapshot']>>[] = [];
+		let beforeText = '';
+		for (const count of [100, 120, 150]) {
+			snapshots.push(await service.snapshot({ sessionUri: ownerSessionUri, chatUri }));
+			const afterText = 'a'.repeat(count);
+			await fileService.writeFile(resource, VSBuffer.fromString(afterText));
+			await service.recordEdit({
+				sessionUri: 'copilotcli:/storage',
+				ownerSessionUri,
+				provider: 'copilotcli',
+				chatUri,
+				turnId: `request-${count}`,
+				toolCallId: `tool-${count}`,
+				filePath: resource.fsPath,
+				beforeText,
+				afterText,
+				changes: computeDiffCounts(beforeText, afterText, 5000).changes,
+				modelId: 'kimi-k3',
+				toolName: 'edit',
+			});
+			snapshots.push(await service.snapshot({ sessionUri: ownerSessionUri, chatUri }));
+			snapshots.push(await service.snapshot({ sessionUri: ownerSessionUri, chatUri }));
+			beforeText = afterText;
+		}
+		assert.deepStrictEqual({ snapshots, events }, {
+			snapshots: [0, 100, 100, 100, 120, 120, 120, 150, 150].map(count => ({
+				trackingEpoch: 0,
+				sources: count === 0 ? [] : [{
+					sourceKey: 'source:Chat.applyEdits-$modelId:kimi-k3-$harness:copilotcli-$origin:agentHost',
+					modelId: 'kimi-k3',
+					deltaModifiedCount: count,
+					modifiedCount: count,
+				}],
+			})),
+			events: [],
+		});
+	});
+
 	for (const scenario of ['precise', 'invalid agent diff', 'agent timeout', 'external fallback', 'agent and external fallback'] as const) {
 		test(`reports scope-wide coarse diff counts and preserves them across cancelled flushes: ${scenario}`, async () => {
 			const before = 'aaa\nmiddle\nzzz';
