@@ -9,15 +9,21 @@ import { relativePath } from '../../../../../base/common/resources.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { ILogService } from '../../../../log/common/log.js';
 import { IAgentHostCheckpointService } from '../../../common/agentHostCheckpointService.js';
-import { createChatMementoKey, type IAgentHostChatContribution, type IAgentHostChatContributionContext, type IOutgoingTurn, type ITurnEnd } from '../../../common/agentHostChatContributionsService.js';
+import { createChatMementoKey, type IAgentHostChatContribution, type IAgentHostChatContributionContext, type IDispatchedAction, type IOutgoingTurn, type ITurnEnd } from '../../../common/agentHostChatContributionsService.js';
 import { IAgentHostGitService } from '../../../common/agentHostGitService.js';
 import { IAgentEditAttributionService, type IEditAttributionSnapshotSource } from '../../../common/fileEditAttribution.js';
+import { CLAUDE_AGENT_PROVIDER_ID, COPILOT_CLI_AGENT_PROVIDER_ID } from '../../../common/agent.js';
+import { readToolCallMeta } from '../../../common/meta/agentToolCallMeta.js';
+import { ActionType } from '../../../common/state/sessionActions.js';
 import type { ISessionFileDiff, URI as ProtocolURI } from '../../../common/state/sessionState.js';
+import { AgentHostStateManager, IAgentHostStateManager } from '../../agentHostStateManager.js';
 import { computeRequestDiffFile, computeRequestDiffSurvivalMetric, type IRequestRepositoryDiff } from './requestDiffSurvival.js';
 import { computeRequestCharacterDiffFile, computeRequestCharacterDiffSurvivalMetric, type IRequestCharacterRepositoryDiff } from './requestCharacterDiffSurvival.js';
 
 const requestDiffSurvivalState = createChatMementoKey<IRequestDiffSurvivalState>('requestDiffSurvival.state', () => ({
 	starts: new Map(),
+	requestEvidence: new Map(),
+	toolRequests: new Map(),
 	trackers: [],
 	characterInitial: undefined,
 }));
@@ -47,6 +53,7 @@ interface IRequestDiffSurvivalTracker {
 	readonly baseModel: string | null;
 	readonly baseStartTimestamp: string;
 	readonly baseEndTimestamp: string;
+	readonly originalRequestUsedEditTool: boolean | null;
 	observationCount: number;
 }
 
@@ -56,8 +63,15 @@ interface IRequestSurvivalDiff extends IRequestRepositoryDiff {
 
 interface IRequestDiffSurvivalState {
 	readonly starts: Map<string, IRequestDiffSurvivalRequestStart>;
+	readonly requestEvidence: Map<string, IRequestEditToolEvidence>;
+	readonly toolRequests: Map<string, { readonly chat: ProtocolURI; readonly turnId: string }>;
 	readonly trackers: IRequestDiffSurvivalTracker[];
 	characterInitial: IRequestCharacterSurvivalInitial | undefined;
+}
+
+interface IRequestEditToolEvidence {
+	readonly supported: boolean;
+	readonly tools: Map<ProtocolURI, Map<string, boolean | undefined>>;
 }
 
 interface IRequestCharacterSurvivalInitial {
@@ -88,6 +102,7 @@ interface IRequestDiffSurvivalObservation {
 	readonly sessionId: ProtocolURI;
 	readonly chatId: ProtocolURI;
 	readonly originatingRequestId: string;
+	readonly originalRequestUsedEditTool: boolean | null;
 	readonly observationRequestId: string;
 	readonly baseModel: string | null;
 	readonly observationModel: string | null;
@@ -122,6 +137,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		@IAgentHostCheckpointService private readonly _checkpointService: IAgentHostCheckpointService,
 		@IAgentHostGitService private readonly _gitService: IAgentHostGitService,
 		@IAgentEditAttributionService private readonly _editAttributionService: IAgentEditAttributionService,
+		@IAgentHostStateManager private readonly _stateManager: AgentHostStateManager,
 	) {
 		super();
 		if (this._enabled) {
@@ -132,6 +148,14 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 	onOutgoingTurn(turn: IOutgoingTurn): undefined {
 		if (!this._enabled) {
 			return undefined;
+		}
+		const state = this._state(turn.chat);
+		if (!state.requestEvidence.has(turn.turnId)) {
+			const provider = this._stateManager.getSessionState(turn.session)?.provider;
+			state.requestEvidence.set(turn.turnId, {
+				supported: provider === COPILOT_CLI_AGENT_PROVIDER_ID || provider === CLAUDE_AGENT_PROVIDER_ID,
+				tools: new Map(),
+			});
 		}
 		const observationModel = turn.message.model?.id ?? turn.effectiveModel?.id ?? null;
 		const observationTimestamp = new Date().toISOString();
@@ -153,11 +177,52 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		return undefined;
 	}
 
+	onDidDispatchAction(dispatched: IDispatchedAction): void {
+		if (!this._enabled || dispatched.rejectionReason) {
+			return;
+		}
+		const { action } = dispatched;
+		if (action.type !== ActionType.ChatToolCallStart
+			&& action.type !== ActionType.ChatToolCallReady
+			&& action.type !== ActionType.ChatToolCallComplete
+			&& action.type !== ActionType.ChatToolCallConfirmed) {
+			return;
+		}
+		const state = this._state(dispatched.channel);
+		const meta = dispatched.origin ? {} : readToolCallMeta(action);
+		const request = state.toolRequests.get(action.toolCallId) ?? meta['vscode.toolRequest']
+			?? { chat: dispatched.channel, turnId: action.turnId };
+		const evidence = this._state(request.chat).requestEvidence.get(request.turnId);
+		if (!evidence) {
+			return;
+		}
+		state.toolRequests.set(action.toolCallId, request);
+		let tools = evidence.tools.get(dispatched.channel);
+		if (!tools) {
+			tools = new Map();
+			evidence.tools.set(dispatched.channel, tools);
+		}
+		if (!tools.has(action.toolCallId)) {
+			tools.set(action.toolCallId, undefined);
+		}
+		if (tools.get(action.toolCallId) !== true) {
+			if (action.type === ActionType.ChatToolCallComplete) {
+				const executed = meta['vscode.editToolExecution'];
+				if (executed !== undefined || tools.get(action.toolCallId) !== false) {
+					tools.set(action.toolCallId, executed);
+				}
+			} else if (action.type === ActionType.ChatToolCallConfirmed && !action.approved) {
+				tools.set(action.toolCallId, false);
+			}
+		}
+	}
+
 	onTurnEnd(turn: ITurnEnd): void {
 		if (!this._enabled || !turn.turnId || !this._tracksTurnEnd(turn)) {
 			return;
 		}
 		const turnId = turn.turnId;
+		const originalRequestUsedEditTool = this._finishEvidence(turn.channel, turnId);
 		const observationTimestamp = new Date().toISOString();
 		this._editAttributionService.requestFocusWindowSnapshot({
 			sessionId: turn.session, chatId: turn.channel, observationRequestId: turnId, observationTimestamp, observationBoundary: 'requestEnd',
@@ -187,12 +252,35 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 				baseModel: start.model,
 				baseStartTimestamp: start.timestamp,
 				baseEndTimestamp: observationTimestamp,
+				originalRequestUsedEditTool,
 				observationCount: 0,
 			};
 			state.trackers.push(tracker);
 			await this._emitObservation(turn.session, turn.channel, turnId, start.model, observationTimestamp, 'requestEnd', result, tracker);
 			state.starts.delete(turnId);
 		});
+	}
+
+	private _finishEvidence(chat: ProtocolURI, turnId: string): boolean | null {
+		const state = this._state(chat);
+		const evidence = state.requestEvidence.get(turnId);
+		state.requestEvidence.delete(turnId);
+		if (!evidence) {
+			return null;
+		}
+		let result: boolean | null = evidence.supported ? false : null;
+		for (const [toolChat, tools] of evidence.tools) {
+			const toolState = this._state(toolChat);
+			for (const [toolCallId, executed] of tools) {
+				toolState.toolRequests.delete(toolCallId);
+				if (executed === true) {
+					result = true;
+				} else if (executed === undefined && result !== true) {
+					result = null;
+				}
+			}
+		}
+		return result;
 	}
 
 	private _tracksTurnEnd(turn: ITurnEnd): boolean {
@@ -312,6 +400,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 			sessionId: session,
 			chatId: chat,
 			originatingRequestId: tracker.originatingRequestId,
+			originalRequestUsedEditTool: tracker.originalRequestUsedEditTool,
 			observationRequestId,
 			baseModel: tracker.baseModel,
 			observationModel,

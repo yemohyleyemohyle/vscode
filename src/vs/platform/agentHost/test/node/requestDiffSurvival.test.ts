@@ -16,7 +16,9 @@ import { IAgentHostCheckpointService, NULL_CHECKPOINT_SERVICE } from '../../comm
 import type { IAgentHostChatContributionContext, IChatMementoKey, ISessionMementoKey } from '../../common/agentHostChatContributionsService.js';
 import { IAgentHostGitService } from '../../common/agentHostGitService.js';
 import { NullAgentEditAttributionService } from '../../common/fileEditAttribution.js';
-import { MessageKind, type URI as ProtocolURI } from '../../common/state/sessionState.js';
+import { createSessionState, MessageKind, SessionStatus, ToolCallCancellationReason, type URI as ProtocolURI } from '../../common/state/sessionState.js';
+import { ActionType, type ChatAction } from '../../common/state/sessionActions.js';
+import { AgentHostStateManager } from '../../node/agentHostStateManager.js';
 import { RequestDiffSurvivalContribution } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalContribution.js';
 import { computeRequestDiffFile, computeRequestDiffSurvivalMetric, type IRequestRepositoryDiff, type IRequestDiffSurvivalMetric } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvival.js';
 import { createNoopGitService } from '../common/sessionTestHelpers.js';
@@ -84,6 +86,109 @@ suite('Agent Host Request Diff Survival', () => {
 	});
 
 	for (const scenario of [
+		{ name: 'no tools', expected: false },
+		{ name: 'parent executed edit', executed: true, expected: true },
+		{ name: 'nested executed edit', toolChat: 'grandchild', executed: true, expected: true },
+		{ name: 'failed or no-op executed edit', executed: true, failed: true, expected: true },
+		{ name: 'terminal-only execution', executed: false, expected: false },
+		{ name: 'denied before execution', denied: true, expected: false },
+		{ name: 'rejected execution action', executed: true, rejected: true, expected: null },
+		{ name: 'unsupported executed tool', tool: true, expected: null },
+		{ name: 'unfinished proposed tool', tool: true, unfinished: true, expected: null },
+		{ name: 'unsupported provider', provider: 'codex', expected: null },
+		{ name: 'resumable failure', executed: true, resumable: true, expected: true },
+	] satisfies readonly {
+		name: string; expected: boolean | null; executed?: boolean; toolChat?: string; failed?: boolean;
+		denied?: boolean; rejected?: boolean; tool?: boolean; unfinished?: boolean; provider?: string; resumable?: boolean;
+	}[]) {
+		test(`freezes originating edit-tool evidence before queued checkpoints: ${scenario.name}`, async () => {
+			const previousValue = process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG;
+			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG = '1';
+			try {
+				const start = new DeferredPromise<void>();
+				const repository = URI.file('/repo');
+				const log = new RecordingObservationLogService();
+				const contribution = disposables.add(new RequestDiffSurvivalContribution(
+					new TestContributionContext(), log,
+					{
+						...NULL_CHECKPOINT_SERVICE,
+						getTurnStartCheckpointState: async () => {
+							await start.p;
+							return [{ repository, tree: 'before' }];
+						},
+						waitForTurnCheckpointPair: async () => ({ parent: 'before', current: 'after' }),
+					},
+					createNoopGitService(), new NullAgentEditAttributionService(), createStateManager(scenario.provider),
+				));
+				const send = (turnId: string) => contribution.onOutgoingTurn({
+					session: 'session', chat: 'chat', turnId,
+					message: { text: 'request', origin: { kind: MessageKind.User } },
+				});
+				const dispatch = (action: ChatAction, channel = 'chat', rejected = false) => contribution.onDidDispatchAction({
+					session: 'session', channel, action, rejectionReason: rejected ? 'rejected' : undefined,
+				});
+				const requestMeta = { 'vscode.toolRequest': { chat: 'chat', turnId: 'base' } };
+				const completion = (executed: boolean | undefined): ChatAction => ({
+					type: ActionType.ChatToolCallComplete, toolCallId: 'tool', turnId: 'child-turn',
+					result: { success: !scenario.failed, pastTenseMessage: 'finished' },
+					_meta: { ...requestMeta, 'vscode.editToolExecution': executed },
+				});
+				send('base');
+				if (scenario.executed !== undefined || scenario.tool || scenario.denied) {
+					dispatch({
+						type: ActionType.ChatToolCallStart, toolCallId: 'tool', toolName: 'edit', displayName: 'Edit',
+						turnId: 'child-turn', _meta: requestMeta,
+					}, scenario.toolChat);
+					if (scenario.denied) {
+						dispatch({
+							type: ActionType.ChatToolCallConfirmed, toolCallId: 'tool', turnId: 'child-turn',
+							approved: false, reason: ToolCallCancellationReason.Denied,
+						}, scenario.toolChat);
+						dispatch(completion(undefined), scenario.toolChat);
+					} else if (!scenario.unfinished) {
+						dispatch(completion(scenario.executed), scenario.toolChat, scenario.rejected);
+					}
+				}
+				if (scenario.resumable) {
+					contribution.onTurnEnd({
+						session: 'session', channel: 'chat', turnId: 'base',
+						reason: { kind: 'error', error: { errorType: 'requestFailed', message: 'retry' }, resumable: true },
+					});
+				}
+				const ended = log.whenRequestEnds('base');
+				contribution.onTurnEnd({ session: 'session', channel: 'chat', turnId: 'base', reason: { kind: 'success' } });
+				await start.complete();
+				await ended;
+				const laterEnded = log.whenRequestEnds('later');
+				send('later');
+				dispatch(completion(true), 'grandchild');
+				contribution.onTurnEnd({ session: 'session', channel: 'chat', turnId: 'later', reason: { kind: 'cancelled' } });
+				await laterEnded;
+				const project = (records: readonly IRecordedObservation[]) => records.map(record => ({
+					request: record.originatingRequestId,
+					used: record.originalRequestUsedEditTool,
+					otherSourceFlag: Object.hasOwn(record, 'originalRequestHadOtherSourceEdits'),
+				}));
+				const expected = [
+					{ request: 'base', used: scenario.expected, otherSourceFlag: false },
+					{ request: 'base', used: scenario.expected, otherSourceFlag: false },
+					{ request: 'base', used: scenario.expected, otherSourceFlag: false },
+					{ request: 'later', used: scenario.provider === 'codex' ? null : false, otherSourceFlag: false },
+				];
+				assert.deepStrictEqual({ line: project(log.observations), character: project(log.characterObservations) }, {
+					line: expected, character: expected,
+				});
+			} finally {
+				if (previousValue === undefined) {
+					delete process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG;
+				} else {
+					process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG = previousValue;
+				}
+			}
+		});
+	}
+
+	for (const scenario of [
 		{ name: 'inherited', explicit: undefined, effective: 'kimi-k3', expected: 'kimi-k3' },
 		{ name: 'explicit override', explicit: 'gpt-5', effective: 'kimi-k3', expected: 'gpt-5' },
 		{ name: 'unknown', explicit: undefined, effective: undefined, expected: null },
@@ -103,7 +208,7 @@ suite('Agent Host Request Diff Survival', () => {
 						getTurnStartCheckpointState: async () => [{ repository, tree: 'before' }],
 						waitForTurnCheckpointPair: async () => ({ parent: 'before', current: 'after' }),
 					},
-					createNoopGitService(), new NullAgentEditAttributionService(),
+					createNoopGitService(), new NullAgentEditAttributionService(), createStateManager(),
 				));
 				const ended = logService.whenRequestEnds('base');
 				const effectiveModel = scenario.effective === undefined ? undefined : { id: scenario.effective };
@@ -174,6 +279,7 @@ suite('Agent Host Request Diff Survival', () => {
 				checkpointService,
 				gitService,
 				attributionService,
+				createStateManager(),
 			));
 			const session = 'ahp-session:/session';
 			const chat = 'ahp-chat:/chat';
@@ -265,6 +371,7 @@ suite('Agent Host Request Diff Survival', () => {
 				},
 				{ ...createNoopGitService(), computeFileDiffsBetweenRefs: async () => [] },
 				new NullAgentEditAttributionService(),
+				createStateManager(),
 			));
 			for (let index = 0; index < 12; index++) {
 				const turnId = `request-${index}`;
@@ -324,6 +431,7 @@ suite('Agent Host Request Diff Survival', () => {
 					},
 				},
 				new NullAgentEditAttributionService(),
+				createStateManager(),
 			));
 			const ended = logService.whenRequestEnds('request');
 			contribution.onOutgoingTurn({ session: 'session', chat: 'chat', turnId: 'request', message: { text: 'request', origin: { kind: MessageKind.User }, model: { id: 'model' } } });
@@ -386,6 +494,7 @@ suite('Agent Host Request Diff Survival', () => {
 				NULL_CHECKPOINT_SERVICE,
 				createNoopGitService(),
 				new SnapshotAgentEditAttributionService(),
+				createStateManager(),
 			));
 			const session = 'ahp-session:/session';
 			const chat = 'ahp-chat:/chat';
@@ -535,6 +644,7 @@ interface IRecordedObservation {
 	readonly schemaVersion: number;
 	readonly complete: boolean;
 	readonly originatingRequestId: string;
+	readonly originalRequestUsedEditTool: boolean | null;
 	readonly observationRequestId: string;
 	readonly observationIndex: number;
 	readonly maximumObservationCount: number;
@@ -546,6 +656,15 @@ interface IRecordedObservation {
 	readonly observationTimestamp: string;
 	readonly observationBoundary: string;
 	readonly diffs: { readonly originalRequest: object };
+}
+
+function createStateManager(provider = 'copilotcli'): AgentHostStateManager {
+	const manager = sinon.createStubInstance(AgentHostStateManager);
+	manager.getSessionState.returns({
+		...createSessionState({ resource: 'session', provider, title: '', status: SessionStatus.Idle, createdAt: '', modifiedAt: '' }),
+		turns: [],
+	});
+	return manager as unknown as AgentHostStateManager;
 }
 
 interface IRecordedCharacterObservation extends IRecordedObservation {

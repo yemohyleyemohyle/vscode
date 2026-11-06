@@ -53,6 +53,7 @@ export const SUBAGENT_ID_SUFFIX_REGEX = /^\s*agentId:\s+([a-z0-9]+)\b/im;
  */
 export class SubagentSpawn {
 	background = false;
+	requestTurnId: string | undefined;
 	subagentType: string | undefined;
 	description: string | undefined;
 	prompt: string | undefined;
@@ -106,6 +107,7 @@ export class SubagentSpawn {
  * agree on a single record per `toolUseId`.
  */
 export interface ISubagentSpawnInit {
+	readonly requestTurnId?: string;
 	readonly agentId?: string;
 	readonly subagentType?: string;
 	readonly description?: string;
@@ -149,6 +151,9 @@ export class SubagentRegistry extends Disposable {
 		}
 		if (init?.agentId !== undefined) {
 			spawn.setAgentId(init.agentId);
+		}
+		if (init?.requestTurnId !== undefined && spawn.requestTurnId === undefined) {
+			spawn.requestTurnId = init.requestTurnId;
 		}
 		if (init?.subagentType !== undefined && spawn.subagentType === undefined) {
 			spawn.subagentType = init.subagentType;

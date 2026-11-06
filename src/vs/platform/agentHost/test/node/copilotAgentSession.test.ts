@@ -16326,6 +16326,38 @@ Use the attached image as context.
 	// ---- event mapping ----
 
 	suite('event mapping', () => {
+		test('experimental edit evidence retains the request owning a nested tool across root turns', async () => {
+			const previous = process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG;
+			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG = '1';
+			try {
+				const { session, mockSession, signals } = await createAgentSession(disposables);
+				session.resetTurnState('original');
+				mockSession.fire('subagent.started', {
+					toolCallId: 'parent', agentName: 'explore', agentDisplayName: 'Explore', agentDescription: 'Explore',
+				}, { agentId: 'parent-agent' });
+				mockSession.fire('tool.execution_start', { toolCallId: 'nested', toolName: 'task', arguments: {} }, { agentId: 'parent-agent' });
+				mockSession.fire('subagent.started', {
+					toolCallId: 'nested', agentName: 'explore', agentDisplayName: 'Explore', agentDescription: 'Explore',
+				}, { agentId: 'nested-agent' });
+				await timeout(0);
+				session.resetTurnState('later');
+				mockSession.fire('tool.execution_start', { toolCallId: 'edit', toolName: 'edit', arguments: {} }, { agentId: 'nested-agent' });
+				mockSession.fire('tool.execution_complete', { toolCallId: 'edit', success: false, error: { message: 'No match', code: 'failure' } }, { agentId: 'nested-agent' });
+				await timeout(0);
+				assert.deepStrictEqual(getActions(signals).flatMap(action =>
+					action.type === ActionType.ChatToolCallComplete && action.toolCallId === 'edit' ? [{
+						request: readToolCallMeta(action)['vscode.toolRequest']?.turnId,
+						executed: readToolCallMeta(action)['vscode.editToolExecution'],
+					}] : []), [{ request: 'original', executed: true }]);
+			} finally {
+				if (previous === undefined) {
+					delete process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG;
+				} else {
+					process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG = previous;
+				}
+			}
+		});
+
 
 		test('maps model.call_finished to the owning host turn', async () => {
 			const { session, mockSession, signals } = await createAgentSession(disposables);

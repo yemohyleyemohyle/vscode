@@ -219,6 +219,17 @@ export function isClaudeFileEditTool(toolName: string): boolean {
 	return TOOL_ROWS[toolName]?.isFileEdit === true;
 }
 
+/** Failed Claude results do not distinguish execution failures from SDK-owned denials. */
+export function getClaudeEditToolExecution(toolName: string, success: boolean, denialCode: string | undefined): boolean | undefined {
+	if (toolName.startsWith('mcp__')) {
+		return undefined;
+	}
+	if (!isClaudeFileEditTool(toolName) || denialCode !== undefined) {
+		return false;
+	}
+	return success ? true : undefined;
+}
+
 /**
  * Phase 7 S3.5. Tools whose `canUseTool` invocation is satisfied by a
  * host-driven round-trip rather than the SDK's auto-approval:

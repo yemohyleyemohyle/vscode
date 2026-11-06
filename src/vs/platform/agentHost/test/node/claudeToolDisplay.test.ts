@@ -7,6 +7,7 @@ import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import {
 	getClaudeConfirmationTitle,
+	getClaudeEditToolExecution,
 	getClaudeInvocationMessage,
 	getClaudePastTenseMessage,
 	getClaudePermissionKind,
@@ -29,6 +30,19 @@ import {
 suite('claudeToolDisplay — §4 mapping table', () => {
 
 	ensureNoDisposablesAreLeakedInTestSuite();
+
+	test('edit execution evidence leaves ambiguous Claude failures and MCP tools unknown', () => {
+		assert.deepStrictEqual([
+			getClaudeEditToolExecution('Edit', true, undefined),
+			getClaudeEditToolExecution('Write', true, undefined),
+			getClaudeEditToolExecution('NotebookEdit', true, undefined),
+			getClaudeEditToolExecution('Edit', false, undefined),
+			getClaudeEditToolExecution('Edit', false, 'denied'),
+			getClaudeEditToolExecution('Bash', true, undefined),
+			getClaudeEditToolExecution('TodoWrite', true, undefined),
+			getClaudeEditToolExecution('mcp__server__Edit', true, undefined),
+		], [true, true, true, undefined, false, false, false, undefined]);
+	});
 
 	test('mapping snapshot covers every Phase 7 §4 row', () => {
 		const TOOLS = [

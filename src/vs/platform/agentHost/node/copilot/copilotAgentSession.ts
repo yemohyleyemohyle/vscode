@@ -106,7 +106,7 @@ import { AgentHostComputerUseEnabledSettingId, AgentHostGitHubMcpServerEnabledSe
 import { COMPUTER_USE_PLUGIN_NAME } from './copilotComputerUsePlugin.js';
 import { CopilotComputerUseActivation } from './copilotComputerUseActivationTool.js';
 import { classifyComputerUsePrompt, type CopilotComputerUsePermissionSetup, type ICopilotComputerUseSetupChat, type IComputerUsePermissionPrompt } from './copilotComputerUsePermissionSetup.js';
-import { CopilotToolName, getEditFilePaths, getInvocationMessage, getPastTenseMessage, getPermissionDisplay, getSandboxPathGrantConfirmation, getSdkImageGenerationMetadata, getToolIntention, getShellLanguage, getStreamingInvocationMessage, getSubagentMetadata, getTaskCompleteMarkdown, getToolDisplayName, getToolInputString, getToolKind, getToolSummaryInputContract, isAgentCoordinationTool, isCopilotSdkToolOutputFile, isEditTool, isHiddenTool, isShellHelperTool, isShellTool, isTaskCompleteTool, parseCopilotStreamingToolInput, synthesizeSkillToolCall, tryStringify } from './copilotToolDisplay.js';
+import { CopilotToolName, getCopilotEditToolExecution, getEditFilePaths, getInvocationMessage, getPastTenseMessage, getPermissionDisplay, getSandboxPathGrantConfirmation, getSdkImageGenerationMetadata, getToolIntention, getShellLanguage, getStreamingInvocationMessage, getSubagentMetadata, getTaskCompleteMarkdown, getToolDisplayName, getToolInputString, getToolKind, getToolSummaryInputContract, isAgentCoordinationTool, isCopilotSdkToolOutputFile, isEditTool, isHiddenTool, isShellHelperTool, isShellTool, isTaskCompleteTool, parseCopilotStreamingToolInput, synthesizeSkillToolCall, tryStringify } from './copilotToolDisplay.js';
 import { imageGenerationToolMetaKey } from '../../common/meta/agentImageGenerationMeta.js';
 import { FileEditTracker } from '../shared/fileEditTracker.js';
 import { ICopilotApiService, type IRestrictedTelemetryContext } from '../shared/copilotApiService.js';
@@ -3235,13 +3235,17 @@ export class CopilotAgentSession extends Disposable {
 		return undefined;
 	}
 
-	private _createToolCallMeta(toolName: string, parameters: Record<string, unknown> | undefined): Mutable<IToolCallMeta> {
+	private _createToolCallMeta(toolName: string, parameters: Record<string, unknown> | undefined, parentToolCallId?: string): Mutable<IToolCallMeta> {
 		const toolKind = getToolKind(toolName, parameters);
 		const subagentMeta = toolKind === 'subagent' ? getSubagentMetadata(parameters) : undefined;
 		const clientToolName = this._clientToolName(toolName);
 		const networkRestrictions = this._clientToolNames.has(clientToolName)
 			? getCopilotBrowserSandboxNetworkRestrictions(this._configurationService, this._configTarget(), clientToolName) : undefined;
+		const requestId = parentToolCallId && !this._fusionPhases.has(parentToolCallId)
+			? this._subagents.getRootTurnId(parentToolCallId) : this._turnId;
 		return {
+			'vscode.toolRequest': process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG === '1' && requestId
+				? { chat: this._chatChannelUri.toString(), turnId: requestId } : undefined,
 			...(networkRestrictions ? {
 				'vscode.copilotSandboxNetworkRestrictions': networkRestrictions,
 			} : {}),
@@ -9124,7 +9128,7 @@ export class CopilotAgentSession extends Disposable {
 					toolName,
 					displayName: getToolDisplayName(toolName),
 					contributor: this._getToolCallContributor(toolName, undefined),
-					_meta: toToolCallMeta(this._createToolCallMeta(toolName, undefined)),
+					_meta: toToolCallMeta(this._createToolCallMeta(toolName, undefined, streaming.parentToolCallId)),
 				}, streaming.parentToolCallId);
 				this._emitStreamingToolCallDisplay(e.data.toolCallId, streaming);
 				return;
@@ -9228,7 +9232,7 @@ export class CopilotAgentSession extends Disposable {
 				this._beginToolCallRound(parentToolCallId);
 			}
 
-			const meta = this._createToolCallMeta(e.data.toolName, parameters);
+			const meta = this._createToolCallMeta(e.data.toolName, parameters, parentToolCallId);
 			if (!isClientTool && !mcpServerName && !e.data.mcpToolName) {
 				meta['vscode.toolInputContract'] = getToolSummaryInputContract(e.data.toolName);
 			}
@@ -9505,7 +9509,12 @@ export class CopilotAgentSession extends Disposable {
 						structuredContent: e.data.result?.structuredContent as Record<string, unknown> | undefined,
 						error: e.data.error,
 					},
-					_meta: tracked.meta ? toToolCallMeta(tracked.meta) : undefined,
+					_meta: toToolCallMeta({
+						...tracked.meta,
+						'vscode.editToolExecution': tracked.meta?.['vscode.toolRequest'] && tracked.contributor === undefined && !tracked.mcpServerName
+							? getCopilotEditToolExecution(tracked.toolName, command, e.data.success, e.data.error?.code)
+							: undefined,
+					}),
 				}, parentToolCallId);
 				const onPublished = (published: boolean) => {
 					completionPublished = published;

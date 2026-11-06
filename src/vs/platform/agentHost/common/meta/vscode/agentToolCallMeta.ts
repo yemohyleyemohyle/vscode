@@ -26,6 +26,10 @@ export interface IToolCallMeta {
 	readonly [imageGenerationToolMetaKey]?: IImageGenerationToolMetadata;
 	/** Provider-measured execution duration for display, in milliseconds. */
 	readonly 'vscode.toolCallDurationMs'?: number;
+	/** Whether a recognized native edit tool executed; absent when execution cannot be established. */
+	readonly 'vscode.editToolExecution'?: boolean;
+	/** Provider-owned request identity before subagent routing remaps the action's turn. */
+	readonly 'vscode.toolRequest'?: { readonly chat: string; readonly turnId: string };
 	/** Declares the input schema of a native tool, never a client- or MCP-contributed implementation. */
 	readonly 'vscode.toolInputContract'?: typeof copilotCliToolInputContract;
 	/** Trusted Copilot host snapshot for integrated-browser client tools. Absent for other tools and harnesses. */
@@ -77,6 +81,8 @@ const knownFusionPhaseStatuses: ReadonlySet<string> = new Set(fusionPhaseStatuse
 const toolCallMetaKeys = [
 	imageGenerationToolMetaKey,
 	'vscode.toolCallDurationMs',
+	'vscode.editToolExecution',
+	'vscode.toolRequest',
 	'vscode.toolInputContract',
 	'vscode.copilotSandboxNetworkRestrictions',
 	'vscode.sandboxPathGrant',
@@ -185,6 +191,16 @@ export function readToolCallMeta(source: IHasToolCallMeta): IToolCallMeta {
 		return {};
 	}
 	const result: Mutable<IToolCallMeta> = {};
+	if (typeof meta['vscode.editToolExecution'] === 'boolean') {
+		result['vscode.editToolExecution'] = meta['vscode.editToolExecution'];
+	}
+	const request = meta['vscode.toolRequest'];
+	if (request && typeof request === 'object' && !Array.isArray(request)) {
+		const value = request as Record<string, unknown>;
+		if (typeof value.chat === 'string' && value.chat.length > 0 && typeof value.turnId === 'string' && value.turnId.length > 0) {
+			result['vscode.toolRequest'] = { chat: value.chat, turnId: value.turnId };
+		}
+	}
 	const durationMs = meta['vscode.toolCallDurationMs'];
 	if (typeof durationMs === 'number' && Number.isFinite(durationMs) && durationMs >= 0) {
 		result['vscode.toolCallDurationMs'] = durationMs;

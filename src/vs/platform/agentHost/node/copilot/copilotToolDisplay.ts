@@ -348,6 +348,20 @@ export function isEditTool(toolName: string, command?: string): boolean {
 	return false;
 }
 
+/** SDK starts precede permissions; only executed outcomes establish an edit attempt. */
+export function getCopilotEditToolExecution(toolName: string, command: string | undefined, success: boolean, errorCode: string | undefined): boolean | undefined {
+	if (!isEditTool(toolName, command)) {
+		return false;
+	}
+	if (success || errorCode === 'failure') {
+		return true;
+	}
+	if (errorCode === 'denied' || errorCode === 'rejected') {
+		return false;
+	}
+	return undefined;
+}
+
 /**
  * Extracts every file path an edit tool will touch. For `edit` / `create` this
  * is the single `path` parameter; for `apply_patch` / `git_apply_patch` this

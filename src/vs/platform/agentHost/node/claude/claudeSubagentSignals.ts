@@ -165,7 +165,7 @@ export function buildTopLevelSubagentReadyAction(
 	const agentName = typeof input?.subagent_type === 'string' ? input.subagent_type : undefined;
 	const prompt = typeof input?.prompt === 'string' ? input.prompt : undefined;
 	const inputJson = block.input !== undefined ? safeStringify(block.input) : undefined;
-	registry.recordSpawn(block.id, { subagentType: agentName, description, prompt });
+	registry.recordSpawn(block.id, { subagentType: agentName, description, prompt, requestTurnId: turnId });
 	const meta: Mutable<IToolCallMeta> = { ...buildClaudeToolCallMeta(block.name) };
 	if (!meta.toolKind) {
 		meta.toolKind = 'subagent';
@@ -263,7 +263,11 @@ export function emitInnerAssistantSignals(
 			const toolName = stripClientToolNamePrefix(block.name);
 			const isClientTool = hasClientToolNamePrefix(block.name);
 			const clientId = isClientTool ? clientToolOwner?.(toolName) : undefined;
-			state.startToolBlock(index, block.id, toolName, turnId, isClientTool);
+			const requestTurnId = registry.getSpawn(parentToolUseId)?.requestTurnId ?? state.lookupToolCall(parentToolUseId)?.turnId ?? turnId;
+			state.startToolBlock(index, block.id, toolName, turnId, isClientTool, requestTurnId);
+			if (!isClientTool && SUBAGENT_SPAWNING_TOOL_NAMES.has(toolName)) {
+				registry.recordSpawn(block.id, { requestTurnId });
+			}
 			// Inner tool input arrives pre-parsed on the synthesized
 			// `assistant` message (not via `input_json_delta` chunks), so
 			// seed the registry directly. Without this the live
@@ -286,7 +290,9 @@ export function emitInnerAssistantSignals(
 					toolName,
 					displayName,
 					...(clientId ? { contributor: { kind: ToolCallContributorKind.Client, clientId } } : {}),
-					...(meta ? { _meta: meta } : {}),
+					...(process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG === '1'
+						? { _meta: { ...meta, 'vscode.toolRequest': { chat: chat.toString(), turnId: requestTurnId } } }
+						: meta ? { _meta: meta } : {}),
 				},
 			});
 			signals.push({

@@ -13,7 +13,8 @@ import { extractForwardedErrorInfo } from '../shared/proxyChatError.js';
 import { buildTopLevelSubagentReadyAction, emitInnerAssistantSignals, mapSubagentSystemMessage, SUBAGENT_SPAWNING_TOOL_NAMES, tagWithParent } from './claudeSubagentSignals.js';
 import type { SubagentRegistry } from './claudeSubagentRegistry.js';
 import { stripClientToolNamePrefix, hasClientToolNamePrefix } from './clientTools/claudeClientToolMcpServer.js';
-import { buildClaudeToolMeta, getClaudePastTenseMessage, getClaudeToolDisplayName, isClaudeFileEditTool } from './claudeToolDisplay.js';
+import { buildClaudeToolMeta, getClaudeEditToolExecution, getClaudePastTenseMessage, getClaudeToolDisplayName, isClaudeFileEditTool } from './claudeToolDisplay.js';
+import { toToolCallMeta } from '../../common/meta/agentToolCallMeta.js';
 import { claudeToolDenialCode } from './claudeToolDenial.js';
 import { ClaudeToolCallRegistry } from './claudeToolCallRegistry.js';
 import { ToolCallConfirmationReason, ToolCallContributorKind, type StringOrMarkdown } from '../../common/state/protocol/state.js';
@@ -48,6 +49,7 @@ import { ToolCallConfirmationReason, ToolCallContributorKind, type StringOrMarkd
  */
 export class ClaudeMapperState {
 	private readonly _activeToolBlocks = new Map<number, { toolUseId: string; toolName: string; isClientTool: boolean }>();
+	private readonly _toolRequests = new Map<string, string>();
 	/**
 	 * Phase 8.5 — cross-message tool-call attribution + input
 	 * accumulation + computed start-info, encapsulated as its own
@@ -95,9 +97,16 @@ export class ClaudeMapperState {
 	 * scopes; the per-message map gets drained on `content_block_stop`,
 	 * the cross-message maps survive until the matching `tool_result`.
 	 */
-	startToolBlock(index: number, toolUseId: string, toolName: string, turnId: string, isClientTool = false): void {
+	startToolBlock(index: number, toolUseId: string, toolName: string, turnId: string, isClientTool = false, requestTurnId = turnId): void {
 		this._activeToolBlocks.set(index, { toolUseId, toolName, isClientTool });
 		this.toolCalls.begin(toolUseId, toolName, turnId, isClientTool);
+		if (process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG === '1') {
+			this._toolRequests.set(toolUseId, requestTurnId);
+		}
+	}
+
+	getToolRequestTurnId(toolUseId: string): string | undefined {
+		return this._toolRequests.get(toolUseId);
 	}
 
 	getActiveToolBlock(index: number): { toolUseId: string; toolName: string; isClientTool: boolean } | undefined {
@@ -148,6 +157,7 @@ export class ClaudeMapperState {
 	/** Drain cross-message tracking once a `tool_result` is delivered. */
 	completeToolCall(toolUseId: string): void {
 		this.toolCalls.complete(toolUseId);
+		this._toolRequests.delete(toolUseId);
 	}
 
 	/**
@@ -199,6 +209,7 @@ export class ClaudeMapperState {
 	 */
 	clearPendingToolCalls(logService: ILogService): void {
 		this.toolCalls.clearPending(logService);
+		this._toolRequests.clear();
 	}
 }
 
@@ -412,6 +423,12 @@ function mapUserMessage(
 				type: ActionType.ChatToolCallComplete,
 				turnId: tracked.turnId,
 				toolCallId: block.tool_use_id,
+				...(process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG === '1' ? {
+					_meta: toToolCallMeta({
+						'vscode.toolRequest': { chat: chat.toString(), turnId: state.getToolRequestTurnId(block.tool_use_id) ?? tracked.turnId },
+						'vscode.editToolExecution': tracked.isClientTool ? undefined : getClaudeEditToolExecution(tracked.toolName, !isError, denialCode),
+					})
+				} : {}),
 				result: {
 					success: !isError,
 					pastTenseMessage,
@@ -635,7 +652,9 @@ function mapStreamEvent(
 				// they don't carry the prefix.
 				const toolName = stripClientToolNamePrefix(block.name);
 				const isClientTool = hasClientToolNamePrefix(block.name);
-				state.startToolBlock(event.index, block.id, toolName, turnId, isClientTool);
+				const requestTurnId = parentToolUseId === null ? turnId
+					: registry.getSpawn(parentToolUseId)?.requestTurnId ?? state.lookupToolCall(parentToolUseId)?.turnId ?? turnId;
+				state.startToolBlock(event.index, block.id, toolName, turnId, isClientTool, requestTurnId);
 				// Phase 12 — subagent correlation bookkeeping. Either this
 				// tool_use is at the top level and (if Task/Agent) spawns a
 				// new subagent, or it is inner and we record its edge to the
@@ -647,10 +666,13 @@ function mapStreamEvent(
 				const isSubagentSpawn = !isClientTool && SUBAGENT_SPAWNING_TOOL_NAMES.has(toolName);
 				if (parentToolUseId === null) {
 					if (isSubagentSpawn) {
-						registry.recordSpawn(block.id);
+						registry.recordSpawn(block.id, { requestTurnId });
 					}
 				} else {
 					registry.noteInnerTool(block.id, parentToolUseId);
+					if (isSubagentSpawn) {
+						registry.recordSpawn(block.id, { requestTurnId });
+					}
 				}
 				// Phase 8.5 — `_meta.toolKind` drives the workbench's terminal /
 				// search / subagent renderers. Single write at the tool-open
@@ -670,7 +692,9 @@ function mapStreamEvent(
 						toolName,
 						displayName: isClientTool ? toolName : getClaudeToolDisplayName(toolName),
 						...(toolClientId ? { contributor: { kind: ToolCallContributorKind.Client, clientId: toolClientId } } : {}),
-						...(meta ? { _meta: meta } : {}),
+						...(process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG === '1'
+							? { _meta: { ...meta, 'vscode.toolRequest': { chat: chat.toString(), turnId: requestTurnId } } }
+							: meta ? { _meta: meta } : {}),
 					},
 				}];
 			}

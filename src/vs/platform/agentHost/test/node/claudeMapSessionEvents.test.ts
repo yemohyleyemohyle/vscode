@@ -9,6 +9,7 @@ import { URI } from '../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../log/common/log.js';
 import type { AgentSignal } from '../../common/agent.js';
+import { readToolCallMeta } from '../../common/meta/agentToolCallMeta.js';
 import { ActionType } from '../../common/state/sessionActions.js';
 import { ResponsePartKind, ToolResultContentType } from '../../common/state/sessionState.js';
 import { STREAMING_TOOL_DISPLAY_INTERVAL_MS } from '../../common/streamingToolCallDisplay.js';
@@ -78,6 +79,34 @@ suite('claudeMapSessionEvents — direct mapper tests', () => {
 	function r(): SubagentRegistry {
 		return disposables.add(new SubagentRegistry());
 	}
+
+	test('experimental nested edit evidence retains its spawning request without changing action turn IDs', () => {
+		const previous = process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG;
+		process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG = '1';
+		try {
+			const state = new ClaudeMapperState();
+			const registry = r();
+			registry.recordSpawn('parent', { requestTurnId: 'original' });
+			const nested = makeAssistantMessage(SESSION_ID, [{ type: 'tool_use', id: 'nested', name: 'Task', input: {} }]);
+			mapSDKMessageToAgentSignals({ ...nested, parent_tool_use_id: 'parent' }, SESSION, 'later', state, new NullLogService(), registry);
+			const edit = makeAssistantMessage(SESSION_ID, [{ type: 'tool_use', id: 'edit', name: 'Edit', input: {} }]);
+			mapSDKMessageToAgentSignals({ ...edit, parent_tool_use_id: 'nested' }, SESSION, 'later', state, new NullLogService(), registry);
+			const result = makeUserToolResultMessage(SESSION_ID, 'edit', 'Done');
+			const signals = mapSDKMessageToAgentSignals({ ...result, parent_tool_use_id: 'nested' }, SESSION, 'later', state, new NullLogService(), registry);
+			assert.deepStrictEqual(signals.flatMap(signal =>
+				signal.kind === 'action' && signal.action.type === ActionType.ChatToolCallComplete ? [{
+					turnId: signal.action.turnId,
+					request: readToolCallMeta(signal.action)['vscode.toolRequest']?.turnId,
+					executed: readToolCallMeta(signal.action)['vscode.editToolExecution'],
+				}] : []), [{ turnId: 'later', request: 'original', executed: true }]);
+		} finally {
+			if (previous === undefined) {
+				delete process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG;
+			} else {
+				process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG = previous;
+			}
+		}
+	});
 
 	test('message_start emits no signals', () => {
 		const signals = mapSDKMessageToAgentSignals(

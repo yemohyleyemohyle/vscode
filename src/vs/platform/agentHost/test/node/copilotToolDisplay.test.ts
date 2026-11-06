@@ -8,7 +8,7 @@ import type { PermissionRequest } from '@github/copilot-sdk';
 import * as marked from '../../../../base/common/marked/marked.js';
 import { URI } from '../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-import { getEditFilePaths, getInvocationMessage, getPastTenseMessage, getPermissionDisplay, getSandboxPathGrantConfirmation, getSdkImageGenerationMetadata, getToolIntention, getShellLanguage, getStreamingInvocationMessage, getSubagentMetadata, getTaskCompleteMarkdown, getToolDisplayName, getToolInputString, getToolKind, getToolSummaryInputContract, isEditTool, isHiddenTool, isTaskCompleteTool, synthesizeSkillToolCall } from '../../node/copilot/copilotToolDisplay.js';
+import { getCopilotEditToolExecution, getEditFilePaths, getInvocationMessage, getPastTenseMessage, getPermissionDisplay, getSandboxPathGrantConfirmation, getSdkImageGenerationMetadata, getToolIntention, getShellLanguage, getStreamingInvocationMessage, getSubagentMetadata, getTaskCompleteMarkdown, getToolDisplayName, getToolInputString, getToolKind, getToolSummaryInputContract, isEditTool, isHiddenTool, isTaskCompleteTool, synthesizeSkillToolCall } from '../../node/copilot/copilotToolDisplay.js';
 
 type CopilotShellPermissionRequest = Extract<PermissionRequest, { kind: 'shell' }>;
 type CopilotCustomToolPermissionRequest = Extract<PermissionRequest, { kind: 'custom-tool' }>;
@@ -41,6 +41,20 @@ function customToolPermissionRequest(toolName: string, args: CopilotCustomToolPe
 suite('copilotToolDisplay — friendly tool names', () => {
 
 	ensureNoDisposablesAreLeakedInTestSuite();
+
+	test('edit execution evidence distinguishes failed attempts from denied and ambiguous outcomes', () => {
+		assert.deepStrictEqual([
+			getCopilotEditToolExecution('edit', undefined, true, undefined),
+			getCopilotEditToolExecution('edit', undefined, false, 'failure'),
+			getCopilotEditToolExecution('create', undefined, false, 'denied'),
+			getCopilotEditToolExecution('apply_patch', undefined, false, 'rejected'),
+			getCopilotEditToolExecution('edit', undefined, false, 'timeout'),
+			getCopilotEditToolExecution('edit', undefined, false, undefined),
+			getCopilotEditToolExecution('str_replace_editor', 'view', true, undefined),
+			getCopilotEditToolExecution('str_replace_editor', 'str_replace', false, 'failure'),
+			getCopilotEditToolExecution('bash', undefined, true, undefined),
+		], [true, true, false, false, undefined, undefined, false, true, false]);
+	});
 
 	test('limits the summary input contract to supported native schemas', () => {
 		assert.deepStrictEqual(['view', 'edit', 'grep', 'rg', 'glob', 'bash', 'tool_search', 'my_tool', 'mcp__server__view'].map(getToolSummaryInputContract), [
