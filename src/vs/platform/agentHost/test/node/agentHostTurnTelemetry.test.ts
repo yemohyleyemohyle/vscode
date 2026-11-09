@@ -18,7 +18,8 @@ import { ServiceCollection } from '../../../instantiation/common/serviceCollecti
 import { FileService } from '../../../files/common/fileService.js';
 import { IFileService } from '../../../files/common/files.js';
 import { ILogService, LogLevel, NullLogService } from '../../../log/common/log.js';
-import { ITelemetryData, ITelemetryService, TelemetryLevel } from '../../../telemetry/common/telemetry.js';
+import { ITelemetryData, ITelemetryService } from '../../../telemetry/common/telemetry.js';
+import { CapturingTelemetryService as PlatformCapturingTelemetryService } from '../../../telemetry/test/common/testTelemetryService.js';
 import { TelemetryTrustedValue } from '../../../telemetry/common/telemetryUtils.js';
 import { createAgentModelByokMeta } from '../../common/agentModelByokMeta.js';
 import { getTelemetryChatSessionId } from '../../common/agentTelemetryCorrelation.js';
@@ -31,6 +32,7 @@ import type { ICodexAccountState } from '../../node/codex/codexAccountState.js';
 import { AgentHostOverlapProviderPreparationConfigKey, platformSessionSchema, type SessionMode } from '../../common/agentHostSchema.js';
 import { SessionConfigKey } from '../../common/sessionConfigKeys.js';
 import { ActionType, type ChatAction, type ChatUsageAction } from '../../common/state/sessionActions.js';
+import { chatToolCallComplete, chatToolCallReady, chatToolCallStart, chatTurnComplete } from '../common/chatActionBuilders.js';
 import { withEphemeralSessionMeta } from '../../common/meta/agentEphemeralSessionMeta.js';
 import { toAgentMergeMessageMeta } from '../../common/meta/agentMergeMessageMeta.js';
 import { buildChatUri, buildDefaultChatUri, buildSubagentChatUri, buildSubagentSessionUri, ChatOriginKind, createErrorResponsePart, type Message, MessageKind, type ModelSelection, PendingMessageKind, ResponsePartKind, ROOT_STATE_URI, SessionStatus } from '../../common/state/sessionState.js';
@@ -116,27 +118,10 @@ class FakeChangesetService implements IAgentHostChangesetService {
 	refreshChatChangesSummary(): void { }
 }
 
-class CapturingTelemetryService implements ITelemetryService {
-	declare readonly _serviceBrand: undefined;
-	readonly telemetryLevel = TelemetryLevel.USAGE;
-	readonly sessionId = 'test-session';
-	readonly machineId = 'test-machine';
-	readonly sqmId = 'test-sqm';
-	readonly devDeviceId = 'test-dev-device';
-	readonly firstSessionDate = 'test-first-session-date';
-	readonly sendErrorTelemetry = false;
-	readonly events: { eventName: string; data: ITelemetryData | undefined }[] = [];
-
-	publicLog(): void { }
-	publicLog2(eventName: string, data?: ITelemetryData): void {
-		this.events.push({ eventName, data });
+class CapturingTelemetryService extends PlatformCapturingTelemetryService<ITelemetryData | undefined> {
+	constructor() {
+		super({ captureErrors: true });
 	}
-	publicLogError(): void { }
-	publicLogError2(eventName: string, data?: ITelemetryData): void {
-		this.events.push({ eventName, data });
-	}
-	setExperimentProperty(): void { }
-	setCommonProperty(): void { }
 }
 
 /**
@@ -283,6 +268,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 			_serviceBrand: undefined,
 			onDidChange: Event.None,
 			initializeSession: async () => { },
+			adoptMcpServerOwnership: () => { },
 			getWorkingDirectoryState: () => ({ kind: 'workspaceless' }),
 			resolve: () => ({ kind: 'resolved', enablement: [], enabled: true, workingDirectory: { kind: 'workspaceless' } }),
 			applyClientGlobalEnablement: () => ({ kind: 'resolved', enablement: [], enabled: true, workingDirectory: { kind: 'workspaceless' } }),
@@ -397,10 +383,10 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 				stateManager.addChat(resource.toString(), subagent, creationTimeChatStorageResource(resource.toString(), subagent, buildDefaultChatUri(resource.toString())));
 
 				startTurn('success', 'hello', undefined, root);
-				fire({ type: ActionType.ChatToolCallStart, turnId: 'success', toolCallId: 'tool', toolName: 'bash', displayName: 'bash' }, root);
-				fire({ type: ActionType.ChatToolCallReady, turnId: 'success', toolCallId: 'tool', invocationMessage: 'run' }, root);
-				fire({ type: ActionType.ChatToolCallComplete, turnId: 'success', toolCallId: 'tool', result: { success: true, pastTenseMessage: 'ran' } }, root);
-				fire({ type: ActionType.ChatTurnComplete, turnId: 'success', duration: 1 }, root);
+				fire(chatToolCallStart('success', 'tool', 'bash', 'bash'), root);
+				fire(chatToolCallReady('success', 'tool', 'run'), root);
+				fire(chatToolCallComplete('success', 'tool', { success: true, pastTenseMessage: 'ran' }), root);
+				fire(chatTurnComplete('success', 1), root);
 				startTurn('failure', 'hello', undefined, peer);
 				fire({ type: ActionType.ChatError, turnId: 'failure', duration: 1, part: createErrorResponsePart({ errorType: 'test', message: 'failed' }) }, peer);
 				startTurn('cancelled', 'hello', undefined, subagent);
@@ -465,7 +451,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		await allSent.p;
 		turnTracker.updateModel(defaultChatUri, 'shared-turn', 'changed-model', 'trusted');
 		for (const chat of [secondChat, defaultChatUri, peerChat]) {
-			fire({ type: ActionType.ChatTurnComplete, turnId: 'shared-turn', duration: 1 }, chat);
+			fire(chatTurnComplete('shared-turn', 1), chat);
 		}
 		const expected = [
 			{ chatgptAccountState: 'signedIn', chatgptPlanTier: 'plus', chatgptWeeklyQuotaState: 'available', chatgptWeeklyUsedPercentBucket: 40, chatgptFiveHourQuotaState: 'missing' },
@@ -496,7 +482,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		codex.chatgptWeeklyUsedPercentBucket = 100;
 		codex.chatgptFiveHourQuotaState = 'available';
 		codex.chatgptFiveHourUsedPercentBucket = 100;
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn', duration: 1 });
+		fire(chatTurnComplete('turn', 1));
 		assert.deepStrictEqual(completedEvents().map(event => Object.fromEntries(Object.entries(event.data as object).filter(([key]) => key.startsWith('chatgpt')))), [
 			{ chatgptAccountState: 'signedIn', chatgptPlanTier: 'plus', chatgptWeeklyQuotaState: 'missing', chatgptFiveHourQuotaState: 'missing' },
 		]);
@@ -528,7 +514,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 			const capture = sinon.spy(() => ({ codex: getCodexAccountTelemetryContext(undefined, undefined, undefined) }));
 			agent.captureTurnTelemetryContext = capture;
 			startTurn('turn');
-			fire({ type: ActionType.ChatTurnComplete, turnId: 'turn', duration: 1 });
+			fire(chatTurnComplete('turn', 1));
 			assert.deepStrictEqual({
 				captureCalls: capture.callCount,
 				fields: telemetry.events.flatMap(event => Object.keys(event.data as object).filter(key => key.startsWith('chatgpt'))),
@@ -548,8 +534,8 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 			completions: completedEvents().length,
 		};
 
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 });
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 });
+		fire(chatTurnComplete('turn-1', 1000));
+		fire(chatTurnComplete('turn-1', 1000));
 
 		assert.deepStrictEqual({ beforeCompletion, sendsAfterCompletion: sentEvents().length }, {
 			beforeCompletion: {
@@ -597,7 +583,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		const removeSteering: ChatAction = { type: ActionType.ChatPendingMessageRemoved, kind: PendingMessageKind.Steering, id: 'steering' };
 		stateManager.dispatchClientAction(defaultChatUri, removeSteering, { clientId: 'test', clientSeq: 5 });
 		sideEffects.handleAction(defaultChatUri, removeSteering);
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'active', duration: 1000 });
+		fire(chatTurnComplete('active', 1000));
 		const drainedTurnId = stateManager.getActiveTurnId(defaultChatUri);
 		assert.ok(drainedTurnId);
 
@@ -636,7 +622,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 			previousRecorder.markMilestone?.('sdkText');
 		};
 		sideEffects.handleAction(defaultChatUri, action, 'test', AgentHostClientType.EditorWindow, turn);
-		fire({ type: ActionType.ChatTurnComplete, turnId: turn.id, duration: 1000 });
+		fire(chatTurnComplete(turn.id, 1000));
 
 		assert.deepStrictEqual({
 			sends: sentEvents().map(event => event.data?.turnId),
@@ -660,7 +646,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 			type: ActionType.ChatTurnStarted, turnId: 'provider-turn', startedAt: '2025-01-01T00:00:00.000Z',
 			message: { text: 'provider continuation', origin: { kind: MessageKind.SystemNotification } },
 		});
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'provider-turn', duration: 1000 });
+		fire(chatTurnComplete('provider-turn', 1000));
 
 		assert.deepStrictEqual({ sends: sentEvents(), completions: completedEvents().length }, { sends: [], completions: 1 });
 	});
@@ -670,7 +656,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		stateManager.setSessionConfig(sessionKey, { schema: platformSessionSchema.toProtocol(), values: { autoApprove: 'default', mode: 'interactive' } });
 		stateManager.dispatchServerAction(defaultChatUri, { type: ActionType.ChatConfigChanged, config: { autoApprove: 'autoApprove', mode: 'plan' } });
 		startTurn('turn-1', 'hello');
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 });
+		fire(chatTurnComplete('turn-1', 1000));
 
 		const data = completedEvents()[0].data as Record<string, unknown>;
 		assert.deepStrictEqual({ permissionLevel: data.permissionLevel, interactionMode: data.interactionMode }, { permissionLevel: 'autoApprove', interactionMode: 'plan' });
@@ -683,7 +669,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		startTurn('turn-1', 'hello', 'gpt-5.5');
 
 		fire({ type: ActionType.ChatResponsePart, turnId: 'turn-1', part: { kind: ResponsePartKind.Markdown, id: 'p1', content: 'hi' } });
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 });
+		fire(chatTurnComplete('turn-1', 1000));
 
 		const events = completedEvents();
 		assert.strictEqual(events.length, 1);
@@ -714,9 +700,9 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		startTurn('first');
 		await timeout(20);
 		const completionProcessAgeMs = Math.round(process.uptime() * 1000);
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'first', duration: 1 });
+		fire(chatTurnComplete('first', 1));
 		startTurn('later');
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'later', duration: 1 });
+		fire(chatTurnComplete('later', 1));
 		const records = info.getCalls()
 			.map(call => call.args[0])
 			.filter((message): message is string => typeof message === 'string' && message.startsWith('[AgentHostTurnTiming] '))
@@ -899,9 +885,9 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 	test('reports the actor that started the turn, separating Agent Merge from user turns', () => {
 		setupSession();
 		startTurn('turn-user');
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-user', duration: 1000 });
+		fire(chatTurnComplete('turn-user', 1000));
 		startHostTurn('turn-agent-merge', { text: 'fix the failed required checks', origin: { kind: MessageKind.SystemNotification }, _meta: toAgentMergeMessageMeta() });
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-agent-merge', duration: 1000 });
+		fire(chatTurnComplete('turn-agent-merge', 1000));
 
 		assert.deepStrictEqual(completedEvents().map(event => {
 			const data = event.data as Record<string, unknown>;
@@ -919,7 +905,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		fireModelCallCompleted('turn-model-calls', 'call-1');
 		fireModelCallCompleted('turn-model-calls', 'call-1');
 		fireModelCallCompleted('turn-model-calls', 'call-2');
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-model-calls', duration: 1000 });
+		fire(chatTurnComplete('turn-model-calls', 1000));
 
 		assert.strictEqual((completedEvents()[0].data as Record<string, unknown>).modelCallCount, 2);
 	});
@@ -933,7 +919,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		fireModelCallFinished('turn-first-edit', 'call-read', 200, 'success', false);
 		fireModelCallFinished('turn-first-edit', 'call-edit', 300, 'success', true);
 		fireModelCallFinished('turn-first-edit', 'call-after-edit', 500, 'success', false);
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-first-edit', duration: 1000 });
+		fire(chatTurnComplete('turn-first-edit', 1000));
 
 		const data = completedEvents()[0].data as Record<string, unknown>;
 		assert.strictEqual(data.timeToFirstEdit, 700);
@@ -957,7 +943,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 				id,
 				message,
 			});
-			fire({ type: ActionType.ChatTurnComplete, turnId: previousTurnId, duration: 1000 });
+			fire(chatTurnComplete(previousTurnId, 1000));
 			fire({
 				type: ActionType.ChatTurnStarted,
 				turnId,
@@ -968,7 +954,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 			fireModelCallFinished(turnId, `call-${turnId}`, 250, 'success', true);
 			previousTurnId = turnId;
 		}
-		fire({ type: ActionType.ChatTurnComplete, turnId: previousTurnId, duration: 1000 });
+		fire(chatTurnComplete(previousTurnId, 1000));
 		await new Promise(resolve => setTimeout(resolve, 0));
 
 		assert.deepStrictEqual({
@@ -1023,7 +1009,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 				fire({ type: result === 'success' ? ActionType.ChatTurnComplete : ActionType.ChatTurnCancelled, turnId: 'turn-steered', duration: 1000 });
 			}
 			startTurn('turn-next');
-			fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-next', duration: 1000 });
+			fire(chatTurnComplete('turn-next', 1000));
 
 			assert.deepStrictEqual(completedEvents().map(event => {
 				const data = event.data as Record<string, unknown>;
@@ -1052,11 +1038,11 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		};
 		stateManager.dispatchClientAction(defaultChatUri, queued, { clientId: 'test', clientSeq: 2 });
 		sideEffects.handleAction(defaultChatUri, queued);
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-original', duration: 1000 });
+		fire(chatTurnComplete('turn-original', 1000));
 		const queuedTurnId = stateManager.getActiveTurnId(defaultChatUri);
 		assert.ok(queuedTurnId);
 		fireModelCallFinished(queuedTurnId, 'edit', 200, 'success', true);
-		fire({ type: ActionType.ChatTurnComplete, turnId: queuedTurnId, duration: 1000 });
+		fire(chatTurnComplete(queuedTurnId, 1000));
 
 		assert.deepStrictEqual(completedEvents().map(event => {
 			const data = event.data as Record<string, unknown>;
@@ -1082,7 +1068,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		applyClientAction(action, defaultChatUri, 1);
 		startTurn('turn-after-idle');
 		chatContributions.didDispatchAction({ channel: defaultChatUri, session: sessionKey, action, rejectionReason: 'rejected' });
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-after-idle', duration: 1000 });
+		fire(chatTurnComplete('turn-after-idle', 1000));
 
 		const data = completedEvents()[0].data as Record<string, unknown>;
 		assert.deepStrictEqual({
@@ -1104,8 +1090,8 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 			message: { text: 'change direction', origin: { kind: MessageKind.User } },
 		};
 		applyClientAction(action, peerChatUri);
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-peer', duration: 1000 }, peerChatUri);
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-default', duration: 1000 });
+		fire(chatTurnComplete('turn-peer', 1000), peerChatUri);
+		fire(chatTurnComplete('turn-default', 1000));
 
 		assert.deepStrictEqual(completedEvents().map(event => {
 			const data = event.data as Record<string, unknown>;
@@ -1125,7 +1111,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 			message: { text: 'background task done', origin: { kind: MessageKind.SystemNotification } },
 		});
 		fireModelCallFinished('turn-notification', 'edit', 300, 'success', true);
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-notification', duration: 1000 });
+		fire(chatTurnComplete('turn-notification', 1000));
 
 		const data = completedEvents()[0].data as Record<string, unknown>;
 		assert.deepStrictEqual({
@@ -1142,7 +1128,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		fireModelCallFinished('turn-no-edit', 'call-1', 100, 'cancelled');
 		fireModelCallFinished('turn-no-edit', 'call-1', 100, 'cancelled');
 		fireModelCallFinished('turn-no-edit', 'call-2', 200, 'success', false);
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-no-edit', duration: 1000 });
+		fire(chatTurnComplete('turn-no-edit', 1000));
 
 		const data = completedEvents()[0].data as Record<string, unknown>;
 		assert.strictEqual(data.timeToFirstEdit, undefined);
@@ -1151,11 +1137,11 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 	test('does not attribute a stale model-call attempt to the active turn', () => {
 		setupSession();
 		startTurn('turn-finished-old');
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-finished-old', duration: 1000 });
+		fire(chatTurnComplete('turn-finished-old', 1000));
 		startTurn('turn-finished-active');
 
 		fireModelCallFinished('turn-finished-old', 'late-edit', 100, 'success', true);
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-finished-active', duration: 1000 });
+		fire(chatTurnComplete('turn-finished-active', 1000));
 
 		assert.deepStrictEqual(completedEvents().map(event => {
 			const data = event.data as Record<string, unknown>;
@@ -1189,9 +1175,9 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 			} else if (turnId === 'cancel') {
 				fire({ type: ActionType.ChatTurnCancelled, turnId, duration: 1 });
 			} else {
-				fire({ type: ActionType.ChatTurnComplete, turnId, duration: 1 });
+				fire(chatTurnComplete(turnId, 1));
 			}
-			fire({ type: ActionType.ChatTurnComplete, turnId, duration: 1 });
+			fire(chatTurnComplete(turnId, 1));
 		}
 		assert.deepStrictEqual(reads, ['success', 'failure', 'cancel', 'missing']);
 		assert.deepStrictEqual(telemetry.events.filter(e => e.eventName === 'agentHost.requestTokenUsage').map(e => {
@@ -1226,13 +1212,16 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 				}
 			});
 			telemetry.publicLog2 = (eventName, data) => {
+				if (!eventName) {
+					return;
+				}
 				if (eventName === 'agentHost.requestTokenUsage') {
 					elapsed += 4000;
 				}
 				if (eventName === 'agentHost.turnCompleted' || eventName === 'agentHost.requestTokenUsage') {
 					order.push(eventName);
 				}
-				telemetry.events.push({ eventName, data });
+				telemetry.events.push({ eventName, data: data as ITelemetryData | undefined });
 			};
 			turnTracker.turnStarted(agent, defaultChatUri, sessionUri.toString(), 'slow-summary', undefined, undefined, 'default', undefined, undefined);
 			const completed = turnTracker.turnCompleted(defaultChatUri, 'slow-summary', result);
@@ -1263,7 +1252,9 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 				if (eventName === 'agentHost.requestTokenUsage') {
 					throw new Error('summary reporting failed');
 				}
-				telemetry.events.push({ eventName, data });
+				if (eventName) {
+					telemetry.events.push({ eventName, data: data as ITelemetryData | undefined });
+				}
 			};
 			turnTracker.turnStarted(agent, defaultChatUri, sessionUri.toString(), 'failed-summary', undefined, undefined, 'default', undefined, undefined);
 			const completed = turnTracker.turnCompleted(defaultChatUri, 'failed-summary', result);
@@ -1288,7 +1279,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		Object.assign(logService, { error: (message: string | Error) => errors.push(message) });
 		Object.assign(agent, { getTurnTokenUsage: () => { throw new Error('snapshot failed'); } });
 		startTurn('failed-snapshot');
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'failed-snapshot', duration: 1 });
+		fire(chatTurnComplete('failed-snapshot', 1));
 		const event = telemetry.events.find(event => event.eventName === 'agentHost.requestTokenUsage')?.data as Record<string, unknown>;
 		assert.deepStrictEqual({
 			errors,
@@ -1347,12 +1338,12 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 	test('does not attribute a stale model response to the active turn', () => {
 		setupSession();
 		startTurn('turn-old');
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-old', duration: 1000 });
+		fire(chatTurnComplete('turn-old', 1000));
 		fireModelCallCompleted('turn-old', 'late-call-while-idle');
 		startTurn('turn-active');
 
 		fireModelCallCompleted('turn-old', 'late-call');
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-active', duration: 1000 });
+		fire(chatTurnComplete('turn-active', 1000));
 
 		assert.deepStrictEqual({
 			completed: completedEvents().map(event => {
@@ -1380,13 +1371,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		startTurn('turn-parent');
 		const subagentChatUri = buildSubagentChatUri(sessionUri, 'call-subagent');
 		stateManager.addChat(sessionKey, subagentChatUri, creationTimeChatStorageResource(sessionKey, subagentChatUri, buildDefaultChatUri(sessionKey)));
-		fire({
-			type: ActionType.ChatToolCallStart,
-			turnId: 'turn-parent',
-			toolCallId: 'call-subagent',
-			toolName: 'task',
-			displayName: 'Task',
-		});
+		fire(chatToolCallStart('turn-parent', 'call-subagent', 'task', 'Task'));
 		agent.fireProgress({
 			kind: 'subagent_started',
 			chat: URI.parse(defaultChatUri),
@@ -1405,8 +1390,8 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 			modelCallId: 'subagent-model-call',
 			parentToolCallId: 'call-subagent',
 		});
-		fire({ type: ActionType.ChatTurnComplete, turnId: subagentTurnId, duration: 1000 }, subagentChatUri);
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-parent', duration: 1000 });
+		fire(chatTurnComplete(subagentTurnId, 1000), subagentChatUri);
+		fire(chatTurnComplete('turn-parent', 1000));
 
 		assert.deepStrictEqual({
 			completed: completedEvents().map(event => {
@@ -1443,8 +1428,8 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 			const turnId = stateManager.getActiveTurnId(phaseChatUri) ?? 'missing-phase-turn';
 			for (const tool of tools) {
 				const toolCallId = `${phaseToolCallId}-${tool}`;
-				fire({ type: ActionType.ChatToolCallStart, turnId, toolCallId, toolName: tool, displayName: tool }, phaseChatUri);
-				fire({ type: ActionType.ChatToolCallComplete, turnId, toolCallId, result: { success: true, pastTenseMessage: `ran ${tool}` } }, phaseChatUri);
+				fire(chatToolCallStart(turnId, toolCallId, tool, tool), phaseChatUri);
+				fire(chatToolCallComplete(turnId, toolCallId, { success: true, pastTenseMessage: `ran ${tool}` }), phaseChatUri);
 			}
 			return turnId;
 		};
@@ -1453,7 +1438,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		// The provider closes every phase chat when the root turn goes idle.
 		agent.fireProgress({ kind: 'subagent_completed', chat: URI.parse(defaultChatUri), toolCallId: 'fusion:fusion-1:judge' });
 		agent.fireProgress({ kind: 'subagent_completed', chat: URI.parse(defaultChatUri), toolCallId: 'fusion:fusion-1:repair' });
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-parent', duration: 1000 });
+		fire(chatTurnComplete('turn-parent', 1000));
 
 		assert.deepStrictEqual({
 			phaseChatsTracked: judgeTurnId !== 'missing-phase-turn' && repairTurnId !== 'missing-phase-turn',
@@ -1486,7 +1471,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		agent.fireProgress({ kind: 'subagent_started', chat, toolCallId: 'call-task', agentName: 'explore', agentDisplayName: 'Explore', parentToolCallId: phaseToolCallId });
 		agent.fireProgress({ kind: 'subagent_completed', chat, toolCallId: 'call-task' });
 		agent.fireProgress({ kind: 'subagent_completed', chat, toolCallId: phaseToolCallId });
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-parent', duration: 1000 });
+		fire(chatTurnComplete('turn-parent', 1000));
 
 		assert.deepStrictEqual(completedEvents().map(event => {
 			const data = event.data as Record<string, unknown>;
@@ -1502,13 +1487,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		startTurn('turn-parent-finished');
 		const subagentChatUri = buildSubagentChatUri(sessionUri, 'call-subagent-finished');
 		stateManager.addChat(sessionKey, subagentChatUri, creationTimeChatStorageResource(sessionKey, subagentChatUri, buildDefaultChatUri(sessionKey)));
-		fire({
-			type: ActionType.ChatToolCallStart,
-			turnId: 'turn-parent-finished',
-			toolCallId: 'call-subagent-finished',
-			toolName: 'task',
-			displayName: 'Task',
-		});
+		fire(chatToolCallStart('turn-parent-finished', 'call-subagent-finished', 'task', 'Task'));
 		agent.fireProgress({
 			kind: 'subagent_started',
 			chat: URI.parse(defaultChatUri),
@@ -1521,8 +1500,8 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		assert.ok(subagentTurnId);
 		fireModelCallFinished('turn-parent-finished', 'subagent-call-1', 150, 'error', undefined, 'call-subagent-finished');
 		fireModelCallFinished('turn-parent-finished', 'subagent-call-2', 250, 'success', true, 'call-subagent-finished');
-		fire({ type: ActionType.ChatTurnComplete, turnId: subagentTurnId, duration: 1000 }, subagentChatUri);
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-parent-finished', duration: 1000 });
+		fire(chatTurnComplete(subagentTurnId, 1000), subagentChatUri);
+		fire(chatTurnComplete('turn-parent-finished', 1000));
 
 		assert.deepStrictEqual(completedEvents().map(event => {
 			const data = event.data as Record<string, unknown>;
@@ -1592,7 +1571,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 			}
 		});
 
-		fire({ type: ActionType.ChatTurnComplete, turnId: level2TurnId, duration: 1000 }, level2ChatUri);
+		fire(chatTurnComplete(level2TurnId, 1000), level2ChatUri);
 		agent.fireProgress({
 			kind: 'subagent_resumed',
 			chat: URI.parse(defaultChatUri),
@@ -1600,9 +1579,9 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		});
 		const resumedLevel2TurnId = stateManager.getActiveTurnId(level2ChatUri);
 		assert.ok(resumedLevel2TurnId);
-		fire({ type: ActionType.ChatTurnComplete, turnId: resumedLevel2TurnId, duration: 1000 }, level2ChatUri);
-		fire({ type: ActionType.ChatTurnComplete, turnId: level1TurnId, duration: 1000 }, level1ChatUri);
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-parent', duration: 1000 });
+		fire(chatTurnComplete(resumedLevel2TurnId, 1000), level2ChatUri);
+		fire(chatTurnComplete(level1TurnId, 1000), level1ChatUri);
+		fire(chatTurnComplete('turn-parent', 1000));
 
 		assert.deepStrictEqual(completedEvents().map(event => {
 			const data = event.data as Record<string, unknown>;
@@ -1650,7 +1629,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		});
 		const childTurnId = stateManager.getActiveTurnId(childChatUri);
 		assert.ok(childTurnId);
-		fire({ type: ActionType.ChatTurnComplete, turnId: childTurnId, duration: 1000 }, childChatUri);
+		fire(chatTurnComplete(childTurnId, 1000), childChatUri);
 
 		const data = completedEvents()[0].data as Record<string, unknown>;
 		assert.strictEqual(data.parentTurnId, undefined);
@@ -1661,7 +1640,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		setupSession(true, ['file:///work/app', 'file:///work/api']);
 		startTurn('turn-mr', 'hello');
 
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-mr', duration: 1000 });
+		fire(chatTurnComplete('turn-mr', 1000));
 
 		const events = completedEvents();
 		assert.strictEqual(events.length, 1);
@@ -1681,12 +1660,12 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		}]);
 
 		startTurn('turn-byok', 'hello', 'openrouter/private-model');
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-byok', duration: 1000 });
+		fire(chatTurnComplete('turn-byok', 1000));
 		startTurn('turn-unknown', 'hello', 'unadvertised/private-model');
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-unknown', duration: 1000 });
+		fire(chatTurnComplete('turn-unknown', 1000));
 		agent.chatModel = { id: 'openrouter/private-model' };
 		startTurn('turn-default');
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-default', duration: 1000 });
+		fire(chatTurnComplete('turn-default', 1000));
 
 		assert.deepStrictEqual(completedEvents().map(event => {
 			const data = event.data as Record<string, unknown>;
@@ -1707,7 +1686,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		startTurn('turn-auto', 'hello', 'auto');
 
 		fire({ type: ActionType.ChatUsage, turnId: 'turn-auto', usage: { model: 'gpt-5.5' } });
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-auto', duration: 1000 });
+		fire(chatTurnComplete('turn-auto', 1000));
 
 		const data = completedEvents()[0].data as Record<string, unknown>;
 		assert.deepStrictEqual({
@@ -1729,7 +1708,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		]);
 		startTurn('turn-explicit', 'hello', COPILOT_HYDRA_FUSION_MODEL_ID);
 		fire({ type: ActionType.ChatUsage, turnId: 'turn-explicit', usage: { model: 'gpt-5.5' } });
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-explicit', duration: 1000 });
+		fire(chatTurnComplete('turn-explicit', 1000));
 
 		agent.chatModel = { id: COPILOT_HYDRA_FUSION_MODEL_ID };
 		startTurn('turn-default');
@@ -1737,7 +1716,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 
 		startTurn('turn-max', 'hello', COPILOT_HYDRA_FUSION_MAX_MODEL_ID);
 		fire({ type: ActionType.ChatUsage, turnId: 'turn-max', usage: { model: 'gpt-5.5' } });
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-max', duration: 1000 });
+		fire(chatTurnComplete('turn-max', 1000));
 
 		assert.deepStrictEqual(completedEvents().map(event => {
 			const data = event.data as Record<string, unknown>;
@@ -1773,20 +1752,20 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		startTurn('turn-high', 'hello', { id: 'auto', config: { tier: 'hydrafusion' } });
 		fire(fusionMilestone('turn-high', COPILOT_HYDRA_FUSION_MODEL_ID));
 		fire({ type: ActionType.ChatUsage, turnId: 'turn-high', usage: { model: 'gpt-5.5' } });
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-high', duration: 1000 });
+		fire(chatTurnComplete('turn-high', 1000));
 
 		// Cancelled before routing finished: only the selected tier is known.
 		startTurn('turn-max', 'hello', { id: 'auto', config: { tier: COPILOT_HYDRA_FUSION_MAX_MODEL_ID } });
 		fire({ type: ActionType.ChatTurnCancelled, turnId: 'turn-max', duration: 1000 });
 
 		startTurn('turn-standard', 'hello', { id: 'auto', config: { tier: 'balance' } });
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-standard', duration: 1000 });
+		fire(chatTurnComplete('turn-standard', 1000));
 
 		startTurn('turn-legacy', 'hello', { id: 'auto', config: { autoTier: 'max' } });
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-legacy', duration: 1000 });
+		fire(chatTurnComplete('turn-legacy', 1000));
 
 		startTurn('turn-unknown', 'hello', { id: 'auto', config: { tier: 'experimental tier' } });
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-unknown', duration: 1000 });
+		fire(chatTurnComplete('turn-unknown', 1000));
 
 		startTurn('turn-failed', 'hello', { id: 'auto', config: { tier: COPILOT_HYDRA_FUSION_MAX_MODEL_ID } });
 		fire(fusionMilestone('turn-failed', COPILOT_HYDRA_FUSION_MAX_MODEL_ID));
@@ -1822,7 +1801,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 			{ provider: 'mock', id: COPILOT_HYDRA_FUSION_MODEL_ID, name: 'HydraFusion', supportsVision: false },
 		]);
 		startTurn('turn-explicit', 'hello', COPILOT_HYDRA_FUSION_MODEL_ID);
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-explicit', duration: 1000 });
+		fire(chatTurnComplete('turn-explicit', 1000));
 
 		const data = completedEvents()[0].data as Record<string, unknown>;
 		assert.deepStrictEqual({
@@ -1840,7 +1819,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		agent.chatModel = { id: 'gpt-5.5' };
 
 		startTurn('turn-success');
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-success', duration: 1000 });
+		fire(chatTurnComplete('turn-success', 1000));
 		startTurn('turn-error');
 		fire({ type: ActionType.ChatError, turnId: 'turn-error', duration: 1000, part: createErrorResponsePart({ errorType: 'oops', message: 'fail' }) });
 		startTurn('turn-cancelled');
@@ -1887,7 +1866,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 
 		// Usage is not a "visible progress" action — it should not mark first progress.
 		fire({ type: ActionType.ChatUsage, turnId: 'turn-1', usage: { inputTokens: 1, outputTokens: 1 } });
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 });
+		fire(chatTurnComplete('turn-1', 1000));
 
 		const data = completedEvents()[0].data as Record<string, unknown>;
 		assert.strictEqual(data.timeToFirstProgress, undefined);
@@ -1897,18 +1876,12 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		setupSession();
 		startTurn('turn-1');
 
-		fire({
-			type: ActionType.ChatToolCallStart,
-			turnId: 'turn-1',
-			toolCallId: 'call-rename',
-			toolName: 'rename_chat',
-			displayName: 'Rename Chat',
-		});
+		fire(chatToolCallStart('turn-1', 'call-rename', 'rename_chat', 'Rename Chat'));
 		// Separate the two marks in time so a substantive value that wrongly
 		// came from the rename call would be indistinguishable from zero delay.
 		await timeout(5);
 		fire({ type: ActionType.ChatResponsePart, turnId: 'turn-1', part: { kind: ResponsePartKind.Markdown, id: 'p1', content: 'working on it' } });
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 });
+		fire(chatTurnComplete('turn-1', 1000));
 
 		const data = completedEvents()[0].data as Record<string, unknown>;
 		const progress = data.timeToFirstProgress as number;
@@ -1927,7 +1900,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		startTurn('turn-1');
 
 		fire({ type: ActionType.ChatResponsePart, turnId: 'turn-1', part: { kind: ResponsePartKind.Markdown, id: 'p1', content: 'hi' } });
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 });
+		fire(chatTurnComplete('turn-1', 1000));
 
 		const data = completedEvents()[0].data as Record<string, unknown>;
 		assert.strictEqual(data.timeToFirstSubstantiveProgress, data.timeToFirstProgress);
@@ -1937,14 +1910,8 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		setupSession();
 		startTurn('turn-1');
 
-		fire({
-			type: ActionType.ChatToolCallStart,
-			turnId: 'turn-1',
-			toolCallId: 'call-rename',
-			toolName: 'rename_chat',
-			displayName: 'Rename Chat',
-		});
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 });
+		fire(chatToolCallStart('turn-1', 'call-rename', 'rename_chat', 'Rename Chat'));
+		fire(chatTurnComplete('turn-1', 1000));
 
 		const data = completedEvents()[0].data as Record<string, unknown>;
 		assert.deepStrictEqual({
@@ -1962,14 +1929,8 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 
 		// Claude exposes host server tools through its MCP bridge, so the same
 		// tool arrives as `mcp__host__rename_chat` rather than the bare name.
-		fire({
-			type: ActionType.ChatToolCallStart,
-			turnId: 'turn-1',
-			toolCallId: 'call-rename',
-			toolName: 'mcp__host__rename_chat',
-			displayName: 'Rename Chat',
-		});
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 });
+		fire(chatToolCallStart('turn-1', 'call-rename', 'mcp__host__rename_chat', 'Rename Chat'));
+		fire(chatTurnComplete('turn-1', 1000));
 
 		const data = completedEvents()[0].data as Record<string, unknown>;
 		assert.deepStrictEqual({
@@ -1988,17 +1949,11 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		// The emission sequence Claude and Codex produce: a rename, then an
 		// empty reasoning part opened by `content_block_start`, then the delta
 		// that actually fills it.
-		fire({
-			type: ActionType.ChatToolCallStart,
-			turnId: 'turn-1',
-			toolCallId: 'call-rename',
-			toolName: 'rename_chat',
-			displayName: 'Rename Chat',
-		});
+		fire(chatToolCallStart('turn-1', 'call-rename', 'rename_chat', 'Rename Chat'));
 		fire({ type: ActionType.ChatResponsePart, turnId: 'turn-1', part: { kind: ResponsePartKind.Reasoning, id: 'r1', content: '' } });
 		await timeout(5);
 		fire({ type: ActionType.ChatReasoning, turnId: 'turn-1', partId: 'r1', content: 'thinking about it' });
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 });
+		fire(chatTurnComplete('turn-1', 1000));
 
 		const data = completedEvents()[0].data as Record<string, unknown>;
 		assert.deepStrictEqual({
@@ -2020,7 +1975,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		fire({ type: ActionType.ChatResponsePart, turnId: 'turn-1', part: { kind: ResponsePartKind.Reasoning, id: 'r1', content: '' } });
 		fire({ type: ActionType.ChatDelta, turnId: 'turn-1', partId: 'p1', content: '' });
 		fire({ type: ActionType.ChatResponsePart, turnId: 'turn-1', part: { kind: ResponsePartKind.SystemNotification, content: '' } });
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 });
+		fire(chatTurnComplete('turn-1', 1000));
 
 		const data = completedEvents()[0].data as Record<string, unknown>;
 		assert.deepStrictEqual({
@@ -2037,7 +1992,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		startTurn('turn-1');
 		// Let the asynchronous send path run to the provider hand-off.
 		await timeout(0);
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 });
+		fire(chatTurnComplete('turn-1', 1000));
 
 		const data = completedEvents()[0].data as Record<string, unknown>;
 		assert.deepStrictEqual({
@@ -2064,7 +2019,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		setupSession(true, undefined, true);
 		startTurn('turn-1');
 		await timeout(0);
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 });
+		fire(chatTurnComplete('turn-1', 1000));
 
 		const data = completedEvents()[0].data as Record<string, unknown>;
 		assert.deepStrictEqual({
@@ -2132,7 +2087,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		fire({ type: ActionType.ChatUsage, turnId: 'turn-1', usage: { _meta: { copilotUsage: { totalNanoAiu: 1_500_000_000 } } } });
 		fire({ type: ActionType.ChatUsage, turnId: 'turn-1', usage: { inputTokens: 10, outputTokens: 5, _meta: { copilotUsage: { totalNanoAiu: 2_000_000_000 } } } });
 		fire({ type: ActionType.ChatUsage, turnId: 'turn-1', usage: { inputTokens: 20, outputTokens: 10 } });
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 });
+		fire(chatTurnComplete('turn-1', 1000));
 
 		assert.strictEqual((completedEvents()[0].data as Record<string, unknown>).billedNanoAiu, 2_000_000_000);
 	});
@@ -2180,7 +2135,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		startTurn('turn-1');
 
 		fire({ type: ActionType.ChatUsage, turnId: 'turn-1', usage: { inputTokens: 10, outputTokens: 5 } });
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 });
+		fire(chatTurnComplete('turn-1', 1000));
 
 		assert.strictEqual((completedEvents()[0].data as Record<string, unknown>).billedNanoAiu, undefined);
 	});
@@ -2198,8 +2153,8 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		fire({ type: ActionType.ChatUsage, turnId: 'turn-parent', usage: { _meta: { copilotUsage: { totalNanoAiu: 3_000_000_000 } } } });
 		fire({ type: ActionType.ChatUsage, turnId: 'turn-subagent', usage: { _meta: { copilotUsage: { totalNanoAiu: 1_000_000_000 } } } }, subagentChatUri);
 
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-subagent', duration: 1000 }, subagentChatUri);
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-parent', duration: 1000 });
+		fire(chatTurnComplete('turn-subagent', 1000), subagentChatUri);
+		fire(chatTurnComplete('turn-parent', 1000));
 
 		assert.deepStrictEqual(completedEvents().map(event => {
 			const data = event.data as Record<string, unknown>;
@@ -2257,8 +2212,8 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 			},
 		}, subagentChatUri);
 
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-subagent', duration: 1000 }, subagentChatUri);
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-parent', duration: 1000 });
+		fire(chatTurnComplete('turn-subagent', 1000), subagentChatUri);
+		fire(chatTurnComplete('turn-parent', 1000));
 
 		assert.deepStrictEqual(completedEvents().map(event => {
 			const data = event.data as Record<string, unknown>;
@@ -2361,7 +2316,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		stateManager.addChat(sessionKey, subagentChatUri, creationTimeChatStorageResource(sessionKey, subagentChatUri, buildDefaultChatUri(sessionKey)), { origin: { kind: ChatOriginKind.Tool, chat: defaultChatUri, toolCallId: 'tool-call-1' } });
 
 		startTurn('subagent-complete', 'hello', undefined, subagentChatUri);
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'subagent-complete', duration: 1000 }, subagentChatUri);
+		fire(chatTurnComplete('subagent-complete', 1000), subagentChatUri);
 		startTurn('subagent-failed', 'hello', undefined, subagentChatUri);
 		fire({ type: ActionType.ChatError, turnId: 'subagent-failed', duration: 1000, part: createErrorResponsePart({ errorType: 'oops', message: 'fail' }) }, subagentChatUri);
 
@@ -2388,10 +2343,10 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 	test('emits a single turnCompleted per turn even when followed by duplicate completions', () => {
 		setupSession();
 		startTurn('turn-1');
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 });
+		fire(chatTurnComplete('turn-1', 1000));
 		// A duplicate turn-complete should not produce a second telemetry event because the tracker
 		// drops its per-turn state on the first completion.
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 });
+		fire(chatTurnComplete('turn-1', 1000));
 
 		assert.strictEqual(completedEvents().length, 1);
 	});
@@ -2404,7 +2359,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		// Change config mid-turn — should not affect the recorded event.
 		setSessionConfig({ autoApprove: 'autopilot' });
 
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 });
+		fire(chatTurnComplete('turn-1', 1000));
 
 		const data = completedEvents()[0].data as Record<string, unknown>;
 		assert.strictEqual(data.permissionLevel, 'default');
@@ -2416,7 +2371,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		for (const mode of ['interactive', 'plan', 'autopilot'] as const) {
 			setSessionConfig({ mode });
 			startTurn(`turn-${mode}`);
-			fire({ type: ActionType.ChatTurnComplete, turnId: `turn-${mode}`, duration: 1000 });
+			fire(chatTurnComplete(`turn-${mode}`, 1000));
 		}
 
 		assert.deepStrictEqual(completedEvents().map(event => (event.data as Record<string, unknown>).interactionMode), ['interactive', 'plan', 'autopilot']);
@@ -2428,7 +2383,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		startTurn('turn-1');
 
 		setSessionConfig({ mode: 'autopilot' });
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 });
+		fire(chatTurnComplete('turn-1', 1000));
 
 		assert.strictEqual((completedEvents()[0].data as Record<string, unknown>).interactionMode, 'plan');
 	});
@@ -2436,7 +2391,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 	test('model and permissionLevel are undefined when never set', () => {
 		setupSession();
 		startTurn('turn-1');
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 });
+		fire(chatTurnComplete('turn-1', 1000));
 
 		const data = completedEvents()[0].data as Record<string, unknown>;
 		assert.strictEqual(data.model, undefined);
@@ -2624,7 +2579,7 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		assert.ok(turnId);
 
 		setSessionConfig({ mode: 'interactive' });
-		fire({ type: ActionType.ChatTurnComplete, turnId, duration: 1000 });
+		fire(chatTurnComplete(turnId, 1000));
 
 		assert.strictEqual((completedEvents()[0].data as Record<string, unknown>).interactionMode, 'autopilot');
 	});
@@ -2642,11 +2597,11 @@ suite('AgentSideEffects — turn tracker telemetry', () => {
 		stateManager.dispatchClientAction(defaultChatUri, setAction, { clientId: 'test', clientSeq: 2 });
 		sideEffects.handleAction(defaultChatUri, setAction);
 		account = { usageSource: 'openai', status: 'signedIn', authType: 'chatgpt', planType: 'plus' };
-		fire({ type: ActionType.ChatTurnComplete, turnId: 'first', duration: 1 });
+		fire(chatTurnComplete('first', 1));
 		const queuedTurnId = stateManager.getActiveTurnId(defaultChatUri);
 		assert.ok(queuedTurnId);
 		account = { usageSource: 'openai', status: 'error' };
-		fire({ type: ActionType.ChatTurnComplete, turnId: queuedTurnId, duration: 1 });
+		fire(chatTurnComplete(queuedTurnId, 1));
 		assert.deepStrictEqual(completedEvents().map(event => Object.fromEntries(Object.entries(event.data as object).filter(([key]) => key.startsWith('chatgpt')))), [
 			{ chatgptAccountState: 'signedOut', chatgptWeeklyQuotaState: 'unavailable', chatgptFiveHourQuotaState: 'unavailable' },
 			{ chatgptAccountState: 'signedIn', chatgptPlanTier: 'plus', chatgptWeeklyQuotaState: 'missing', chatgptFiveHourQuotaState: 'missing' },

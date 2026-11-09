@@ -14,6 +14,7 @@ import type { ClaudeMapperState } from './claudeMapSessionEvents.js';
 import { SUBAGENT_TOOL_NAMES, type SubagentRegistry } from './claudeSubagentRegistry.js';
 import { buildClaudeToolCallMeta, buildClaudeToolMeta, getClaudeInvocationMessage, getClaudeToolDisplayName, getClaudeToolInputString } from './claudeToolDisplay.js';
 import { hasClientToolNamePrefix, stripClientToolNamePrefix } from './clientTools/claudeClientToolMcpServer.js';
+import type { SessionClientToolsModel } from './clientTools/claudeSessionClientToolsModel.js';
 
 /**
  * Phase 12 — SDK tool names that spawn subagent sessions. Re-exported
@@ -218,7 +219,7 @@ export function emitInnerAssistantSignals(
 	state: ClaudeMapperState,
 	parentToolUseId: string,
 	registry: SubagentRegistry,
-	clientToolOwner?: (toolName: string) => string | undefined,
+	clientTools?: SessionClientToolsModel,
 ): AgentSignal[] {
 	const messageId = message.message.id;
 	const signals: AgentSignal[] = [];
@@ -262,7 +263,7 @@ export function emitInnerAssistantSignals(
 			// mapper). SDK-owned tools and Task/Agent passes through unchanged.
 			const toolName = stripClientToolNamePrefix(block.name);
 			const isClientTool = hasClientToolNamePrefix(block.name);
-			const clientId = isClientTool ? clientToolOwner?.(toolName) : undefined;
+			const clientId = isClientTool ? clientTools?.ownerOf(toolName) : undefined;
 			const requestTurnId = registry.getSpawn(parentToolUseId)?.requestTurnId ?? state.lookupToolCall(parentToolUseId)?.turnId ?? turnId;
 			state.startToolBlock(index, block.id, toolName, turnId, isClientTool, requestTurnId);
 			if (!isClientTool && SUBAGENT_SPAWNING_TOOL_NAMES.has(toolName)) {

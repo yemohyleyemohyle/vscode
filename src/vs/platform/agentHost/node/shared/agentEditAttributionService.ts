@@ -16,7 +16,7 @@ import { generateUuid } from '../../../../base/common/uuid.js';
 import { FileOperationResult, IFileService, toFileOperationResult } from '../../../files/common/files.js';
 import { ILogService } from '../../../log/common/log.js';
 import { EditTelemetryTrigger, sendEditSourcesDetailsTelemetry, sendEditSourcesStatsTelemetry } from '../../../telemetry/common/editTelemetry.js';
-import { ITelemetryService, TelemetryLevel } from '../../../telemetry/common/telemetry.js';
+import { ITelemetryService, normalizeModelRouterTelemetryId, TelemetryLevel } from '../../../telemetry/common/telemetry.js';
 import { AgentSession } from '../../common/agent.js';
 import { getTelemetryChatSessionId } from '../../common/agentTelemetryCorrelation.js';
 import { IDiffComputeService, IOffsetEdit } from '../../common/diffComputeService.js';
@@ -25,6 +25,7 @@ import { isAhpChatChannel } from '../../common/state/sessionState.js';
 import { IAgentHostTelemetryService } from '../agentHostTelemetryService.js';
 import { Emitter } from '../../../../base/common/event.js';
 import { type IRequestEditSurvivalBoundary, type IRequestFocusWindowSurvivalSnapshot, unavailableRequestEditSurvivalSnapshots } from '../../common/requestEditSurvival.js';
+import { toCopilotTelemetryData } from './copilotSkuTelemetry.js';
 
 const MAX_TOTAL_TRACKED_TEXT = 20 * 1024 * 1024;
 const MAX_TRACKED_RESOURCES = 100;
@@ -52,6 +53,7 @@ interface IAttributedInterval {
 
 interface ISourceStatistics {
 	readonly trackingKey: string;
+	readonly copilotTrackingId: string | undefined;
 	readonly groupKey: string;
 	readonly sourceKey: string;
 	readonly sourceKeyCleaned: string;
@@ -368,7 +370,9 @@ export class AgentEditAttributionService extends Disposable implements IAgentEdi
 		}
 
 		const provider = edit.provider ?? getSessionProvider(edit.ownerSessionUri);
-		const modelSegment = edit.modelId ? `-$modelId:${edit.modelId}` : '';
+		const copilotTrackingId = provider === 'copilotcli' ? edit.copilotTrackingId || undefined : undefined;
+		const telemetryModelId = normalizeModelRouterTelemetryId(edit.modelId);
+		const modelSegment = telemetryModelId ? `-$modelId:${telemetryModelId}` : '';
 		// Matches the workbench edit-source key order ($modelId, $autoTier, $fusionModel, ..., $harness, $origin).
 		const autoTierSegment = edit.autoTier ? `-$autoTier:${edit.autoTier}` : '';
 		const fusionModelSegment = edit.fusionModel ? `-$fusionModel:${edit.fusionModel}` : '';
@@ -379,15 +383,16 @@ export class AgentEditAttributionService extends Disposable implements IAgentEdi
 		const agentSessionId = AgentSession.id(edit.ownerSessionUri);
 		const chatSessionId = chatUri === undefined ? undefined : getTelemetryChatSessionId(chatUri);
 		const toTrackingKey = (key: string) => JSON.stringify([key, agentSessionId, conversationId, chatSessionId]);
-		const trackingKey = toTrackingKey(sourceKey);
+		const trackingKey = JSON.stringify([toTrackingKey(sourceKey), copilotTrackingId]);
 		let source = resource.sources.get(trackingKey);
 		if (!source) {
 			source = {
 				trackingKey,
+				copilotTrackingId,
 				groupKey: toTrackingKey(groupSourceKey),
 				sourceKey,
 				sourceKeyCleaned: `source:Chat.applyEdits-$harness:${provider}-$origin:agentHost`,
-				modelId: edit.modelId,
+				modelId: telemetryModelId,
 				autoTier: edit.autoTier,
 				fusionModel: edit.fusionModel,
 				conversationId,
@@ -922,6 +927,7 @@ export class AgentEditAttributionService extends Disposable implements IAgentEdi
 		}
 		for (const source of prepared.sources) {
 			const data = {
+				...toCopilotTelemetryData({ copilotSku: undefined, copilotTrackingId: source.copilotTrackingId }),
 				mode: 'longterm',
 				sourceKey: source.sourceKey,
 				sourceKeyCleaned: source.sourceKeyCleaned,
