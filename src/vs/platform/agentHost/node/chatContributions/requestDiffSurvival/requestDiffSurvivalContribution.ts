@@ -19,6 +19,7 @@ import type { ISessionFileDiff, URI as ProtocolURI } from '../../../common/state
 import { AgentHostStateManager, IAgentHostStateManager } from '../../agentHostStateManager.js';
 import { computeRequestCharacterDiffFile, computeRequestCharacterDiffSurvivalMetric, type IRequestCharacterRepositoryDiff } from './requestCharacterDiffSurvival.js';
 import { RequestDiffSurvivalBudgetError, RequestDiffSurvivalInputBudget, requestDiffSurvivalLimits } from './requestDiffSurvivalLimits.js';
+import { getRequestDiffSurvivalCostOutcome, RequestDiffSurvivalCostObservation, type IRequestDiffSurvivalFileCost, type IRequestDiffSurvivalSizeDetails, type RequestDiffSurvivalComparison, type RequestDiffSurvivalCostOutcome } from './requestDiffSurvivalCost.js';
 
 const CHARACTER_DIFF_LOG_PREFIX = '[RequestCharacterDiffSurvivalObservation] ';
 const ENABLED_ENVIRONMENT_VARIABLE = 'VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG';
@@ -45,6 +46,7 @@ interface IRequestDiffSurvivalTracker {
 	readonly baseEndTimestamp: string;
 	readonly originalRequestUsedEditTool: boolean | null;
 	observationCount: number;
+	cost: RequestDiffSurvivalCostObservation;
 }
 
 interface IRequestDiffSurvivalState {
@@ -108,7 +110,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 	}), state => {
 		state.isDisposed = true;
 		for (const tracker of [...state.trackers]) {
-			this._retireTracker(state, tracker);
+			this._retireTracker(state, tracker, 'stateDisposed');
 		}
 		state.starts.clear();
 		state.requestEvidence.clear();
@@ -230,6 +232,10 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 				baseEndTimestamp: observationTimestamp,
 				originalRequestUsedEditTool,
 				observationCount: 0,
+				cost: new RequestDiffSurvivalCostObservation(this._logService, {
+					sessionId: turn.session, chatId: turn.channel, originatingRequestId: turnId,
+					observationRequestId: turnId, observationIndex: 0,
+				}),
 			};
 			state.trackers.push(tracker);
 			await this._emitObservation(turn.session, turn.channel, turnId, start.model, observationTimestamp, result, tracker, state);
@@ -287,25 +293,56 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		}
 	}
 
-	private _reserveRetained(state: IRequestDiffSurvivalState, tracker: IRequestDiffSurvivalTracker, bytes: number): void {
+	private _reserveRetained(
+		state: IRequestDiffSurvivalState, tracker: IRequestDiffSurvivalTracker, bytes: number,
+		file?: IRequestDiffSurvivalFileCost,
+	): void {
 		this._assertActive(state);
 		const proposedRetainedDiffBytes = this._retainedBytes + bytes;
 		if (proposedRetainedDiffBytes > requestDiffSurvivalLimits.maximumRetainedDiffBytes) {
-			this._retireTracker(state, tracker);
+			this._sizeEvent(tracker, {
+				phase: 'budgetRejection', status: 'budgetRejected', ...this._fileSizeDetails(file),
+				proposedHostEstimatedRetainedBytes: proposedRetainedDiffBytes,
+			});
+			this._retireTracker(state, tracker, 'budgetRejected');
 			throw new RequestDiffSurvivalBudgetError(false, false, true, { proposedRetainedDiffBytes });
 		}
 		this._retainedBytes = proposedRetainedDiffBytes;
 		tracker.retainedBytes += bytes;
 	}
 
-	private _retireTracker(state: IRequestDiffSurvivalState, tracker: IRequestDiffSurvivalTracker): void {
+	private _retireTracker(
+		state: IRequestDiffSurvivalState, tracker: IRequestDiffSurvivalTracker,
+		reason: NonNullable<IRequestDiffSurvivalSizeDetails['reason']>,
+	): void {
 		const index = state.trackers.indexOf(tracker);
+		const retainedBytes = tracker.retainedBytes;
+		const wasTracked = index >= 0 || retainedBytes > 0;
 		if (index >= 0) {
 			state.trackers.splice(index, 1);
 		}
 		this._retainedBytes -= tracker.retainedBytes;
 		tracker.retainedBytes = 0;
 		tracker.originalRequest = undefined;
+		if (wasTracked) {
+			this._sizeEvent(tracker, { phase: 'release', status: 'completed', reason, retainedBytesDelta: -retainedBytes });
+		}
+	}
+
+	private _sizeEvent(
+		tracker: IRequestDiffSurvivalTracker,
+		details: Omit<IRequestDiffSurvivalSizeDetails, 'trackerEstimatedRetainedBytes' | 'hostEstimatedRetainedBytes'>,
+	): void {
+		tracker.cost.size({
+			...details, trackerEstimatedRetainedBytes: tracker.retainedBytes, hostEstimatedRetainedBytes: this._retainedBytes,
+		});
+	}
+
+	private _fileSizeDetails(file?: IRequestDiffSurvivalFileCost) {
+		return file ? {
+			comparisonKind: file.comparisonKind, repositoryIndex: file.repositoryIndex,
+			fileIndex: file.fileIndex, fileInputBytes: file.fileInputBytes,
+		} : {};
 	}
 
 	private async _getTurnResultState(
@@ -350,38 +387,56 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		tracker: IRequestDiffSurvivalTracker,
 		state: IRequestDiffSurvivalState,
 	): Promise<void> {
+		const cost = tracker.observationCount === 0 ? tracker.cost : tracker.cost = new RequestDiffSurvivalCostObservation(this._logService, {
+			sessionId: session, chatId: chat, originatingRequestId: tracker.originatingRequestId,
+			observationRequestId, observationIndex: tracker.observationCount,
+		});
+		let outcome: RequestDiffSurvivalCostOutcome = 'failed';
 		try {
-			const budget = new RequestDiffSurvivalInputBudget();
+			const budget = cost.inputBudget;
 			if (!tracker.originalRequest) {
 				this._reserveRetained(state, tracker, 256);
-				const original = await this._computeDiff(session, tracker.baseline, latest, budget, state, tracker);
+				this._sizeEvent(tracker, { phase: 'admission', status: 'started', retainedBytesDelta: 256 });
+				const original = await this._computeDiff(session, tracker.baseline, latest, budget, state, tracker, 'originalRequest', true);
 				this._assertActive(state);
 				tracker.originalRequest = original;
+				this._sizeEvent(tracker, { phase: 'admission', status: 'completed' });
+			} else {
+				cost.finishComparison('originalRequest', 'reused');
 			}
 			const originalRequest = tracker.originalRequest;
 			const baselineToLatest = tracker.observationCount === 0
 				? originalRequest
-				: await this._computeDiff(session, tracker.baseline, latest, budget, state);
+				: await this._computeDiff(session, tracker.baseline, latest, budget, state, tracker, 'baselineToLatest', false);
 			const requestResultToLatest = tracker.observationCount === 0
 				? { files: [], errors: [] }
-				: await this._computeDiff(session, tracker.requestResult, latest, budget, state);
+				: await this._computeDiff(session, tracker.requestResult, latest, budget, state, tracker, 'requestResultToLatest', false);
+			if (tracker.observationCount === 0) {
+				cost.finishComparison('baselineToLatest', 'reused');
+				cost.finishComparison('requestResultToLatest', 'empty');
+			}
 			this._assertActive(state);
+			outcome = [originalRequest, baselineToLatest, requestResultToLatest].some(diff => diff.errors.length > 0) ? 'failed' : 'completed';
 			this._writeObservation(session, chat, observationRequestId, observationModel, observationTimestamp, tracker, {
 				originalRequest, baselineToLatest, requestResultToLatest,
 			});
 			tracker.observationCount++;
 			if (tracker.observationCount > requestDiffSurvivalLimits.maximumFollowUpCount) {
-				this._retireTracker(state, tracker);
+				this._retireTracker(state, tracker, 'horizon');
 			}
 		} catch (error) {
+			outcome = getRequestDiffSurvivalCostOutcome(error);
 			if (error instanceof RequestDiffSurvivalBudgetError) {
 				this._assertActive(state);
 				this._writeObservation(session, chat, observationRequestId, observationModel, observationTimestamp, tracker, undefined, error);
-				this._retireTracker(state, tracker);
+				this._retireTracker(state, tracker, 'budgetRejected');
 			} else {
-				this._retireTracker(state, tracker);
+				this._retireTracker(state, tracker, isCancellationError(error) ? 'cancelled' : 'failed');
 				throw error;
 			}
+		} finally {
+			cost.finishObservation(outcome);
+			this._sizeEvent(tracker, { phase: 'observation', status: outcome });
 		}
 	}
 
@@ -435,58 +490,81 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		after: readonly IRepositoryState[],
 		budget: RequestDiffSurvivalInputBudget,
 		state: IRequestDiffSurvivalState,
-		retainedTracker?: IRequestDiffSurvivalTracker,
+		tracker: IRequestDiffSurvivalTracker,
+		comparison: RequestDiffSurvivalComparison,
+		retain: boolean,
 	): Promise<IRequestCharacterRepositoryDiff> {
-		const afterByRepository = new Map(after.map(state => [state.repository.toString(), state.ref]));
-		const files = [];
-		const errors: string[] = [];
-		const addError = (message: string) => {
-			if (retainedTracker) {
-				this._reserveRetained(state, retainedTracker, 64 + 2 * message.length);
-			}
-			errors.push(message);
-		};
-		for (const beforeRepository of before) {
-			const afterRef = afterByRepository.get(beforeRepository.repository.toString());
-			if (!afterRef) {
-				addError(`Missing latest state for repository ${beforeRepository.repository.toString()}`);
-				continue;
-			}
-			const diffs = await this._gitService.computeFileDiffsBetweenRefs(beforeRepository.repository, {
-				sessionUri: session,
-				fromRef: beforeRepository.ref,
-				toRef: afterRef,
-			});
-			this._assertActive(state);
-			if (!diffs) {
-				addError(`Failed to compute diff for repository ${beforeRepository.repository.toString()}`);
-				continue;
-			}
-			for (const diff of diffs) {
-				const retainedBytesBeforeFile = retainedTracker?.retainedBytes ?? 0;
-				try {
-					const materialized = await this._materializeFileDiff(beforeRepository.repository, beforeRepository.ref, afterRef, diff, budget, state, retainedTracker);
-					files.push(materialized);
-				} catch (error) {
-					if (error instanceof RequestDiffSurvivalBudgetError || isCancellationError(error)) {
-						throw error;
+		const cost = tracker.cost;
+		cost.beginComparison(comparison);
+		let outcome: RequestDiffSurvivalCostOutcome = 'failed';
+		try {
+			const afterByRepository = new Map(after.map(state => [state.repository.toString(), state.ref]));
+			const files = [];
+			const errors: string[] = [];
+			const addError = (message: string) => {
+				if (retain) {
+					this._reserveRetained(state, tracker, 64 + 2 * message.length);
+				}
+				errors.push(message);
+			};
+			for (const [repositoryIndex, beforeRepository] of before.entries()) {
+				const afterRef = afterByRepository.get(beforeRepository.repository.toString());
+				if (!afterRef) {
+					addError(`Missing latest state for repository ${beforeRepository.repository.toString()}`);
+					continue;
+				}
+				const diffs = await this._gitService.computeFileDiffsBetweenRefs(beforeRepository.repository, {
+					sessionUri: session,
+					fromRef: beforeRepository.ref,
+					toRef: afterRef,
+				});
+				this._assertActive(state);
+				if (!diffs) {
+					addError(`Failed to compute diff for repository ${beforeRepository.repository.toString()}`);
+					continue;
+				}
+				for (const [fileIndex, diff] of diffs.entries()) {
+					const retainedBytesBeforeFile = tracker.retainedBytes;
+					const fileCost = cost.createFile(comparison, repositoryIndex, fileIndex);
+					try {
+						const materialized = await this._materializeFileDiff(beforeRepository.repository, beforeRepository.ref, afterRef, diff, budget, state, tracker, retain, fileCost);
+						files.push(materialized);
+						this._sizeEvent(tracker, { phase: 'fileConstruction', status: 'completed', ...this._fileSizeDetails(fileCost) });
+					} catch (error) {
+						const fileOutcome = getRequestDiffSurvivalCostOutcome(error);
+						if (!fileCost.computationStarted) {
+							cost.fileNotStarted(fileCost, fileOutcome);
+						}
+						this._sizeEvent(tracker, { phase: 'fileConstruction', status: fileOutcome, ...this._fileSizeDetails(fileCost) });
+						if (error instanceof RequestDiffSurvivalBudgetError || isCancellationError(error)) {
+							throw error;
+						}
+						this._assertActive(state);
+						if (retain) {
+							const released = tracker.retainedBytes - retainedBytesBeforeFile;
+							this._retainedBytes -= released;
+							tracker.retainedBytes = retainedBytesBeforeFile;
+							this._sizeEvent(tracker, { phase: 'rollback', status: 'failed', retainedBytesDelta: -released, ...this._fileSizeDetails(fileCost) });
+						}
+						const message = `Failed to materialize ${diff.after?.uri ?? diff.before?.uri ?? 'unknown file'}: ${error instanceof Error ? error.message : String(error)}`;
+						addError(message);
 					}
-					this._assertActive(state);
-					if (retainedTracker) {
-						this._retainedBytes -= retainedTracker.retainedBytes - retainedBytesBeforeFile;
-						retainedTracker.retainedBytes = retainedBytesBeforeFile;
-					}
-					const message = `Failed to materialize ${diff.after?.uri ?? diff.before?.uri ?? 'unknown file'}: ${error instanceof Error ? error.message : String(error)}`;
-					addError(message);
 				}
 			}
+			outcome = errors.length > 0 ? 'failed' : 'completed';
+			return { files, errors };
+		} catch (error) {
+			outcome = getRequestDiffSurvivalCostOutcome(error);
+			throw error;
+		} finally {
+			cost.finishComparison(comparison, outcome);
 		}
-		return { files, errors };
 	}
 
 	private async _materializeFileDiff(
 		repository: URI, beforeRef: string, afterRef: string, diff: ISessionFileDiff,
-		budget: RequestDiffSurvivalInputBudget, state: IRequestDiffSurvivalState, retainedTracker?: IRequestDiffSurvivalTracker,
+		budget: RequestDiffSurvivalInputBudget, state: IRequestDiffSurvivalState,
+		tracker: IRequestDiffSurvivalTracker, retain: boolean, fileCost: IRequestDiffSurvivalFileCost,
 	) {
 		const beforePath = diff.before ? relativePath(repository, URI.parse(diff.before.uri)) : undefined;
 		const afterPath = diff.after ? relativePath(repository, URI.parse(diff.after.uri)) : undefined;
@@ -499,15 +577,28 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		]);
 		this._assertActive(state);
 		if (beforeSize === undefined || afterSize === undefined || !Number.isSafeInteger(beforeSize) || !Number.isSafeInteger(afterSize) || beforeSize < 0 || afterSize < 0) {
+			this._sizeEvent(tracker, { phase: 'inputCheck', status: 'failed', ...this._fileSizeDetails(fileCost) });
 			throw new Error('Unable to read Git blob size');
 		}
 		const fileInputBytes = beforeSize + afterSize;
-		budget.consume(fileInputBytes);
+		fileCost.fileInputBytes = fileInputBytes;
+		try {
+			budget.consume(fileInputBytes);
+		} catch (error) {
+			if (error instanceof RequestDiffSurvivalBudgetError) {
+				this._sizeEvent(tracker, {
+					phase: 'budgetRejection', status: 'budgetRejected', ...this._fileSizeDetails(fileCost),
+					proposedObservationInputBytes: error.diagnostics.observationInputBytes,
+				});
+			}
+			throw error;
+		}
+		this._sizeEvent(tracker, { phase: 'inputCheck', status: 'completed', ...this._fileSizeDetails(fileCost) });
 		const originalPath = beforePath ? `${repository.toString()}#${beforePath}` : undefined;
 		const modifiedPath = afterPath ? `${repository.toString()}#${afterPath}` : undefined;
-		if (retainedTracker) {
+		if (retain) {
 			// Charge source strings too: sliced change text can retain their backing storage.
-			this._reserveRetained(state, retainedTracker, 256 + 2 * fileInputBytes + 2 * ((originalPath?.length ?? 0) + (modifiedPath?.length ?? 0)));
+			this._reserveRetained(state, tracker, 256 + 2 * fileInputBytes + 2 * ((originalPath?.length ?? 0) + (modifiedPath?.length ?? 0)), fileCost);
 		}
 		const [before, after] = await Promise.all([
 			beforePath ? this._gitService.showBlob(repository, beforeRef, beforePath) : undefined,
@@ -525,7 +616,9 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		}
 		const originalText = before?.toString() ?? '';
 		const modifiedText = after?.toString() ?? '';
-		return computeRequestCharacterDiffFile(originalPath, modifiedPath, originalText, modifiedText,
-			retainedTracker ? (path, length) => this._reserveRetained(state, retainedTracker, 128 + 2 * (path.length + length)) : undefined);
+		fileCost.beforeUtf16Length = originalText.length;
+		fileCost.afterUtf16Length = modifiedText.length;
+		return tracker.cost.measureFile(fileCost, () => computeRequestCharacterDiffFile(originalPath, modifiedPath, originalText, modifiedText,
+			retain ? (path, length) => this._reserveRetained(state, tracker, 128 + 2 * (path.length + length), fileCost) : undefined));
 	}
 }

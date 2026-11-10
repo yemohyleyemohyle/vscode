@@ -20,6 +20,7 @@ import { ActionType, type ChatAction } from '../../common/state/sessionActions.j
 import { AgentHostStateManager } from '../../node/agentHostStateManager.js';
 import { RequestDiffSurvivalContribution } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalContribution.js';
 import { RequestDiffSurvivalBudgetError, RequestDiffSurvivalInputBudget, requestDiffSurvivalLimits } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalLimits.js';
+import { RequestDiffSurvivalCostObservation, type IRequestDiffSurvivalSizeDetails } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalCost.js';
 import { createNoopGitService } from '../common/sessionTestHelpers.js';
 import { type computeRequestCharacterDiffSurvivalMetric, type IRequestCharacterRepositoryDiff } from '../../node/chatContributions/requestDiffSurvival/requestCharacterDiffSurvival.js';
 
@@ -724,6 +725,143 @@ suite('Agent Host Request Diff Survival', () => {
 			}, { record: { ...terminal, flags: [0, 1, 0] }, reads: 1, repositories: 2 });
 		});
 
+		test('separate compute events reuse survival identity and aggregate two follow-up comparisons', async () => {
+			const f = fixture();
+			await f.end('base');
+			await f.end('later');
+			const files = f.log.computeObservations.filter(event => event.phase === 'file');
+			const followUp = f.log.computeObservations.find(event => event.originatingRequestId === 'base' && event.observationIndex === 1 && event.phase === 'observation')!;
+			assert.deepStrictEqual({
+				files: files.map(event => ({
+					base: event.originatingRequestId, request: event.observationRequestId, index: event.observationIndex,
+					comparison: event.comparisonKind, repository: event.repositoryIndex, file: event.fileIndex,
+				})),
+				followUpCount: followUp.startedFileCount,
+				aggregateMatches: followUp.elapsedMs === files.filter(event => event.originatingRequestId === 'base' && event.observationIndex === 1).reduce((sum, event) => sum + event.elapsedMs!, 0),
+				cpuStatuses: [...new Set(files.map(event => event.cpuMeasurementStatus))],
+				reuse: f.log.computeObservations.filter(event => event.originatingRequestId === 'base' && event.phase === 'comparison' && event.status === 'reused').map(event => ({
+					comparison: event.comparisonKind, index: event.observationIndex, elapsed: event.elapsedMs, cpu: event.cpuTotalMs,
+				})),
+			}, {
+				files: [
+					{ base: 'base', request: 'base', index: 0, comparison: 'originalRequest', repository: 0, file: 0 },
+					{ base: 'base', request: 'later', index: 1, comparison: 'baselineToLatest', repository: 0, file: 0 },
+					{ base: 'base', request: 'later', index: 1, comparison: 'requestResultToLatest', repository: 0, file: 0 },
+					{ base: 'later', request: 'later', index: 0, comparison: 'originalRequest', repository: 0, file: 0 },
+				],
+				followUpCount: 2, aggregateMatches: true,
+				cpuStatuses: [typeof process.threadCpuUsage === 'function' ? 'available' : 'unsupported'],
+				reuse: [
+					{ comparison: 'baselineToLatest', index: 0, elapsed: null, cpu: null },
+					{ comparison: 'originalRequest', index: 1, elapsed: null, cpu: null },
+				],
+			});
+		});
+
+		test('size events distinguish accepted from rejected input and retain the originating index', async () => {
+			sinon.stub(requestDiffSurvivalLimits, 'maximumObservationInputBytes').value(3);
+			const f = fixture();
+			await f.end('base');
+			await f.end('later');
+			const rejected = f.log.sizeObservations.find(event => event.originatingRequestId === 'base' && event.phase === 'budgetRejection')!;
+			const notStarted = f.log.computeObservations.find(event => event.originatingRequestId === 'base' && event.observationIndex === 1 && event.phase === 'file' && !event.computationStarted)!;
+			assert.deepStrictEqual({
+				rejected: {
+					base: rejected.originatingRequestId, request: rejected.observationRequestId, index: rejected.observationIndex,
+					fileBytes: rejected.fileInputBytes, accepted: rejected.observationInputBytes, proposed: rejected.proposedObservationInputBytes,
+				},
+				compute: { status: notStarted.status, elapsed: notStarted.elapsedMs, cpu: notStarted.cpuTotalMs },
+				release: f.log.sizeObservations.filter(event => event.originatingRequestId === 'base' && event.phase === 'release').map(event => ({
+					index: event.observationIndex, reason: event.reason, trackerBytes: event.trackerEstimatedRetainedBytes, hostBytes: event.hostEstimatedRetainedBytes,
+				})),
+			}, {
+				rejected: { base: 'base', request: 'later', index: 1, fileBytes: 2, accepted: 2, proposed: 4 },
+				compute: { status: 'budgetRejected', elapsed: null, cpu: null },
+				release: [{ index: 1, reason: 'budgetRejected', trackerBytes: 0, hostBytes: 0 }],
+			});
+		});
+
+		test('retained rejection snapshots precede release and no duplicate release event is emitted', async () => {
+			const path = `${URI.file('/repo').toString()}#file`;
+			const retainedBytes = 256 + 256 + 4 + 2 * path.length + 128 + 2 * (path.length + 2);
+			sinon.stub(requestDiffSurvivalLimits, 'maximumRetainedDiffBytes').value(retainedBytes - 1);
+			const f = fixture();
+			await f.end('base');
+			const rejected = f.log.sizeObservations.find(event => event.phase === 'budgetRejection')!;
+			assert.deepStrictEqual({
+				beforeRelease: rejected.hostEstimatedRetainedBytes,
+				proposed: rejected.proposedHostEstimatedRetainedBytes,
+				releases: f.log.sizeObservations.filter(event => event.phase === 'release').map(event => ({
+					base: event.originatingRequestId, index: event.observationIndex, hostBytes: event.hostEstimatedRetainedBytes, delta: event.retainedBytesDelta,
+				})),
+				compute: f.log.computeObservations.filter(event => event.phase === 'file').map(event => ({ status: event.status, started: event.computationStarted })),
+			}, {
+				beforeRelease: 256 + 256 + 4 + 2 * path.length, proposed: retainedBytes,
+				releases: [{ base: 'base', index: 0, hostBytes: 0, delta: -(256 + 256 + 4 + 2 * path.length) }],
+				compute: [{ status: 'budgetRejected', started: true }],
+			});
+		});
+
+		test('eviction logs host-wide release totals using the last associated request/index', async () => {
+			const f = fixture();
+			await f.end('one', 'one-chat');
+			await f.end('two', 'two-chat');
+			const admissions = f.log.sizeObservations.filter(event => event.phase === 'admission' && event.status === 'completed');
+			const firstBytes = admissions[0].trackerEstimatedRetainedBytes;
+			f.context.evict('one-chat');
+			f.context.evict('two-chat');
+			assert.deepStrictEqual({
+				hostAdmissions: admissions.map(event => event.hostEstimatedRetainedBytes),
+				releases: f.log.sizeObservations.filter(event => event.phase === 'release').map(event => ({
+					base: event.originatingRequestId, index: event.observationIndex, reason: event.reason, host: event.hostEstimatedRetainedBytes, delta: event.retainedBytesDelta,
+				})),
+			}, {
+				hostAdmissions: [firstBytes, 2 * firstBytes],
+				releases: [
+					{ base: 'one', index: 0, reason: 'stateDisposed', host: firstBytes, delta: -firstBytes },
+					{ base: 'two', index: 0, reason: 'stateDisposed', host: 0, delta: -firstBytes },
+				],
+			});
+		});
+
+		test('missing metadata remains unavailable and failed construction rolls back before recording error retention', async () => {
+			const f = fixture();
+			f.git.getBlobSize.resolves(undefined);
+			await f.end('missing');
+			const missing = f.log.sizeObservations.find(event => event.phase === 'inputCheck')!;
+			const rollbacks = f.log.sizeObservations.filter(event => event.phase === 'rollback');
+			assert.deepStrictEqual({
+				input: missing.fileInputBytes, accepted: missing.observationInputBytes, status: missing.status,
+				compute: f.log.computeObservations.find(event => event.phase === 'file')?.computationStarted,
+				rollbacks: rollbacks.map(event => ({ delta: event.retainedBytesDelta, tracker: event.trackerEstimatedRetainedBytes })),
+			}, { input: null, accepted: 0, status: 'failed', compute: false, rollbacks: [{ delta: 0, tracker: 256 }] });
+		});
+
+		test('failed character computation rolls back file retention before retaining the error record', async () => {
+			const f = fixture();
+			sinon.stub(LcsDiff.prototype, 'ComputeDiff').throws(new Error('diff failed'));
+			await f.end('failed');
+			const path = `${URI.file('/repo').toString()}#file`;
+			const rolledBack = f.log.sizeObservations.find(event => event.phase === 'rollback')!;
+			f.context.evict('chat');
+			assert.deepStrictEqual({
+				rollback: { delta: rolledBack.retainedBytesDelta, tracker: rolledBack.trackerEstimatedRetainedBytes },
+				fileStatus: f.log.computeObservations.find(event => event.phase === 'file')?.status,
+				releases: f.log.sizeObservations.filter(event => event.phase === 'release').map(event => event.hostEstimatedRetainedBytes),
+			}, { rollback: { delta: -(256 + 4 + 2 * path.length), tracker: 256 }, fileStatus: 'failed', releases: [0] });
+		});
+
+		test('disabled experiment emits no compute or size events and does no extra work', async () => {
+			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG = '0';
+			const f = fixture();
+			f.begin('disabled');
+			await timeout(0);
+			assert.deepStrictEqual({
+				survival: f.log.characterObservations, compute: f.log.computeObservations, sizes: f.log.sizeObservations,
+				gitCalls: f.git.computeFileDiffsBetweenRefs.callCount,
+			}, { survival: [], compute: [], sizes: [], gitCalls: 0 });
+		});
+
 		test('releases retained bytes at the follow-up horizon before admitting the next origin', async () => {
 			sinon.stub(requestDiffSurvivalLimits, 'maximumFollowUpCount').value(1);
 			const path = `${URI.file('/repo').toString()}#file`;
@@ -832,8 +970,33 @@ interface IRecordedCharacterObservation extends IRecordedObservation {
 	};
 }
 
+interface IRecordedComputeObservation {
+	readonly originatingRequestId: string;
+	readonly observationRequestId: string;
+	readonly observationIndex: number;
+	readonly phase: string;
+	readonly status: string;
+	readonly comparisonKind?: string;
+	readonly repositoryIndex?: number;
+	readonly fileIndex?: number;
+	readonly computationStarted?: boolean;
+	readonly startedFileCount: number;
+	readonly elapsedMs: number | null;
+	readonly cpuMeasurementStatus: string;
+	readonly cpuTotalMs: number | null;
+}
+
+interface IRecordedSizeObservation extends IRequestDiffSurvivalSizeDetails {
+	readonly originatingRequestId: string;
+	readonly observationRequestId: string;
+	readonly observationIndex: number;
+	readonly observationInputBytes: number;
+}
+
 class RecordingObservationLogService extends NullLogService {
 	readonly characterObservations: IRecordedCharacterObservation[] = [];
+	readonly computeObservations: IRecordedComputeObservation[] = [];
+	readonly sizeObservations: IRecordedSizeObservation[] = [];
 	private readonly _requestEnds = new Map<string, DeferredPromise<void>>();
 
 	whenRequestEnds(requestId: string): Promise<void> {
@@ -843,6 +1006,14 @@ class RecordingObservationLogService extends NullLogService {
 	}
 
 	override info(message: string): void {
+		if (message.startsWith(RequestDiffSurvivalCostObservation.computeLogPrefix)) {
+			this.computeObservations.push(JSON.parse(message.slice(RequestDiffSurvivalCostObservation.computeLogPrefix.length)));
+			return;
+		}
+		if (message.startsWith(RequestDiffSurvivalCostObservation.sizeLogPrefix)) {
+			this.sizeObservations.push(JSON.parse(message.slice(RequestDiffSurvivalCostObservation.sizeLogPrefix.length)));
+			return;
+		}
 		const prefix = '[RequestCharacterDiffSurvivalObservation] ';
 		if (!message.startsWith(prefix)) {
 			return;

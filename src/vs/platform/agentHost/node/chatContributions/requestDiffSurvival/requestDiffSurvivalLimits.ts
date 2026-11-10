@@ -28,6 +28,10 @@ export class RequestDiffSurvivalBudgetError extends Error {
 export class RequestDiffSurvivalInputBudget {
 	private _inputBytes = 0;
 
+	get inputBytes(): number {
+		return this._inputBytes;
+	}
+
 	consume(fileInputBytes: number): void {
 		const proposedInputBytes = this._inputBytes + fileInputBytes;
 		const fileExceeded = fileInputBytes > requestDiffSurvivalLimits.maximumFileInputBytes;
