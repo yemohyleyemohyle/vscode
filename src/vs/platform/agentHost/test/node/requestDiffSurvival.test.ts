@@ -18,7 +18,7 @@ import { IAgentHostGitService } from '../../common/agentHostGitService.js';
 import { createSessionState, MessageKind, SessionStatus, ToolCallCancellationReason, type URI as ProtocolURI } from '../../common/state/sessionState.js';
 import { ActionType, type ChatAction } from '../../common/state/sessionActions.js';
 import { AgentHostStateManager } from '../../node/agentHostStateManager.js';
-import { RequestDiffSurvivalContribution } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalContribution.js';
+import { RequestDiffSurvivalContribution, RequestDiffSurvivalExpiryScheduler } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalContribution.js';
 import { RequestDiffSurvivalBudgetError, RequestDiffSurvivalInputBudget, requestDiffSurvivalLimits } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalLimits.js';
 import { RequestDiffSurvivalCostObservation, type IRequestDiffSurvivalSizeDetails } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalCost.js';
 import { createNoopGitService } from '../common/sessionTestHelpers.js';
@@ -249,7 +249,7 @@ suite('Agent Host Request Diff Survival', () => {
 					&& baseObservation.baseEndTimestamp === laterObservation.baseEndTimestamp,
 			}, {
 				base: {
-					schemaVersion: 3,
+					schemaVersion: 4,
 					originatingRequestId: 'base-request',
 					observationRequestId: 'base-request',
 					baseModel: 'kimi-k3',
@@ -263,7 +263,7 @@ suite('Agent Host Request Diff Survival', () => {
 					diffKeys: ['files', 'errors'],
 				},
 				later: {
-					schemaVersion: 3,
+					schemaVersion: 4,
 					originatingRequestId: 'base-request',
 					observationRequestId: 'later-request',
 					baseModel: 'kimi-k3',
@@ -483,7 +483,7 @@ suite('Agent Host Request Diff Survival', () => {
 			}
 		});
 
-		function fixture(repositories: readonly URI[] = [URI.file('/repo')]) {
+		function fixture(repositories: readonly URI[] = [URI.file('/repo')], lifetime = false) {
 			const context = new TestContributionContext();
 			const log = new RecordingObservationLogService();
 			const git = {
@@ -495,11 +495,13 @@ suite('Agent Host Request Diff Survival', () => {
 				getBlobSize: sinon.stub().resolves(2),
 				showBlob: sinon.stub().resolves(VSBuffer.fromString('ab')),
 			};
-			const contribution = disposables.add(new RequestDiffSurvivalContribution(context, log, {
+			const checkpoint = {
 				...NULL_CHECKPOINT_SERVICE,
 				getTurnStartCheckpointState: async (_session, _chat, turnId) => repositories.map(repository => ({ repository, tree: `${turnId}-start` })),
 				waitForTurnCheckpointPair: async (_session, _chat, turnId) => ({ parent: `${turnId}-start`, current: `${turnId}-end` }),
-			}, git, createStateManager()));
+			} satisfies IAgentHostCheckpointService;
+			const Contribution = lifetime ? TestLifetimeContribution : RequestDiffSurvivalContribution;
+			const contribution = disposables.add(new Contribution(context, log, checkpoint, git, createStateManager()));
 			const begin = (turnId: string, chat = 'chat') => {
 				contribution.onOutgoingTurn({ session: 'session', chat, turnId, message: { text: 'request', origin: { kind: MessageKind.User } } });
 				contribution.onTurnEnd({ session: 'session', channel: chat, turnId, reason: { kind: 'success' } });
@@ -509,7 +511,10 @@ suite('Agent Host Request Diff Survival', () => {
 				begin(turnId, chat);
 				await ended;
 			};
-			return { context, log, git, contribution, begin, end };
+			return {
+				context, log, git, checkpoint, contribution, begin, end,
+				clock: contribution instanceof TestLifetimeContribution ? contribution.clock : undefined,
+			};
 		}
 
 		function terminalShape(record: IRecordedCharacterObservation) {
@@ -524,6 +529,341 @@ suite('Agent Host Request Diff Survival', () => {
 			status: 'budgetExceeded', complete: false, final: true,
 			survival: [-1, -1, -1, -1, -1, -1, -1], hasDiffs: false,
 		};
+
+		suite('tracker lifetime', () => {
+			function lifetimeFixture() {
+				const f = fixture([URI.file('/repo')], true);
+				assert.ok(f.clock);
+				const clock = f.clock;
+				const capture = sinon.stub().resolves('expiry-tree');
+				f.git.captureWorkingTreeAsTree = capture;
+				const send = (turnId: string, chat = 'chat', repository = URI.file('/repo')) => f.contribution.onOutgoingTurn({
+					session: 'session', chat, turnId, workingDirectories: [repository],
+					message: { text: 'request', origin: { kind: MessageKind.User } },
+				});
+				return { ...f, clock, capture, send };
+			}
+
+			function expiryShape(record: IRecordedCharacterObservation) {
+				return {
+					index: record.observationIndex, request: record.observationRequestId, boundary: record.observationBoundary,
+					final: record.isFinalObservation, status: record.status, reason: record.terminalReason,
+					unavailable: record.unavailableReason, complete: record.complete, ratio: record.survival.ratio,
+				};
+			}
+
+			test('uses centralized production durations and expires at the exact idle deadline without another request', async () => {
+				const f = lifetimeFixture();
+				await f.end('base');
+				const expired = f.log.whenExpires('base');
+				f.clock.advance(requestDiffSurvivalLimits.idleExpiryMs - 1);
+				assert.deepStrictEqual({
+					durations: [requestDiffSurvivalLimits.idleExpiryMs, requestDiffSurvivalLimits.maximumTrackerAgeMs],
+					records: f.log.characterObservations.length, captures: f.capture.callCount,
+				}, { durations: [3_600_000, 86_400_000], records: 1, captures: 0 });
+				f.clock.advance(1);
+				await expired;
+				const record = f.log.characterObservations[1];
+				const comparisonRefs = f.git.computeFileDiffsBetweenRefs.getCalls().slice(1).map(call => call.args[1]);
+				assert.deepStrictEqual({
+					record: expiryShape(record), captures: f.capture.callCount,
+					refs: comparisonRefs.map(ref => [ref.fromRef, ref.toRef]),
+					releases: f.log.sizeObservations.filter(record => record.reason === 'idleExpired').map(record => ({
+						index: record.observationIndex, tracker: record.trackerEstimatedRetainedBytes, host: record.hostEstimatedRetainedBytes,
+					})),
+				}, {
+					record: {
+						index: 1, request: 'base', boundary: 'expiry', final: true, status: 'measured',
+						reason: 'idleExpired', unavailable: undefined, complete: true, ratio: 1
+					},
+					captures: 1, refs: [['base-start', 'expiry-tree'], ['base-end', 'expiry-tree']],
+					releases: [{ index: 1, tracker: 0, host: 0 }],
+				});
+				f.clock.advance(requestDiffSurvivalLimits.maximumTrackerAgeMs);
+				await f.end('later');
+				assert.deepStrictEqual(f.log.characterObservations.filter(record => record.originatingRequestId === 'base').length, 2);
+			});
+
+			test('suspends idle expiry during a running request and resets it on request end', async () => {
+				const f = lifetimeFixture();
+				await f.end('base');
+				f.clock.advance(requestDiffSurvivalLimits.idleExpiryMs - 1);
+				f.send('running');
+				f.clock.advance(requestDiffSurvivalLimits.idleExpiryMs + 1);
+				assert.deepStrictEqual(f.capture.callCount, 0);
+				const ended = f.log.whenRequestEnds('running');
+				f.contribution.onTurnEnd({ session: 'session', channel: 'chat', turnId: 'running', reason: { kind: 'success' } });
+				await ended;
+				f.clock.advance(requestDiffSurvivalLimits.idleExpiryMs - 1);
+				assert.deepStrictEqual(f.capture.callCount, 0);
+				const expired = f.log.whenExpires('base');
+				f.clock.advance(1);
+				await expired;
+				assert.deepStrictEqual(f.log.characterObservations.filter(record => record.originatingRequestId === 'base').map(record => ({
+					index: record.observationIndex, boundary: record.observationBoundary,
+				})), [{ index: 0, boundary: 'requestEnd' }, { index: 1, boundary: 'requestEnd' }, { index: 2, boundary: 'expiry' }]);
+			});
+
+			test('fresh expiry state measures edits removed after the last request rather than reusing its 100% result', async () => {
+				const f = lifetimeFixture();
+				await f.end('base');
+				f.git.computeFileDiffsBetweenRefs.callsFake(async (_repository: URI, options: { fromRef: string }) =>
+					options.fromRef === 'base-start' ? [] : [{
+						before: { uri: 'file:///repo/file', content: { uri: 'before' } }, diff: { added: 0, removed: 2 },
+					}]);
+				const expired = f.log.whenExpires('base');
+				f.clock.advance(requestDiffSurvivalLimits.idleExpiryMs);
+				await expired;
+				assert.deepStrictEqual(f.log.characterObservations.map(record => ({
+					status: record.status, complete: record.complete, ratio: record.survival.ratio,
+					surviving: record.survival.totalSurviving,
+				})), [
+					{ status: 'measured', complete: true, ratio: 1, surviving: 2 },
+					{ status: 'measured', complete: true, ratio: 0, surviving: 0 },
+				]);
+			});
+
+			test('expiry does not wait behind a blocked queued checkpoint for another request', async () => {
+				const f = lifetimeFixture();
+				await f.end('base');
+				const started = new DeferredPromise<void>();
+				const checkpoint = new DeferredPromise<void>();
+				f.checkpoint.getTurnStartCheckpointState = async () => {
+					started.complete();
+					await checkpoint.p;
+					return [{ repository: URI.file('/repo'), tree: 'queued-start' }];
+				};
+				f.begin('queued');
+				await started.p;
+				const expired = f.log.whenExpires('base');
+				f.clock.advance(requestDiffSurvivalLimits.idleExpiryMs);
+				await expired;
+				assert.deepStrictEqual({
+					records: f.log.characterObservations.filter(record => record.originatingRequestId === 'base').length,
+					captures: f.capture.callCount,
+				}, { records: 2, captures: 1 });
+				checkpoint.complete();
+				await timeout(0);
+			});
+
+			test('a terminal log failure is reported without retrying the terminal or leaking retention', async () => {
+				const f = lifetimeFixture();
+				await f.end('base');
+				const warning = new DeferredPromise<void>();
+				sinon.stub(f.log, 'warn').callsFake(() => { warning.complete(); });
+				const info = sinon.stub(f.log, 'info').callThrough();
+				info.withArgs(sinon.match((message: string) => message.startsWith('[RequestCharacterDiffSurvivalObservation] ')))
+					.throws(new Error('terminal log failed'));
+				f.clock.advance(requestDiffSurvivalLimits.idleExpiryMs);
+				await warning.p;
+				assert.deepStrictEqual({
+					attempts: info.getCalls().filter(call => call.args[0].startsWith('[RequestCharacterDiffSurvivalObservation] ')).length,
+					host: f.log.sizeObservations.at(-1)?.hostEstimatedRetainedBytes, scheduled: f.clock.isScheduled(),
+				}, { attempts: 1, host: 0, scheduled: false });
+			});
+
+			test('maximum age wins over idle expiry when both are overdue', async () => {
+				const f = lifetimeFixture();
+				await f.end('base');
+				const expired = f.log.whenExpires('base');
+				f.clock.advance(requestDiffSurvivalLimits.maximumTrackerAgeMs);
+				await expired;
+				assert.deepStrictEqual(f.log.characterObservations[1].terminalReason, 'maximumAgeExceeded');
+			});
+
+			test('maximum age is not extended by active turns and does not wait for a quiet window', async () => {
+				const f = lifetimeFixture();
+				await f.end('base');
+				f.send('running');
+				f.clock.advance(requestDiffSurvivalLimits.maximumTrackerAgeMs - 1);
+				assert.deepStrictEqual(f.log.characterObservations.length, 1);
+				const expired = f.log.whenExpires('base');
+				f.clock.advance(1);
+				await expired;
+				assert.deepStrictEqual({
+					reason: f.log.characterObservations[1].terminalReason,
+					unavailable: f.log.characterObservations[1].unavailableReason,
+					ratio: f.log.characterObservations[1].survival.ratio, captures: f.capture.callCount,
+				}, { reason: 'maximumAgeExceeded', unavailable: 'repositoryBusy', ratio: -1, captures: 0 });
+			});
+
+			test('activity in another chat does not reset idle expiry and shared-repository activity prevents capture', async () => {
+				const f = lifetimeFixture();
+				await f.end('base');
+				f.clock.advance(requestDiffSurvivalLimits.idleExpiryMs - 1);
+				f.send('other', 'other-chat');
+				const expired = f.log.whenExpires('base');
+				f.clock.advance(1);
+				await expired;
+				assert.deepStrictEqual({
+					reason: f.log.characterObservations[1].terminalReason,
+					unavailable: f.log.characterObservations[1].unavailableReason, captures: f.capture.callCount,
+					scheduled: f.clock.isScheduled(),
+				}, { reason: 'idleExpired', unavailable: 'repositoryBusy', captures: 0, scheduled: false });
+			});
+
+			test('known activity in an unrelated repository does not prevent expiry capture', async () => {
+				const f = lifetimeFixture();
+				await f.end('base');
+				f.send('other', 'other-chat', URI.file('/other-repo'));
+				const expired = f.log.whenExpires('base');
+				f.clock.advance(requestDiffSurvivalLimits.idleExpiryMs);
+				await expired;
+				assert.deepStrictEqual({
+					status: f.log.characterObservations[1].status, captures: f.capture.callCount,
+				}, { status: 'measured', captures: 1 });
+			});
+
+			for (const failure of ['missing', 'throwing'] as const) {
+				test(`logs an unavailable terminal and releases retention after ${failure} fresh capture`, async () => {
+					const f = lifetimeFixture();
+					await f.end('base');
+					if (failure === 'missing') {
+						f.capture.resolves(undefined);
+					} else {
+						f.capture.rejects(new Error('capture failed'));
+					}
+					const expired = f.log.whenExpires('base');
+					f.clock.advance(requestDiffSurvivalLimits.idleExpiryMs);
+					await expired;
+					assert.deepStrictEqual({
+						status: f.log.characterObservations[1].status, unavailable: f.log.characterObservations[1].unavailableReason,
+						survival: Object.values(f.log.characterObservations[1].survival),
+						diffs: f.log.characterObservations[1].diffs,
+						host: f.log.sizeObservations.at(-1)?.hostEstimatedRetainedBytes, scheduled: f.clock.isScheduled(),
+					}, {
+						status: 'unavailable', unavailable: 'captureFailed', survival: [-1, -1, -1, -1, -1, -1, -1],
+						diffs: undefined, host: 0, scheduled: false
+					});
+				});
+			}
+
+			test('an expiry comparison budget violation preserves both expiry and budget reasons and stops further computation', async () => {
+				const f = lifetimeFixture();
+				await f.end('base');
+				const reads = f.git.showBlob.callCount;
+				f.git.getBlobSize.resolves(requestDiffSurvivalLimits.maximumFileInputBytes + 1);
+				const expired = f.log.whenExpires('base');
+				f.clock.advance(requestDiffSurvivalLimits.idleExpiryMs);
+				await expired;
+				assert.deepStrictEqual({
+					record: terminalShape(f.log.characterObservations[1]),
+					reason: f.log.characterObservations[1].terminalReason,
+					reads: f.git.showBlob.callCount - reads, comparisons: f.git.computeFileDiffsBetweenRefs.callCount,
+				}, { record: { ...terminal, flags: [1, 0, 0] }, reason: 'idleExpired', reads: 0, comparisons: 2 });
+			});
+
+			test('incomplete final comparisons are unavailable, never valid survival loss', async () => {
+				const f = lifetimeFixture();
+				await f.end('base');
+				f.git.computeFileDiffsBetweenRefs.resolves(undefined);
+				const expired = f.log.whenExpires('base');
+				f.clock.advance(requestDiffSurvivalLimits.idleExpiryMs);
+				await expired;
+				assert.deepStrictEqual({
+					status: f.log.characterObservations[1].status, unavailable: f.log.characterObservations[1].unavailableReason,
+					ratio: f.log.characterObservations[1].survival.ratio, complete: f.log.characterObservations[1].complete,
+				}, { status: 'unavailable', unavailable: 'computationFailed', ratio: -1, complete: false });
+			});
+
+			test('activity starting and ending during capture invalidates that capture', async () => {
+				const f = lifetimeFixture();
+				await f.end('base');
+				const started = new DeferredPromise<void>();
+				const capture = new DeferredPromise<string>();
+				f.capture.callsFake(() => { started.complete(); return capture.p; });
+				const expired = f.log.whenExpires('base');
+				f.clock.advance(requestDiffSurvivalLimits.idleExpiryMs);
+				await started.p;
+				f.send('race');
+				f.contribution.onTurnEnd({ session: 'session', channel: 'chat', turnId: 'race', reason: { kind: 'cancelled' } });
+				capture.complete('racing-tree');
+				await expired;
+				assert.deepStrictEqual({
+					status: f.log.characterObservations[1].status, unavailable: f.log.characterObservations[1].unavailableReason,
+				}, { status: 'unavailable', unavailable: 'repositoryActivity' });
+				await timeout(0);
+			});
+
+			test('queued initial computation uses the originating request-end age, not completion time', async () => {
+				const f = lifetimeFixture();
+				const start = new DeferredPromise<void>();
+				f.checkpoint.getTurnStartCheckpointState = async () => {
+					await start.p;
+					return [{ repository: URI.file('/repo'), tree: 'before' }];
+				};
+				f.begin('base');
+				f.clock.advance(requestDiffSurvivalLimits.maximumTrackerAgeMs);
+				const expired = f.log.whenExpires('base');
+				start.complete();
+				await expired;
+				assert.deepStrictEqual({
+					count: f.log.characterObservations.length, index: f.log.characterObservations[0].observationIndex,
+					reason: f.log.characterObservations[0].terminalReason,
+					unavailable: f.log.characterObservations[0].unavailableReason,
+					computations: f.git.computeFileDiffsBetweenRefs.callCount,
+				}, { count: 1, index: 0, reason: 'maximumAgeExceeded', unavailable: 'initialObservationIncomplete', computations: 0 });
+			});
+
+			test('expiry during an in-flight observation releases immediately and prevents a later ordinary record', async () => {
+				const f = lifetimeFixture();
+				await f.end('base');
+				const started = new DeferredPromise<void>();
+				const diff = new DeferredPromise<undefined>();
+				f.git.computeFileDiffsBetweenRefs.callsFake(() => { started.complete(); return diff.p; });
+				f.begin('follow-up');
+				await started.p;
+				const expired = f.log.whenExpires('base');
+				f.clock.advance(requestDiffSurvivalLimits.maximumTrackerAgeMs);
+				await expired;
+				diff.complete(undefined);
+				await timeout(0);
+				assert.deepStrictEqual({
+					records: f.log.characterObservations.filter(record => record.originatingRequestId === 'base').map(record => record.observationBoundary),
+					unavailable: f.log.characterObservations[1].unavailableReason,
+					releases: f.log.sizeObservations.filter(record => record.originatingRequestId === 'base' && record.phase === 'release').length,
+				}, { records: ['requestEnd', 'expiry'], unavailable: 'observationInProgress', releases: 1 });
+			});
+
+			test('the ordinary ten-follow-up horizon cancels expiry for that origin', async () => {
+				const f = lifetimeFixture();
+				await f.end('base');
+				for (let index = 1; index <= requestDiffSurvivalLimits.maximumFollowUpCount; index++) {
+					await f.end(`follow-up-${index}`);
+				}
+				f.clock.advance(requestDiffSurvivalLimits.idleExpiryMs);
+				await timeout(0);
+				assert.deepStrictEqual(f.log.characterObservations.filter(record => record.originatingRequestId === 'base').map(record => ({
+					index: record.observationIndex, boundary: record.observationBoundary, final: record.isFinalObservation,
+				})), Array.from({ length: 11 }, (_, index) => ({ index, boundary: 'requestEnd', final: index === 10 })));
+			});
+
+			for (const disposal of ['chat', 'contribution', 'capturing'] as const) {
+				test(`${disposal} disposal cancels scheduled expiry and never starts new Git work`, async () => {
+					const f = lifetimeFixture();
+					await f.end('base');
+					const started = new DeferredPromise<void>();
+					const capture = new DeferredPromise<string>();
+					if (disposal === 'capturing') {
+						f.capture.callsFake(() => { started.complete(); return capture.p; });
+						f.clock.advance(requestDiffSurvivalLimits.idleExpiryMs);
+						await started.p;
+					}
+					if (disposal === 'contribution') {
+						f.contribution.dispose();
+					} else {
+						f.context.evict('chat');
+					}
+					capture.complete('after-disposal');
+					f.clock.advance(requestDiffSurvivalLimits.maximumTrackerAgeMs);
+					await timeout(0);
+					assert.deepStrictEqual({
+						records: f.log.characterObservations.length, captures: f.capture.callCount,
+						scheduled: f.clock.isScheduled(), host: f.log.sizeObservations.at(-1)?.hostEstimatedRetainedBytes,
+					}, { records: 1, captures: disposal === 'capturing' ? 1 : 0, scheduled: false, host: 0 });
+				});
+			}
+		});
 
 		test('allows the exact production input limits, rejects one byte over, and reports both confirmed violations', () => {
 			const budget = new RequestDiffSurvivalInputBudget();
@@ -958,7 +1298,9 @@ interface IRecordedCharacterObservation extends IRecordedObservation {
 	readonly unit: string;
 	readonly complete: boolean;
 	readonly survival: ReturnType<typeof computeRequestCharacterDiffSurvivalMetric>;
-	readonly status: 'measured' | 'budgetExceeded';
+	readonly status: 'measured' | 'budgetExceeded' | 'unavailable';
+	readonly terminalReason?: string;
+	readonly unavailableReason?: string;
 	readonly fileInputBudgetExceeded: number;
 	readonly observationInputBudgetExceeded: number;
 	readonly retainedDiffBudgetExceeded: number;
@@ -998,6 +1340,13 @@ class RecordingObservationLogService extends NullLogService {
 	readonly computeObservations: IRecordedComputeObservation[] = [];
 	readonly sizeObservations: IRecordedSizeObservation[] = [];
 	private readonly _requestEnds = new Map<string, DeferredPromise<void>>();
+	private readonly _expiries = new Map<string, DeferredPromise<void>>();
+
+	whenExpires(requestId: string): Promise<void> {
+		const expired = new DeferredPromise<void>();
+		this._expiries.set(requestId, expired);
+		return expired.p;
+	}
 
 	whenRequestEnds(requestId: string): Promise<void> {
 		const ended = new DeferredPromise<void>();
@@ -1020,10 +1369,54 @@ class RecordingObservationLogService extends NullLogService {
 		}
 		const observation: IRecordedCharacterObservation = JSON.parse(message.slice(prefix.length));
 		this.characterObservations.push(observation);
+		if (observation.observationBoundary === 'expiry') {
+			this._expiries.get(observation.originatingRequestId)?.complete();
+			this._expiries.delete(observation.originatingRequestId);
+		}
 		if (observation.observationIndex === 0) {
 			this._requestEnds.get(observation.originatingRequestId)?.complete();
 			this._requestEnds.delete(observation.originatingRequestId);
 		}
+	}
+}
+
+class TestExpiryScheduler extends RequestDiffSurvivalExpiryScheduler {
+	private _elapsed = 0;
+	private _deadline: number | undefined;
+
+	override now(): number {
+		return this._elapsed;
+	}
+
+	override schedule(delay = 0): void {
+		this._deadline = this._elapsed + delay;
+	}
+
+	override cancel(): void {
+		this._deadline = undefined;
+	}
+
+	override isScheduled(): boolean {
+		return this._deadline !== undefined;
+	}
+
+	advance(duration: number): void {
+		this._elapsed += duration;
+		if (this._deadline !== undefined && this._deadline <= this._elapsed) {
+			this.cancel();
+			this.doRun();
+		}
+	}
+}
+
+class TestLifetimeContribution extends RequestDiffSurvivalContribution {
+	protected override _createExpiryScheduler(runner: () => void): RequestDiffSurvivalExpiryScheduler {
+		return new TestExpiryScheduler(runner, 0);
+	}
+
+	get clock(): TestExpiryScheduler {
+		assert.ok(this._expiryScheduler instanceof TestExpiryScheduler);
+		return this._expiryScheduler;
 	}
 }
 

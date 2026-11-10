@@ -3,10 +3,10 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { SequencerByKey } from '../../../../../base/common/async.js';
+import { RunOnceScheduler, SequencerByKey } from '../../../../../base/common/async.js';
 import { Disposable } from '../../../../../base/common/lifecycle.js';
 import { CancellationError, isCancellationError } from '../../../../../base/common/errors.js';
-import { relativePath } from '../../../../../base/common/resources.js';
+import { isEqualOrParent, relativePath } from '../../../../../base/common/resources.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { ILogService } from '../../../../log/common/log.js';
 import { IAgentHostCheckpointService } from '../../../common/agentHostCheckpointService.js';
@@ -23,6 +23,16 @@ import { getRequestDiffSurvivalCostOutcome, RequestDiffSurvivalCostObservation, 
 
 const CHARACTER_DIFF_LOG_PREFIX = '[RequestCharacterDiffSurvivalObservation] ';
 const ENABLED_ENVIRONMENT_VARIABLE = 'VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG';
+
+type ExpiryReason = 'idleExpired' | 'maximumAgeExceeded';
+type UnavailableReason = 'repositoryBusy' | 'repositoryActivity' | 'captureFailed' | 'computationFailed' | 'initialObservationIncomplete' | 'observationInProgress';
+
+/** Couples deadline scheduling with a monotonic clock; tests override this dependency. */
+export class RequestDiffSurvivalExpiryScheduler extends RunOnceScheduler {
+	now(): number {
+		return performance.now();
+	}
+}
 
 interface IRepositoryState {
 	readonly repository: URI;
@@ -47,6 +57,12 @@ interface IRequestDiffSurvivalTracker {
 	readonly originalRequestUsedEditTool: boolean | null;
 	observationCount: number;
 	cost: RequestDiffSurvivalCostObservation;
+	readonly endedAt: number;
+	lastObservationRequestId: string;
+	lastObservationModel: string | null;
+	expiryReason?: ExpiryReason;
+	isObserving: boolean;
+	isRetired: boolean;
 }
 
 interface IRequestDiffSurvivalState {
@@ -54,6 +70,9 @@ interface IRequestDiffSurvivalState {
 	readonly requestEvidence: Map<string, IRequestEditToolEvidence>;
 	readonly toolRequests: Map<string, { readonly chat: ProtocolURI; readonly turnId: string }>;
 	readonly trackers: IRequestDiffSurvivalTracker[];
+	readonly activeTurns: Map<string, readonly URI[] | undefined>;
+	session?: ProtocolURI;
+	lastActivity: number;
 	isDisposed: boolean;
 }
 
@@ -63,7 +82,7 @@ interface IRequestEditToolEvidence {
 }
 
 interface IRequestCharacterDiffSurvivalObservation {
-	readonly schemaVersion: 3;
+	readonly schemaVersion: 4;
 	readonly recordKind: 'requestCharacterDiffSurvivalObservation';
 	readonly unit: 'utf16CodeUnit';
 	readonly sessionId: ProtocolURI;
@@ -76,13 +95,15 @@ interface IRequestCharacterDiffSurvivalObservation {
 	readonly baseStartTimestamp: string;
 	readonly baseEndTimestamp: string;
 	readonly observationTimestamp: string;
-	readonly observationBoundary: 'requestEnd';
+	readonly observationBoundary: 'requestEnd' | 'expiry';
 	readonly observationIndex: number;
 	readonly maximumObservationCount: number;
 	readonly maximumFollowUpCount: number;
 	readonly isFinalObservation: boolean;
 	readonly complete: boolean;
-	readonly status: 'measured' | 'budgetExceeded';
+	readonly status: 'measured' | 'budgetExceeded' | 'unavailable';
+	readonly terminalReason?: ExpiryReason;
+	readonly unavailableReason?: UnavailableReason;
 	readonly fileInputBudgetExceeded: 0 | 1;
 	readonly observationInputBudgetExceeded: 0 | 1;
 	readonly retainedDiffBudgetExceeded: 0 | 1;
@@ -104,18 +125,45 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 
 	private readonly _enabled = process.env[ENABLED_ENVIRONMENT_VARIABLE] === '1';
 	private readonly _observations = new SequencerByKey<ProtocolURI>();
+	private readonly _states = new Map<ProtocolURI, IRequestDiffSurvivalState>();
+	protected readonly _expiryScheduler = this._register(this._createExpiryScheduler(() => this._expireTrackers()));
+	private _activityVersion = 0;
 	private _retainedBytes = 0;
 	private readonly _stateKey = createChatMementoKey<IRequestDiffSurvivalState>('requestDiffSurvival.state', () => ({
 		starts: new Map(), requestEvidence: new Map(), toolRequests: new Map(), trackers: [], isDisposed: false,
-	}), state => {
+		activeTurns: new Map(), lastActivity: this._expiryScheduler.now(),
+	}), state => this._disposeState(state));
+
+	private _disposeState(state: IRequestDiffSurvivalState): void {
+		if (state.isDisposed) {
+			return;
+		}
 		state.isDisposed = true;
+		for (const [chat, candidate] of this._states) {
+			if (candidate === state) {
+				this._states.delete(chat);
+			}
+		}
 		for (const tracker of [...state.trackers]) {
 			this._retireTracker(state, tracker, 'stateDisposed');
 		}
 		state.starts.clear();
 		state.requestEvidence.clear();
 		state.toolRequests.clear();
-	});
+		state.activeTurns.clear();
+		this._scheduleExpiry();
+	}
+
+	protected _createExpiryScheduler(runner: () => void): RequestDiffSurvivalExpiryScheduler {
+		return new RequestDiffSurvivalExpiryScheduler(runner, 0);
+	}
+
+	override dispose(): void {
+		for (const state of [...this._states.values()]) {
+			this._disposeState(state);
+		}
+		super.dispose();
+	}
 
 	constructor(
 		protected readonly _context: IAgentHostChatContributionContext,
@@ -131,10 +179,15 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 	}
 
 	onOutgoingTurn(turn: IOutgoingTurn): undefined {
-		if (!this._enabled) {
+		if (!this._enabled || this._store.isDisposed) {
 			return undefined;
 		}
-		const state = this._state(turn.chat);
+		this._expireTrackers();
+		const state = this._state(turn.chat, turn.session);
+		state.lastActivity = this._expiryScheduler.now();
+		state.activeTurns.set(turn.turnId, turn.workingDirectories);
+		this._activityVersion++;
+		this._scheduleExpiry();
 		if (!state.requestEvidence.has(turn.turnId)) {
 			const provider = this._stateManager.getSessionState(turn.session)?.provider;
 			state.requestEvidence.set(turn.turnId, {
@@ -158,16 +211,21 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 	}
 
 	onDidDispatchAction(dispatched: IDispatchedAction): void {
-		if (!this._enabled || dispatched.rejectionReason) {
+		if (!this._enabled || this._store.isDisposed || dispatched.rejectionReason) {
 			return;
 		}
 		const { action } = dispatched;
+		if (action.type === ActionType.ChatTurnStarted) {
+			this._activityVersion++;
+			return;
+		}
 		if (action.type !== ActionType.ChatToolCallStart
 			&& action.type !== ActionType.ChatToolCallReady
 			&& action.type !== ActionType.ChatToolCallComplete
 			&& action.type !== ActionType.ChatToolCallConfirmed) {
 			return;
 		}
+		this._activityVersion++;
 		const state = this._state(dispatched.channel);
 		const meta = dispatched.origin ? {} : readToolCallMeta(action);
 		const request = state.toolRequests.get(action.toolCallId) ?? meta['vscode.toolRequest']
@@ -198,13 +256,22 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 	}
 
 	onTurnEnd(turn: ITurnEnd): void {
-		if (!this._enabled || !turn.turnId || !this._tracksTurnEnd(turn)) {
+		if (!this._enabled || this._store.isDisposed || !turn.turnId) {
+			return;
+		}
+		this._expireTrackers();
+		const state = this._state(turn.channel, turn.session);
+		const endedAt = this._expiryScheduler.now();
+		state.lastActivity = endedAt;
+		state.activeTurns.delete(turn.turnId);
+		this._activityVersion++;
+		this._scheduleExpiry();
+		if (!this._tracksTurnEnd(turn)) {
 			return;
 		}
 		const turnId = turn.turnId;
 		const originalRequestUsedEditTool = this._finishEvidence(turn.channel, turnId);
 		const observationTimestamp = new Date().toISOString();
-		const state = this._state(turn.channel);
 		this._schedule(turn.channel, state, async () => {
 			const start = state.starts.get(turnId);
 			if (!start) {
@@ -232,14 +299,21 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 				baseEndTimestamp: observationTimestamp,
 				originalRequestUsedEditTool,
 				observationCount: 0,
+				endedAt,
+				lastObservationRequestId: turnId,
+				lastObservationModel: start.model,
+				isObserving: false,
+				isRetired: false,
 				cost: new RequestDiffSurvivalCostObservation(this._logService, {
 					sessionId: turn.session, chatId: turn.channel, originatingRequestId: turnId,
 					observationRequestId: turnId, observationIndex: 0,
 				}),
 			};
 			state.trackers.push(tracker);
+			this._expireTrackers();
 			await this._emitObservation(turn.session, turn.channel, turnId, start.model, observationTimestamp, result, tracker, state);
 			state.starts.delete(turnId);
+			this._scheduleExpiry();
 		});
 	}
 
@@ -275,16 +349,20 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		void this._observations.queue(chat, async () => {
 			this._assertActive(state);
 			await task();
-		}).catch(error => {
-			if (isCancellationError(error)) {
-				return;
-			}
-			this._logService.warn(`[RequestDiffSurvival] Observation failed for ${chat}: ${error instanceof Error ? error.message : String(error)}`);
-		});
+		}).catch(error => this._handleObservationError(chat, error));
 	}
 
-	private _state(chat: ProtocolURI): IRequestDiffSurvivalState {
-		return this._context.memento(this._stateKey, chat).get();
+	private _handleObservationError(chat: ProtocolURI, error: unknown): void {
+		if (!isCancellationError(error)) {
+			this._logService.warn(`[RequestDiffSurvival] Observation failed for ${chat}: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
+	private _state(chat: ProtocolURI, session?: ProtocolURI): IRequestDiffSurvivalState {
+		const state = this._context.memento(this._stateKey, chat).get();
+		state.session ??= session;
+		this._states.set(chat, state);
+		return state;
 	}
 
 	private _assertActive(state: IRequestDiffSurvivalState): void {
@@ -293,11 +371,169 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		}
 	}
 
+	private _assertTrackerActive(state: IRequestDiffSurvivalState, tracker: IRequestDiffSurvivalTracker, expiryReason?: ExpiryReason): void {
+		this._assertActive(state);
+		if (tracker.isRetired || tracker.expiryReason !== expiryReason) {
+			throw new CancellationError();
+		}
+	}
+
+	private _scheduleExpiry(): void {
+		this._expiryScheduler.cancel();
+		if (this._store.isDisposed) {
+			return;
+		}
+		let deadline = Infinity;
+		for (const state of this._states.values()) {
+			for (const tracker of state.trackers) {
+				if (!tracker.expiryReason) {
+					deadline = Math.min(deadline, tracker.endedAt + requestDiffSurvivalLimits.maximumTrackerAgeMs);
+					if (state.activeTurns.size === 0) {
+						deadline = Math.min(deadline, state.lastActivity + requestDiffSurvivalLimits.idleExpiryMs);
+					}
+				}
+			}
+		}
+		if (deadline !== Infinity) {
+			this._expiryScheduler.schedule(Math.max(0, deadline - this._expiryScheduler.now()));
+		}
+	}
+
+	private _expireTrackers(): void {
+		const now = this._expiryScheduler.now();
+		for (const [chat, state] of this._states) {
+			for (const tracker of [...state.trackers]) {
+				if (tracker.expiryReason || tracker.isRetired) {
+					continue;
+				}
+				const reason = now - tracker.endedAt >= requestDiffSurvivalLimits.maximumTrackerAgeMs ? 'maximumAgeExceeded'
+					: state.activeTurns.size === 0 && now - state.lastActivity >= requestDiffSurvivalLimits.idleExpiryMs ? 'idleExpired' : undefined;
+				if (!reason) {
+					continue;
+				}
+				tracker.expiryReason = reason;
+				try {
+					if (tracker.isObserving || !tracker.originalRequest || this._repositoryBusy(tracker.baseline)) {
+						if (!tracker.isObserving) {
+							this._prepareExpiryCost(state, chat, tracker);
+						}
+						this._writeUnavailableExpiry(state, chat, tracker, tracker.isObserving ? 'observationInProgress'
+							: !tracker.originalRequest ? 'initialObservationIncomplete' : 'repositoryBusy');
+					} else {
+						void this._finalizeExpiry(state, chat, tracker, reason)
+							.finally(() => this._retireTracker(state, tracker, reason))
+							.catch(error => this._handleObservationError(chat, error));
+					}
+				} catch (error) {
+					this._retireTracker(state, tracker, reason);
+					this._handleObservationError(chat, error);
+				}
+			}
+		}
+		this._scheduleExpiry();
+	}
+
+	private _repositoryBusy(repositories: readonly IRepositoryState[]): boolean {
+		for (const state of this._states.values()) {
+			for (const [turnId, directories] of state.activeTurns) {
+				const roots = directories ?? state.starts.get(turnId)?.repositories.map(repository => repository.repository);
+				if (!roots || roots.some(root => repositories.some(repository =>
+					isEqualOrParent(root, repository.repository) || isEqualOrParent(repository.repository, root)))) {
+					return true;
+				}
+			}
+		}
+		for (const session of this._stateManager.getSessionUris()) {
+			for (const chat of this._stateManager.getSessionState(session)?.chats ?? []) {
+				const turnId = this._stateManager.getActiveTurnId(chat.resource);
+				if (turnId && !this._states.get(chat.resource)?.activeTurns.has(turnId)) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	private _prepareExpiryCost(state: IRequestDiffSurvivalState, chat: ProtocolURI, tracker: IRequestDiffSurvivalTracker): void {
+		if (!state.session) {
+			throw new Error('Missing session for request survival expiry');
+		}
+		tracker.cost = new RequestDiffSurvivalCostObservation(this._logService, {
+			sessionId: state.session, chatId: chat, originatingRequestId: tracker.originatingRequestId,
+			observationRequestId: tracker.lastObservationRequestId, observationIndex: tracker.observationCount,
+		});
+	}
+
+	private _writeUnavailableExpiry(state: IRequestDiffSurvivalState, chat: ProtocolURI, tracker: IRequestDiffSurvivalTracker, reason: UnavailableReason): void {
+		try {
+			if (!state.session || !tracker.expiryReason) {
+				throw new Error('Missing request survival expiry identity');
+			}
+			this._writeObservation(state.session, chat, tracker.lastObservationRequestId, tracker.lastObservationModel,
+				new Date().toISOString(), tracker, undefined, undefined, tracker.expiryReason, reason);
+		} finally {
+			if (!tracker.isObserving) {
+				tracker.cost.finishObservation('failed');
+				this._sizeEvent(tracker, { phase: 'observation', status: 'failed' });
+			}
+			this._retireTracker(state, tracker, tracker.expiryReason ?? 'failed');
+		}
+	}
+
+	private async _finalizeExpiry(state: IRequestDiffSurvivalState, chat: ProtocolURI, tracker: IRequestDiffSurvivalTracker, reason: ExpiryReason): Promise<void> {
+		if (tracker.isRetired) {
+			return;
+		}
+		this._prepareExpiryCost(state, chat, tracker);
+		let latest: readonly IRepositoryState[] | UnavailableReason;
+		try {
+			latest = await this._captureExpiryState(state, tracker, reason);
+		} catch (error) {
+			if (isCancellationError(error) && (state.isDisposed || tracker.isRetired)) {
+				return;
+			}
+			this._logService.warn(`[RequestDiffSurvival] Expiry capture failed for ${chat}`, error);
+			this._writeUnavailableExpiry(state, chat, tracker, 'captureFailed');
+			return;
+		}
+		if (typeof latest === 'string') {
+			this._writeUnavailableExpiry(state, chat, tracker, latest);
+			return;
+		}
+		const session = state.session;
+		if (!session) {
+			throw new Error('Missing session for request survival expiry');
+		}
+		await this._emitObservation(session, chat, tracker.lastObservationRequestId, tracker.lastObservationModel,
+			new Date().toISOString(), latest, tracker, state, reason);
+	}
+
+	private async _captureExpiryState(state: IRequestDiffSurvivalState, tracker: IRequestDiffSurvivalTracker, reason: ExpiryReason): Promise<readonly IRepositoryState[] | UnavailableReason> {
+		const version = this._activityVersion;
+		const latest: IRepositoryState[] = [];
+		for (const { repository } of tracker.baseline) {
+			if (this._repositoryBusy(tracker.baseline)) {
+				return 'repositoryBusy';
+			}
+			const ref = await this._gitService.captureWorkingTreeAsTree(repository);
+			this._assertTrackerActive(state, tracker, reason);
+			if (version !== this._activityVersion || this._repositoryBusy(tracker.baseline)) {
+				return 'repositoryActivity';
+			}
+			if (!ref) {
+				this._logService.warn(`[RequestDiffSurvival] Failed to capture expiry state for ${tracker.originatingRequestId}`);
+				return 'captureFailed';
+			}
+			latest.push({ repository, ref });
+		}
+		return latest;
+	}
+
 	private _reserveRetained(
 		state: IRequestDiffSurvivalState, tracker: IRequestDiffSurvivalTracker, bytes: number,
 		file?: IRequestDiffSurvivalFileCost,
 	): void {
-		this._assertActive(state);
+		this._assertTrackerActive(state, tracker, tracker.expiryReason);
 		const proposedRetainedDiffBytes = this._retainedBytes + bytes;
 		if (proposedRetainedDiffBytes > requestDiffSurvivalLimits.maximumRetainedDiffBytes) {
 			this._sizeEvent(tracker, {
@@ -324,9 +560,11 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		this._retainedBytes -= tracker.retainedBytes;
 		tracker.retainedBytes = 0;
 		tracker.originalRequest = undefined;
+		tracker.isRetired = true;
 		if (wasTracked) {
 			this._sizeEvent(tracker, { phase: 'release', status: 'completed', reason, retainedBytesDelta: -retainedBytes });
 		}
+		this._scheduleExpiry();
 	}
 
 	private _sizeEvent(
@@ -373,6 +611,10 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 	): Promise<void> {
 		for (const tracker of [...state.trackers]) {
 			this._assertActive(state);
+			this._expireTrackers();
+			if (tracker.isRetired || tracker.expiryReason) {
+				continue;
+			}
 			await this._emitObservation(session, chat, observationRequestId, observationModel, observationTimestamp, latest, tracker, state);
 		}
 	}
@@ -386,19 +628,27 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		latest: readonly IRepositoryState[],
 		tracker: IRequestDiffSurvivalTracker,
 		state: IRequestDiffSurvivalState,
+		expiryReason?: ExpiryReason,
 	): Promise<void> {
-		const cost = tracker.observationCount === 0 ? tracker.cost : tracker.cost = new RequestDiffSurvivalCostObservation(this._logService, {
+		if (tracker.isRetired || tracker.expiryReason !== expiryReason) {
+			return;
+		}
+		tracker.lastObservationRequestId = observationRequestId;
+		tracker.lastObservationModel = observationModel;
+		tracker.isObserving = true;
+		const cost = expiryReason || tracker.observationCount === 0 ? tracker.cost : tracker.cost = new RequestDiffSurvivalCostObservation(this._logService, {
 			sessionId: session, chatId: chat, originatingRequestId: tracker.originatingRequestId,
 			observationRequestId, observationIndex: tracker.observationCount,
 		});
 		let outcome: RequestDiffSurvivalCostOutcome = 'failed';
+		let attemptedWrite = false;
 		try {
 			const budget = cost.inputBudget;
 			if (!tracker.originalRequest) {
 				this._reserveRetained(state, tracker, 256);
 				this._sizeEvent(tracker, { phase: 'admission', status: 'started', retainedBytesDelta: 256 });
 				const original = await this._computeDiff(session, tracker.baseline, latest, budget, state, tracker, 'originalRequest', true);
-				this._assertActive(state);
+				this._assertTrackerActive(state, tracker, expiryReason);
 				tracker.originalRequest = original;
 				this._sizeEvent(tracker, { phase: 'admission', status: 'completed' });
 			} else {
@@ -415,21 +665,33 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 				cost.finishComparison('baselineToLatest', 'reused');
 				cost.finishComparison('requestResultToLatest', 'empty');
 			}
-			this._assertActive(state);
+			this._assertTrackerActive(state, tracker, expiryReason);
 			outcome = [originalRequest, baselineToLatest, requestResultToLatest].some(diff => diff.errors.length > 0) ? 'failed' : 'completed';
+			attemptedWrite = true;
 			this._writeObservation(session, chat, observationRequestId, observationModel, observationTimestamp, tracker, {
 				originalRequest, baselineToLatest, requestResultToLatest,
-			});
+			}, undefined, expiryReason, expiryReason && outcome === 'failed' ? 'computationFailed' : undefined);
 			tracker.observationCount++;
-			if (tracker.observationCount > requestDiffSurvivalLimits.maximumFollowUpCount) {
-				this._retireTracker(state, tracker, 'horizon');
+			if (expiryReason || tracker.observationCount > requestDiffSurvivalLimits.maximumFollowUpCount) {
+				this._retireTracker(state, tracker, expiryReason ?? 'horizon');
 			}
 		} catch (error) {
 			outcome = getRequestDiffSurvivalCostOutcome(error);
+			if (isCancellationError(error) && (tracker.isRetired || tracker.expiryReason !== expiryReason)) {
+				return;
+			}
+			if (expiryReason && attemptedWrite) {
+				this._retireTracker(state, tracker, expiryReason);
+				throw error;
+			}
 			if (error instanceof RequestDiffSurvivalBudgetError) {
 				this._assertActive(state);
-				this._writeObservation(session, chat, observationRequestId, observationModel, observationTimestamp, tracker, undefined, error);
+				this._writeObservation(session, chat, observationRequestId, observationModel, observationTimestamp, tracker, undefined, error, expiryReason);
 				this._retireTracker(state, tracker, 'budgetRejected');
+			} else if (expiryReason && !state.isDisposed && !this._store.isDisposed) {
+				this._logService.warn(`[RequestDiffSurvival] Expiry computation failed for ${chat}`, error);
+				this._writeObservation(session, chat, observationRequestId, observationModel, observationTimestamp, tracker, undefined, undefined, expiryReason, 'computationFailed');
+				this._retireTracker(state, tracker, expiryReason);
 			} else {
 				this._retireTracker(state, tracker, isCancellationError(error) ? 'cancelled' : 'failed');
 				throw error;
@@ -437,6 +699,8 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		} finally {
 			cost.finishObservation(outcome);
 			this._sizeEvent(tracker, { phase: 'observation', status: outcome });
+			tracker.isObserving = false;
+			this._scheduleExpiry();
 		}
 	}
 
@@ -449,9 +713,14 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		tracker: IRequestDiffSurvivalTracker,
 		diffs: IRequestCharacterDiffSurvivalObservation['diffs'],
 		error?: RequestDiffSurvivalBudgetError,
+		expiryReason?: ExpiryReason,
+		unavailableReason?: UnavailableReason,
 	): void {
+		if (unavailableReason) {
+			diffs = undefined;
+		}
 		const observation: IRequestCharacterDiffSurvivalObservation = {
-			schemaVersion: 3,
+			schemaVersion: 4,
 			recordKind: 'requestCharacterDiffSurvivalObservation',
 			unit: 'utf16CodeUnit',
 			sessionId: session,
@@ -464,13 +733,15 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 			baseStartTimestamp: tracker.baseStartTimestamp,
 			baseEndTimestamp: tracker.baseEndTimestamp,
 			observationTimestamp,
-			observationBoundary: 'requestEnd',
+			observationBoundary: expiryReason ? 'expiry' : 'requestEnd',
 			observationIndex: tracker.observationCount,
 			maximumObservationCount: requestDiffSurvivalLimits.maximumFollowUpCount + 1,
 			maximumFollowUpCount: requestDiffSurvivalLimits.maximumFollowUpCount,
-			isFinalObservation: !!error || tracker.observationCount === requestDiffSurvivalLimits.maximumFollowUpCount,
+			isFinalObservation: !!expiryReason || !!error || tracker.observationCount === requestDiffSurvivalLimits.maximumFollowUpCount,
 			complete: !!diffs && Object.values(diffs).every(diff => diff.errors.length === 0),
-			status: error ? 'budgetExceeded' : 'measured',
+			status: error ? 'budgetExceeded' : unavailableReason ? 'unavailable' : 'measured',
+			terminalReason: expiryReason,
+			unavailableReason,
 			fileInputBudgetExceeded: error?.fileInputBudgetExceeded ? 1 : 0,
 			observationInputBudgetExceeded: error?.observationInputBudgetExceeded ? 1 : 0,
 			retainedDiffBudgetExceeded: error?.retainedDiffBudgetExceeded ? 1 : 0,
@@ -495,6 +766,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		retain: boolean,
 	): Promise<IRequestCharacterRepositoryDiff> {
 		const cost = tracker.cost;
+		const expiryReason = tracker.expiryReason;
 		cost.beginComparison(comparison);
 		let outcome: RequestDiffSurvivalCostOutcome = 'failed';
 		try {
@@ -518,7 +790,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 					fromRef: beforeRepository.ref,
 					toRef: afterRef,
 				});
-				this._assertActive(state);
+				this._assertTrackerActive(state, tracker, expiryReason);
 				if (!diffs) {
 					addError(`Failed to compute diff for repository ${beforeRepository.repository.toString()}`);
 					continue;
@@ -527,7 +799,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 					const retainedBytesBeforeFile = tracker.retainedBytes;
 					const fileCost = cost.createFile(comparison, repositoryIndex, fileIndex);
 					try {
-						const materialized = await this._materializeFileDiff(beforeRepository.repository, beforeRepository.ref, afterRef, diff, budget, state, tracker, retain, fileCost);
+						const materialized = await this._materializeFileDiff(beforeRepository.repository, beforeRepository.ref, afterRef, diff, budget, state, tracker, retain, fileCost, expiryReason);
 						files.push(materialized);
 						this._sizeEvent(tracker, { phase: 'fileConstruction', status: 'completed', ...this._fileSizeDetails(fileCost) });
 					} catch (error) {
@@ -565,6 +837,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		repository: URI, beforeRef: string, afterRef: string, diff: ISessionFileDiff,
 		budget: RequestDiffSurvivalInputBudget, state: IRequestDiffSurvivalState,
 		tracker: IRequestDiffSurvivalTracker, retain: boolean, fileCost: IRequestDiffSurvivalFileCost,
+		expiryReason?: ExpiryReason,
 	) {
 		const beforePath = diff.before ? relativePath(repository, URI.parse(diff.before.uri)) : undefined;
 		const afterPath = diff.after ? relativePath(repository, URI.parse(diff.after.uri)) : undefined;
@@ -575,7 +848,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 			beforePath ? this._gitService.getBlobSize(repository, beforeRef, beforePath) : 0,
 			afterPath ? this._gitService.getBlobSize(repository, afterRef, afterPath) : 0,
 		]);
-		this._assertActive(state);
+		this._assertTrackerActive(state, tracker, expiryReason);
 		if (beforeSize === undefined || afterSize === undefined || !Number.isSafeInteger(beforeSize) || !Number.isSafeInteger(afterSize) || beforeSize < 0 || afterSize < 0) {
 			this._sizeEvent(tracker, { phase: 'inputCheck', status: 'failed', ...this._fileSizeDetails(fileCost) });
 			throw new Error('Unable to read Git blob size');
@@ -604,7 +877,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 			beforePath ? this._gitService.showBlob(repository, beforeRef, beforePath) : undefined,
 			afterPath ? this._gitService.showBlob(repository, afterRef, afterPath) : undefined,
 		]);
-		this._assertActive(state);
+		this._assertTrackerActive(state, tracker, expiryReason);
 		if (beforePath && !before) {
 			throw new Error(`Missing before blob ${beforeRef}:${beforePath}`);
 		}

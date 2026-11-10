@@ -47,7 +47,7 @@ export interface IRequestDiffSurvivalSizeDetails {
 	readonly retainedBytesDelta?: number;
 	readonly proposedObservationInputBytes?: number | null;
 	readonly proposedHostEstimatedRetainedBytes?: number | null;
-	readonly reason?: 'horizon' | 'budgetRejected' | 'failed' | 'cancelled' | 'stateDisposed';
+	readonly reason?: 'horizon' | 'budgetRejected' | 'failed' | 'cancelled' | 'stateDisposed' | 'idleExpired' | 'maximumAgeExceeded';
 }
 
 interface IComputeTotals {
