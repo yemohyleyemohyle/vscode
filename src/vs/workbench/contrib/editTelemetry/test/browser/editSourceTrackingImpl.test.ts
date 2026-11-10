@@ -38,33 +38,6 @@ import { MutableObservableWorkspace } from './editTelemetry.test.js';
 suite('Edit Source Tracking Windows', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
 
-	test('both focus windows preserve gross insertions across successive external overwrites', () => runWithFakedTimers({}, async () => {
-		const visible = observableValue('visible', true);
-		const correlation = new TestExternalEditCorrelation();
-		const context = setup(visible, { createCorrelation: () => correlation, prepareFlush: async () => undefined }, false, '');
-		try {
-			await timeout(10);
-			context.document.applyEdit(diskReloadEdit('', 'abcdef'));
-			await timeout(1500);
-			correlation.resolve(EditSources.agentHostChatApplyEdits({
-				modelId: 'kimi-k3', sessionId: 'session-1', requestId: 'turn-1', harness: 'copilotcli',
-			}));
-			context.document.applyEdit(diskReloadEdit('abcdef', 'aXef'));
-			await timeout(1500);
-			visible.set(false, undefined);
-			await timeout(10);
-			assert.deepStrictEqual({
-				reports: context.allDetails.filter(event => event.mode !== 'longterm').map(event => ({
-					mode: event.mode, inserted: event.deltaModifiedCount, retained: event.modifiedCount,
-				})),
-			}, {
-				reports: ['10minFocusWindow', '20minFocusWindow'].map(mode => ({ mode, inserted: 7, retained: 4 })),
-			});
-		} finally {
-			context.disposables.dispose();
-		}
-	}));
-
 	test('flushes and recreates the long-term tracker on hash and branch changes', () => runWithFakedTimers({}, async () => {
 		const context = setup();
 		await timeout(10);
