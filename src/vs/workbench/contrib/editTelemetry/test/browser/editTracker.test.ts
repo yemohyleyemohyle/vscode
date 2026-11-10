@@ -19,56 +19,6 @@ import { IExternalEditCorrelation, IExternalEditCorrelationResolution } from '..
 suite('DocumentEditSourceTracker', () => {
 	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
 
-	test('snapshots pending edits without applying or consuming them', () => {
-		const document = disposables.add(new TestAnnotatedDocument(''));
-		const tracker = disposables.add(new DocumentEditSourceTracker(document, undefined));
-		const source = chatEditSource('kimi-k3', 'author-request');
-		document.apply(StringEdit.insert(0, 'abcdef'), source);
-		document.apply(StringEdit.delete(new OffsetRange(2, 4)), EditSources.reloadFromDisk());
-		const initial = snapshot(tracker);
-		const sampled = tracker.snapshot();
-		const repeated = tracker.snapshot();
-		const afterSampling = snapshot(tracker);
-		tracker.applyPendingExternalEdits();
-		const final = snapshot(tracker);
-		assert.deepStrictEqual({
-			initial, afterSampling, repeated,
-			sampled: sampled.sources.map(entry => ({ key: entry.representative.toKey(1), retained: entry.modifiedCount, delta: entry.deltaModifiedCount })),
-			pending: sampled.correlationPending, final,
-		}, {
-			initial: [{ key: source.toKey(1), delta: 6, retained: 6, requestId: 'author-request' }],
-			afterSampling: initial, repeated: sampled, pending: false,
-			sampled: [{ key: source.toKey(1), retained: 4, delta: 6 }, { key: 'source:reloadFromDisk', retained: 0, delta: 0 }],
-			final: [
-				{ key: source.toKey(1), delta: 6, retained: 4, requestId: 'author-request' },
-				{ key: 'source:reloadFromDisk', delta: 0, retained: 0, requestId: undefined },
-			].sort((a, b) => a.key.localeCompare(b.key)),
-		});
-	});
-
-	test('snapshots resolved pending external edits without releasing correlations', () => {
-		const document = disposables.add(new TestAnnotatedDocument(''));
-		const correlation = new TestExternalEditCorrelation();
-		const tracker = disposables.add(new DocumentEditSourceTracker(document, undefined, correlation, 'reattribute'));
-		document.apply(StringEdit.insert(0, '\u4e2d\u6587\ud840\udc00\ud83d\ude00\r\n'), EditSources.reloadFromDisk());
-		const pending = tracker.snapshot();
-		const source = agentHostEditSource('kimi-k3', 'author-turn', 'copilotcli');
-		correlation.resolve(correlation.lastObservationId!, source);
-		const resolved = tracker.snapshot();
-		const repeated = tracker.snapshot();
-		assert.deepStrictEqual({
-			pending: pending.correlationPending,
-			resolved: resolved.sources.map(entry => ({ modelId: entry.representative.props.$modelId, retained: entry.modifiedCount, delta: entry.deltaModifiedCount })),
-			resolutionRetained: correlation.getResolution(correlation.lastObservationId!)?.source === source,
-			normalCounts: snapshot(tracker),
-			repeated,
-		}, {
-			pending: true,
-			resolved: [{ modelId: 'kimi-k3', retained: 8, delta: 8 }],
-			resolutionRetained: true, normalCounts: [], repeated: resolved,
-		});
-	});
-
 	test('ignores an initial external edit', () => {
 		const document = disposables.add(new TestAnnotatedDocument('initial'));
 		const tracker = disposables.add(new DocumentEditSourceTracker(document, undefined));
@@ -100,23 +50,21 @@ suite('DocumentEditSourceTracker', () => {
 				if (lateResolution) {
 					correlation.resolve('observation-1', first);
 				}
-				const project = () => tracker.snapshot().sources.map(entry => ({
-					request: entry.representative.props.$$requestId, inserted: entry.deltaModifiedCount, retained: entry.modifiedCount,
+				const project = () => snapshot(tracker).map(entry => ({
+					request: entry.requestId, inserted: entry.delta, retained: entry.retained,
 				}));
-				const pending = project();
-				const repeated = project();
-				tracker.applyPendingExternalEdits();
 				tracker.applyPendingExternalEdits();
 				const applied = project();
-				const normal = snapshot(tracker).map(entry => ({ request: entry.requestId, inserted: entry.delta, retained: entry.retained }));
+				tracker.applyPendingExternalEdits();
+				const repeated = project();
 				document.apply(StringEdit.insert(0, '!'), EditSources.cursor({ kind: 'type' }));
-				assert.deepStrictEqual({ pending, repeated, applied, normal, afterLocal: project() }, {
-					pending: [
+				assert.deepStrictEqual({ applied, repeated, afterLocal: project() }, {
+					applied: [
 						{ request: 'first', inserted: 6, retained: scenario.retained },
 						{ request: 'second', inserted: scenario.inserted, retained: scenario.newRetained },
 					],
-					repeated: pending, applied: pending, normal: pending,
-					afterLocal: [...pending, { request: undefined, inserted: 1, retained: 1 }],
+					repeated: applied,
+					afterLocal: [...applied, { request: undefined, inserted: 1, retained: 1 }],
 				});
 			});
 		}
@@ -130,20 +78,17 @@ suite('DocumentEditSourceTracker', () => {
 		document.apply(StringEdit.delete(OffsetRange.ofLength(6)), EditSources.reloadFromDisk());
 		correlation.suppress('observation-1');
 		correlation.suppress('observation-2');
-		const suppressed = tracker.snapshot().sources;
-		const excluded = tracker.snapshot().excludedAgentHostObservationCount;
 		tracker.applyPendingExternalEdits();
+		const suppressed = snapshot(tracker);
 		const fallback = snapshot(tracker, true);
 		correlation.invalidate('observation-1');
-		assert.deepStrictEqual({ suppressed, excluded, fallback, invalidated: snapshot(tracker), remainingExcluded: tracker.snapshot().excludedAgentHostObservationCount }, {
+		assert.deepStrictEqual({ suppressed, fallback, invalidated: snapshot(tracker) }, {
 			suppressed: [],
-			excluded: 2,
 			fallback: [
 				{ key: 'external-observation:observation-1', delta: 6, retained: 0, requestId: undefined },
 				{ key: 'external-observation:observation-2', delta: 0, retained: 0, requestId: undefined },
 			],
 			invalidated: [{ key: 'external-observation:observation-1', delta: 6, retained: 0, requestId: undefined }],
-			remainingExcluded: 1,
 		});
 	});
 
@@ -154,15 +99,11 @@ suite('DocumentEditSourceTracker', () => {
 		document.apply(StringEdit.insert(0, '!'), user);
 		document.apply(StringEdit.insert(1, 'abcdef'), EditSources.reloadFromDisk());
 		document.apply(StringEdit.replace(new OffsetRange(2, 5), 'X'), EditSources.reloadFromDisk());
-		const pending = tracker.snapshot().sources.map(entry => ({ inserted: entry.deltaModifiedCount, retained: entry.modifiedCount }));
 		document.apply(StringEdit.insert(0, '?'), user);
-		assert.deepStrictEqual({ pending, applied: snapshot(tracker) }, {
-			pending: [{ inserted: 1, retained: 1 }, { inserted: 7, retained: 4 }],
-			applied: [
-				{ key: user.toKey(1), delta: 2, retained: 2, requestId: undefined },
-				{ key: 'source:reloadFromDisk', delta: 7, retained: 4, requestId: undefined },
-			],
-		});
+		assert.deepStrictEqual(snapshot(tracker), [
+			{ key: user.toKey(1), delta: 2, retained: 2, requestId: undefined },
+			{ key: 'source:reloadFromDisk', delta: 7, retained: 4, requestId: undefined },
+		]);
 	});
 
 	test('retains a matched initial external edit only for fallback', () => {

@@ -21,7 +21,6 @@ import { Client as MessagePortClient } from '../../../base/parts/ipc/common/ipc.
 import { acquirePort, MessagePortAcquisitionError } from '../../../base/parts/ipc/electron-browser/ipc.mp.js';
 import { ipcRenderer } from '../../../base/parts/sandbox/electron-browser/globals.js';
 import { localize } from '../../../nls.js';
-import type { IRequestEditSurvivalBoundary, IRequestFocusWindowSurvivalSnapshot } from '../common/requestEditSurvival.js';
 import { IConfigurationService } from '../../configuration/common/configuration.js';
 import { IEnvironmentService } from '../../environment/common/environment.js';
 import { IInstantiationService } from '../../instantiation/common/instantiation.js';
@@ -219,8 +218,6 @@ export class LocalAgentHostServiceClient extends Disposable implements IAgentHos
 		() => this._protocolClient?.connectionAvailable.get() ?? false);
 
 	// Consumers can subscribe before prewarming creates the protocol client.
-	private readonly _onDidRequestFocusWindowSnapshot = this._register(new Relay<IRequestEditSurvivalBoundary>());
-	readonly onDidRequestFocusWindowSnapshot = this._onDidRequestFocusWindowSnapshot.event;
 	private readonly _onDidAction = this._register(new Relay<ActionEnvelope>());
 	readonly onDidAction = this._onDidAction.event;
 	private readonly _onDidNotification = this._register(new Relay<INotification>());
@@ -393,7 +390,6 @@ export class LocalAgentHostServiceClient extends Disposable implements IAgentHos
 		}
 		if (state === AgentHostClientState.Connected) {
 			this._managementConnection.connected();
-			this._onDidRequestFocusWindowSnapshot.input = this._getManagementService().onDidRequestFocusWindowSnapshot;
 			this._startupTelemetry?.protocolConnected();
 			if (!this._didConnectInitially) {
 				this._didConnectInitially = true;
@@ -402,7 +398,6 @@ export class LocalAgentHostServiceClient extends Disposable implements IAgentHos
 			this._logService.info(`${LOG_PREFIX} Protocol connection established; clientId=${this._requireClient().clientId}`);
 			this._onAgentHostStart.fire();
 		} else if (state === AgentHostClientState.Reconnecting || state === AgentHostClientState.Incompatible || state === AgentHostClientState.Closed) {
-			this._onDidRequestFocusWindowSnapshot.input = Event.None;
 			this._clientStore.clear();
 			if (state === AgentHostClientState.Reconnecting) {
 				this._managementConnection.reconnecting();
@@ -876,10 +871,6 @@ export class LocalAgentHostServiceClient extends Disposable implements IAgentHos
 		return ProxyChannel.toService<IAgentHostManagementService>(
 			getDelayedChannel(this._managementConnection.client().then(client => client.getChannel(AgentHostIpcChannels.Management)))
 		);
-	}
-
-	logFocusWindowSnapshots(snapshots: readonly IRequestFocusWindowSurvivalSnapshot[]): Promise<void> {
-		return this._getManagementService().logFocusWindowSnapshots(snapshots);
 	}
 
 	configureMissionControl(options: IMissionControlOptions | undefined, withdrawingAccountId?: string): Promise<void> {

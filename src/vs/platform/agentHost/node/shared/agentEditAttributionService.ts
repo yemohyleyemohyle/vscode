@@ -6,9 +6,9 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { sumBy } from '../../../../base/common/arrays.js';
-import { IntervalTimer, raceTimeout, RunOnceScheduler, SequencerByKey } from '../../../../base/common/async.js';
+import { IntervalTimer, raceTimeout, SequencerByKey } from '../../../../base/common/async.js';
 import { groupByMap } from '../../../../base/common/collections.js';
-import { Disposable, DisposableMap } from '../../../../base/common/lifecycle.js';
+import { Disposable } from '../../../../base/common/lifecycle.js';
 import { dirname } from '../../../../base/common/path.js';
 import { extUriBiasedIgnorePathCase } from '../../../../base/common/resources.js';
 import { URI } from '../../../../base/common/uri.js';
@@ -20,18 +20,15 @@ import { ITelemetryService, normalizeModelRouterTelemetryId, TelemetryLevel } fr
 import { AgentSession } from '../../common/agent.js';
 import { getTelemetryChatSessionId } from '../../common/agentTelemetryCorrelation.js';
 import { IDiffComputeService, IOffsetEdit } from '../../common/diffComputeService.js';
-import { createFileEditContentDigest, IAgentEditAttribution, IAgentEditAttributionService, ICancelEditAttributionFlushParams, ICommitEditAttributionFlushParams, IEditAttributionCoverageGapAcknowledgement, IEditAttributionFlushResult, IEditAttributionSnapshot, IEditAttributionSnapshotParams, IEditAttributionSnapshotSource, IFileEditAttributionMarker, IPrepareEditAttributionFlushParams, IPreparedEditAttributionFlush, ISkippedFileEditAttributionMarker, MAX_EDIT_ATTRIBUTION_FILE_SIZE } from '../../common/fileEditAttribution.js';
+import { createFileEditContentDigest, IAgentEditAttribution, IAgentEditAttributionService, ICancelEditAttributionFlushParams, ICommitEditAttributionFlushParams, IEditAttributionCoverageGapAcknowledgement, IEditAttributionFlushResult, IFileEditAttributionMarker, IPrepareEditAttributionFlushParams, IPreparedEditAttributionFlush, ISkippedFileEditAttributionMarker, MAX_EDIT_ATTRIBUTION_FILE_SIZE } from '../../common/fileEditAttribution.js';
 import { isAhpChatChannel } from '../../common/state/sessionState.js';
 import { IAgentHostTelemetryService } from '../agentHostTelemetryService.js';
-import { Emitter } from '../../../../base/common/event.js';
-import { type IRequestEditSurvivalBoundary, type IRequestFocusWindowSurvivalSnapshot, unavailableRequestEditSurvivalSnapshots } from '../../common/requestEditSurvival.js';
 import { toCopilotTelemetryData } from './copilotSkuTelemetry.js';
 
 const MAX_TOTAL_TRACKED_TEXT = 20 * 1024 * 1024;
 const MAX_TRACKED_RESOURCES = 100;
 const MAX_INTERVALS_PER_RESOURCE = 10_000;
 const MAX_COVERAGE_GAP_SEQUENCES = 128;
-const FOCUS_WINDOW_SNAPSHOT_TRANSPORT_TIMEOUT_MS = 15_000;
 const MAX_COVERAGE_GAP_ACKNOWLEDGEMENTS_PER_FLUSH = 128;
 const MAX_SETTLED_FLUSHES = 1_000;
 const MAX_STANDALONE_ACKNOWLEDGEMENTS = 1_000;
@@ -128,15 +125,8 @@ interface IPreparedFlush {
 	readonly timestamp: number;
 }
 
-function focusWindowSnapshotBoundaryKey(boundary: IRequestEditSurvivalBoundary): string {
-	return JSON.stringify([boundary.sessionId, boundary.chatId, boundary.observationRequestId, boundary.observationBoundary, boundary.observationTimestamp]);
-}
-
 export class AgentEditAttributionService extends Disposable implements IAgentEditAttributionService {
 	declare readonly _serviceBrand: undefined;
-	private readonly _onDidRequestFocusWindowSnapshot = this._register(new Emitter<IRequestEditSurvivalBoundary>());
-	readonly onDidRequestFocusWindowSnapshot = this._onDidRequestFocusWindowSnapshot.event;
-	private readonly _pendingFocusWindowSnapshots = this._register(new DisposableMap<string, RunOnceScheduler>());
 
 	private readonly _resources = new Map<string, ITrackedResource>();
 	private readonly _claimedResources = new Set<ITrackedResource>();
@@ -148,10 +138,8 @@ export class AgentEditAttributionService extends Disposable implements IAgentEdi
 	private readonly _standaloneAcknowledgements = new Map<string, IStandaloneAcknowledgement>();
 	private readonly _repositories = new Map<string, IAgentEditAttributionGitState>();
 	private readonly _nonRepositoryDirectories = new Map<string, number>();
-	private readonly _snapshotEpochs = new Map<string, number>();
 	private _trackedTextLength = 0;
 	private _sequence = 0;
-	private _nextSnapshotEpoch = 0;
 	private _generation = 0;
 	private _enabled = true;
 
@@ -170,45 +158,6 @@ export class AgentEditAttributionService extends Disposable implements IAgentEdi
 		this._register(new IntervalTimer()).cancelAndSet(() => {
 			void this.checkGitState();
 		}, GIT_STATE_POLL_INTERVAL);
-	}
-
-	requestFocusWindowSnapshot(boundary: IRequestEditSurvivalBoundary): void {
-		if (process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG !== '1') {
-			return;
-		}
-		if (!this._enabled || this._telemetryService.telemetryLevel < TelemetryLevel.USAGE) {
-			this._writeFocusWindowSnapshots(unavailableRequestEditSurvivalSnapshots(boundary, 'collectionDisabled'));
-		} else if (!this._onDidRequestFocusWindowSnapshot.hasListeners()) {
-			this._writeFocusWindowSnapshots(unavailableRequestEditSurvivalSnapshots(boundary, 'transportError', ['No renderer snapshot listener is connected']));
-		} else {
-			const key = focusWindowSnapshotBoundaryKey(boundary);
-			const timer = new RunOnceScheduler(() => {
-				this._pendingFocusWindowSnapshots.deleteAndDispose(key);
-				this._writeFocusWindowSnapshots(unavailableRequestEditSurvivalSnapshots(boundary, 'transportError', ['Renderer snapshot response timed out']));
-			}, FOCUS_WINDOW_SNAPSHOT_TRANSPORT_TIMEOUT_MS);
-			this._pendingFocusWindowSnapshots.set(key, timer);
-			timer.schedule();
-			this._onDidRequestFocusWindowSnapshot.fire(boundary);
-		}
-	}
-
-	logFocusWindowSnapshots(snapshots: readonly IRequestFocusWindowSurvivalSnapshot[]): void {
-		const acknowledged = new Set(snapshots.map(focusWindowSnapshotBoundaryKey).filter(key => this._pendingFocusWindowSnapshots.has(key)));
-		for (const key of acknowledged) {
-			this._pendingFocusWindowSnapshots.deleteAndDispose(key);
-		}
-		this._writeFocusWindowSnapshots(snapshots.filter(snapshot => acknowledged.has(focusWindowSnapshotBoundaryKey(snapshot))));
-	}
-
-	private _writeFocusWindowSnapshots(snapshots: readonly IRequestFocusWindowSurvivalSnapshot[]): void {
-		if (process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG !== '1') {
-			return;
-		}
-		for (const snapshot of snapshots) {
-			const collectionEnabled = this._enabled && this._telemetryService.telemetryLevel >= TelemetryLevel.USAGE;
-			const record = collectionEnabled ? snapshot : unavailableRequestEditSurvivalSnapshots(snapshot, 'collectionDisabled').find(record => record.mode === snapshot.mode)!;
-			this._logService.info(`[RequestFocusWindowSurvivalSnapshot] ${JSON.stringify(record)}`);
-		}
 	}
 
 	setEnabled(enabled: boolean): void {
@@ -441,50 +390,6 @@ export class AgentEditAttributionService extends Disposable implements IAgentEdi
 		await Promise.allSettled(resources.map(resource => this._flushStandalone(resource, 'closed', generation)));
 	}
 
-	async snapshot(params: IEditAttributionSnapshotParams): Promise<IEditAttributionSnapshot> {
-		const chatSessionId = getTelemetryChatSessionId(params.chatUri);
-		const scopeKey = snapshotScopeKey(params.sessionUri, chatSessionId);
-		if (!this._enabled || this._telemetryService.telemetryLevel < TelemetryLevel.USAGE) {
-			return { trackingEpoch: this._snapshotEpochs.get(scopeKey) ?? 0, sources: [] };
-		}
-		const generation = this._generation;
-		const resources = this._snapshotResources(params.sessionUri, chatSessionId);
-		await Promise.all(resources.map(resource => this._fileSequencer.queue(resource.fileKey, async () => {
-			await this._reconcileSnapshotResource(resource, generation);
-		})));
-		if (!this._isCurrentGeneration(generation)) {
-			return { trackingEpoch: this._snapshotEpochs.get(scopeKey) ?? 0, sources: [] };
-		}
-
-		const rows = new Map<string, IEditAttributionSnapshotSource>();
-		for (const resource of this._snapshotResources(params.sessionUri, chatSessionId)) {
-			const retainedBySource = new Map<string, number>();
-			for (const interval of resource.intervals) {
-				if (interval.sourceKey !== undefined) {
-					retainedBySource.set(interval.sourceKey, (retainedBySource.get(interval.sourceKey) ?? 0) + interval.endExclusive - interval.start);
-				}
-			}
-			for (const source of resource.sources.values()) {
-				if (source.chatSessionId !== chatSessionId) {
-					continue;
-				}
-				const existing = rows.get(source.trackingKey);
-				rows.set(source.trackingKey, {
-					sourceKey: source.sourceKey,
-					modelId: source.modelId ?? null,
-					deltaModifiedCount: (existing?.deltaModifiedCount ?? 0) + source.insertedCount,
-					modifiedCount: (existing?.modifiedCount ?? 0) + (retainedBySource.get(source.trackingKey) ?? 0),
-				});
-			}
-		}
-		return {
-			trackingEpoch: this._snapshotEpochs.get(scopeKey) ?? 0,
-			sources: Array.from(rows.values()).sort((left, right) =>
-				left.sourceKey.localeCompare(right.sourceKey) || (left.modelId ?? '').localeCompare(right.modelId ?? '')
-			),
-		};
-	}
-
 	async prepareFlush(params: IPrepareEditAttributionFlushParams): Promise<IPreparedEditAttributionFlush | undefined> {
 		const generation = this._generation;
 		if (!this._isCurrentGeneration(generation)) {
@@ -620,7 +525,6 @@ export class AgentEditAttributionService extends Disposable implements IAgentEdi
 		}
 		this._preparedFlushes.delete(params.flushToken);
 		this._releaseResourceClaims(prepared.resources);
-		this._advanceSnapshotEpochs(prepared.resources);
 		this._emitTelemetry(prepared, params.totalModifiedCount);
 		const result = {
 			outcome: 'committed',
@@ -678,7 +582,6 @@ export class AgentEditAttributionService extends Disposable implements IAgentEdi
 		this._preparedFlushes.delete(params.flushToken);
 		if (prepared.resources.some(resource => this._resources.has(resource.key))) {
 			this._releaseResourceClaims(prepared.resources);
-			this._advanceSnapshotEpochs(prepared.resources);
 			this._emitTelemetry(prepared, prepared.agentModifiedCount);
 			const result = {
 				outcome: 'committed',
@@ -1043,57 +946,6 @@ export class AgentEditAttributionService extends Disposable implements IAgentEdi
 		}
 	}
 
-	private _snapshotResources(sessionUri: string, chatSessionId: string): ITrackedResource[] {
-		return Array.from(this._resources.values()).filter(resource =>
-			resource.ownerSessionUri === sessionUri
-			&& Array.from(resource.sources.values()).some(source => source.chatSessionId === chatSessionId)
-		);
-	}
-
-	private async _reconcileSnapshotResource(resource: ITrackedResource, generation: number): Promise<void> {
-		if (!this._isCurrentGeneration(generation) || this._resources.get(resource.key) !== resource || resource.currentContent === undefined) {
-			return;
-		}
-		const deadline = this._now() + RECONCILIATION_TIMEOUT;
-		const currentContent = await raceTimeout(
-			this._readCurrentContent(resource.filePath),
-			getRemainingReconciliationTime(deadline, this._now())
-		);
-		if (currentContent === undefined) {
-			throw new Error('Agent Host edit attribution snapshot file read timed out');
-		}
-		if (!this._isCurrentGeneration(generation) || this._resources.get(resource.key) !== resource) {
-			return;
-		}
-		if (currentContent !== resource.currentContent) {
-			const remainingTime = getRemainingReconciliationTime(deadline, this._now());
-			const diff = await raceTimeout(
-				this._diffComputeService.computeDiffCounts(resource.currentContent, currentContent, remainingTime),
-				remainingTime
-			);
-			if (!diff) {
-				throw new Error('Agent Host edit attribution snapshot diff timed out');
-			}
-			if (!this._isCurrentGeneration(generation) || this._resources.get(resource.key) !== resource) {
-				return;
-			}
-			this._applyChanges(resource, diff.changes, 'external', currentContent, true, diff.hitTimeout);
-		}
-		await this._reconcileOtherSessionResources(resource, generation, deadline);
-	}
-
-	private _advanceSnapshotEpochs(resources: readonly ITrackedResource[]): void {
-		const scopes = new Set<string>();
-		for (const resource of resources) {
-			for (const source of resource.sources.values()) {
-				scopes.add(snapshotScopeKey(resource.ownerSessionUri, source.chatSessionId));
-			}
-		}
-		for (const scope of scopes) {
-			this._snapshotEpochs.set(scope, ++this._nextSnapshotEpoch);
-		}
-	}
-
 	private _excludeOtherSessionAgentIntervals(resource: ITrackedResource): void {
 		if (resource.currentContent === undefined) {
 			return;
@@ -1331,7 +1183,6 @@ export class AgentEditAttributionService extends Disposable implements IAgentEdi
 		this._preparedFlushes.delete(flushToken);
 		if (prepared.resources.some(resource => this._resources.has(resource.key))) {
 			this._releaseResourceClaims(prepared.resources);
-			this._advanceSnapshotEpochs(prepared.resources);
 			this._emitTelemetry(prepared, prepared.agentModifiedCount);
 			this._recordSettledFlush(flushToken, {
 				outcome: 'committed',
@@ -1357,10 +1208,6 @@ export class AgentEditAttributionService extends Disposable implements IAgentEdi
 
 function resourceKey(sessionUri: string, fileKey: string): string {
 	return `${sessionUri}\0${fileKey}`;
-}
-
-function snapshotScopeKey(sessionUri: string, chatSessionId: string | undefined): string {
-	return JSON.stringify([sessionUri, chatSessionId]);
 }
 
 const MAX_REPORTED_SOURCE_GROUPS = 30;

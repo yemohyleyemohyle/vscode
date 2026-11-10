@@ -4,7 +4,16 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { LcsDiff, StringDiffSequence } from '../../../../../base/common/diff/diff.js';
-import type { IRequestDiffSurvivalMetric } from './requestDiffSurvival.js';
+
+interface IRequestCharacterDiffSurvivalMetric {
+	readonly survivingAdditions: number;
+	readonly survivingDeletions: number;
+	readonly totalAdditions: number;
+	readonly totalDeletions: number;
+	readonly totalSurviving: number;
+	readonly totalEdits: number;
+	readonly ratio: number | null;
+}
 
 export interface IRequestCharacterChange {
 	readonly path: string;
@@ -49,7 +58,7 @@ export function computeRequestCharacterDiffSurvivalMetric(
 	originalRequest: IRequestCharacterRepositoryDiff,
 	baselineToLatest: IRequestCharacterRepositoryDiff,
 	requestResultToLatest: IRequestCharacterRepositoryDiff,
-): IRequestDiffSurvivalMetric {
+): IRequestCharacterDiffSurvivalMetric {
 	const additions = originalRequest.files.flatMap(file => file.plus);
 	const deletions = originalRequest.files.flatMap(file => file.minus);
 	const totalAdditions = additions.reduce((sum, change) => sum + change.length, 0);

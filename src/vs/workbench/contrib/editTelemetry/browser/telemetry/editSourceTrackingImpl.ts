@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { reverseOrder, compareBy, numberComparator, sumBy } from '../../../../../base/common/arrays.js';
-import { IntervalTimer, raceTimeout } from '../../../../../base/common/async.js';
+import { IntervalTimer } from '../../../../../base/common/async.js';
 import { groupByMap } from '../../../../../base/common/collections.js';
 import { toDisposable, Disposable, DisposableStore } from '../../../../../base/common/lifecycle.js';
 import { mapObservableArrayCached, derived, IObservable, observableSignal, runOnChange, autorun } from '../../../../../base/common/observable.js';
@@ -18,13 +18,11 @@ import { ILogService } from '../../../../../platform/log/common/log.js';
 import { AnnotatedDocument, IAnnotatedDocuments } from '../helpers/annotatedDocuments.js';
 import { CreateSuggestionIdForChatOrInlineChatCaller, EditTelemetryReportEditArcForChatOrInlineChatSender, EditTelemetryReportInlineEditArcSender } from './arcTelemetrySender.js';
 import { createDocWithJustReason, EditSource } from '../helpers/documentWithAnnotatedEdits.js';
-import { DocumentEditSourceTracker, TrackedEdit, type IEditSourceTrackerSnapshot } from './editTracker.js';
+import { DocumentEditSourceTracker, TrackedEdit } from './editTracker.js';
 import { sumByCategory } from '../helpers/utils.js';
 import { IScmRepoAdapter, ScmAdapter } from './scmAdapter.js';
 import { IRandomService } from '../randomService.js';
 import { AgentHostEditAttributionDeferredError, AgentHostEditAttributionUnknownOutcomeError, IAgentHostEditMarkerService, IPreparedAgentHostEditAttributionFlush } from './agentHostEditMarkerService.js';
-import { type IRequestEditSurvivalBoundary, type IRequestFocusWindowSurvivalSnapshot, type RequestEditSurvivalMode, requestEditSurvivalModes, unavailableRequestEditSurvivalSnapshots } from '../../../../../platform/agentHost/common/requestEditSurvival.js';
-import { generateUuid } from '../../../../../base/common/uuid.js';
 
 const FOCUS_CORRELATION_DRAIN_TIMEOUT = 1_000;
 
@@ -32,18 +30,6 @@ function getDetailsGroupingKey(source: TextModelEditSource, sourceKey = source.t
 	return source.props.$origin === 'agentHost' && (source.props.$$agentSessionId !== undefined || source.props.$$chatSessionId !== undefined)
 		? JSON.stringify([sourceKey, source.props.$$agentSessionId, source.props.$$sessionId, source.props.$$chatSessionId])
 		: sourceKey;
-}
-
-function selectDetailsSources(counts: ReadonlyMap<string, IEditSourceTrackerSnapshot['sources'][number]>, mode: EditTelemetryMode) {
-	// Cap sources before subdividing by Auto tier and HydraFusion model.
-	const sourceGroups = groupByMap(Array.from(counts), ([, entry]) => getDetailsGroupingKey(entry.representative, entry.representative.toKey(1, { $autoTier: false, $fusionModel: false })));
-	return Array.from(sourceGroups.values(), entries => ({
-		entries,
-		modifiedCount: sumBy(entries, ([, entry]) => entry.modifiedCount),
-	}))
-		.sort(reverseOrder(compareBy(group => group.modifiedCount, numberComparator)))
-		.slice(0, mode === 'longterm' ? 30 : 10)
-		.flatMap(group => group.entries);
 }
 
 export type EditTelemetryCategory = 'nes' | 'inlineCompletionsCopilot' | 'inlineCompletionsNES' | 'inlineCompletionsOther' | 'otherAI' | 'agentHost' | 'user' | 'ide' | 'external' | 'unknown';
@@ -84,17 +70,6 @@ export class EditSourceTrackingImpl extends Disposable {
 
 		this.docsState.recomputeInitiallyAndOnChange(this._store);
 	}
-
-	async snapshot(boundary: IRequestEditSurvivalBoundary): Promise<readonly IRequestFocusWindowSurvivalSnapshot[]> {
-		if (!this._statsEnabled.get()) {
-			return unavailableRequestEditSurvivalSnapshots(boundary, 'collectionDisabled');
-		}
-		const documents = Array.from(this.docsState.get().values());
-		if (documents.length === 0) {
-			return unavailableRequestEditSurvivalSnapshots(boundary, 'noActiveTracker');
-		}
-		return (await Promise.all(documents.map(document => document.snapshot(boundary)))).flat();
-	}
 }
 
 class TrackedDocumentInfo extends Disposable {
@@ -103,7 +78,6 @@ class TrackedDocumentInfo extends Disposable {
 	public readonly windowedFocusTracker: IObservable<DocumentEditSourceTracker<undefined> | undefined>;
 
 	private readonly _repo: IObservable<IScmRepoAdapter | undefined>;
-	private readonly _trackerMetadata = new WeakMap<DocumentEditSourceTracker<undefined>, { readonly id: string; readonly startTime: number; readonly startFocusTime: number }>();
 
 	constructor(
 		private readonly _doc: AnnotatedDocument,
@@ -141,7 +115,6 @@ class TrackedDocumentInfo extends Disposable {
 			const t = new DocumentEditSourceTracker(docWithJustReason, undefined, externalEditCorrelation);
 			const startFocusTime = this._userAttentionService.totalFocusTimeMs;
 			const startTime = Date.now();
-			this._trackerMetadata.set(t, { id: generateUuid(), startTime, startFocusTime });
 			reader.store.add(toDisposable(() => {
 				// send long term document telemetry
 				this._sendTelemetryAndLog('longterm', longtermReason, t, this._userAttentionService.totalFocusTimeMs - startFocusTime, Date.now() - startTime);
@@ -196,7 +169,6 @@ class TrackedDocumentInfo extends Disposable {
 			const t = new DocumentEditSourceTracker(docWithJustReason, undefined, externalEditCorrelation, 'reattribute');
 			const startFocusTime = this._userAttentionService.totalFocusTimeMs;
 			const startTime = Date.now();
-			this._trackerMetadata.set(t, { id: generateUuid(), startTime, startFocusTime });
 			reader.store.add(toDisposable(() => {
 				// send windowed document telemetry
 				this._sendTelemetryAndLog('10minFocusWindow', 'time', t, this._userAttentionService.totalFocusTimeMs - startFocusTime, Date.now() - startTime);
@@ -224,7 +196,6 @@ class TrackedDocumentInfo extends Disposable {
 			const t = new DocumentEditSourceTracker(docWithJustReason, undefined, externalEditCorrelation, 'reattribute');
 			const startFocusTime = this._userAttentionService.totalFocusTimeMs;
 			const startTime = Date.now();
-			this._trackerMetadata.set(t, { id: generateUuid(), startTime, startFocusTime });
 			reader.store.add(toDisposable(() => {
 				// send focus-windowed document telemetry
 				this._sendTelemetryAndLog('20minFocusWindow', 'time', t, this._userAttentionService.totalFocusTimeMs - startFocusTime, Date.now() - startTime);
@@ -233,60 +204,6 @@ class TrackedDocumentInfo extends Disposable {
 			return t;
 		}).recomputeInitiallyAndOnChange(this._store);
 
-	}
-
-	async snapshot(boundary: IRequestEditSurvivalBoundary): Promise<readonly IRequestFocusWindowSurvivalSnapshot[]> {
-		return Promise.all(requestEditSurvivalModes.map(mode => this._snapshotMode(boundary, mode)));
-	}
-
-	private async _snapshotMode(boundary: IRequestEditSurvivalBoundary, mode: RequestEditSurvivalMode): Promise<IRequestFocusWindowSurvivalSnapshot> {
-		const observable = mode === 'longterm' ? this.longtermTracker : mode === '10minFocusWindow' ? this.windowedTracker : this.windowedFocusTracker;
-		const tracker = observable.get();
-		const unavailable = unavailableRequestEditSurvivalSnapshots(boundary, 'noActiveTracker').find(snapshot => snapshot.mode === mode)!;
-		if (!tracker) {
-			return { ...unavailable, documentUri: this._doc.document.uri.toString() };
-		}
-		const metadata = this._trackerMetadata.get(tracker)!;
-		const identity = { documentUri: this._doc.document.uri.toString(), trackerInstanceId: metadata.id, windowStartTimestamp: new Date(metadata.startTime).toISOString() };
-		try {
-			const drained = await raceTimeout((async () => {
-				await tracker.waitForQueue();
-				await tracker.waitForExternalEditCorrelations(FOCUS_CORRELATION_DRAIN_TIMEOUT);
-				await tracker.waitForQueue();
-				return true;
-			})(), FOCUS_CORRELATION_DRAIN_TIMEOUT);
-			if (this._store.isDisposed || observable.get() !== tracker) {
-				return { ...unavailable, ...identity, capturedTimestamp: new Date().toISOString(), status: 'incomplete', reason: 'trackerDisposed' };
-			}
-			const snapshot = tracker.snapshot();
-			const grouped = new Map<string, { representative: TextModelEditSource; modifiedCount: number; deltaModifiedCount: number }>();
-			for (const source of snapshot.sources) {
-				const key = getDetailsGroupingKey(source.representative);
-				const entry = grouped.get(key) ?? { representative: source.representative, modifiedCount: 0, deltaModifiedCount: 0 };
-				entry.modifiedCount += source.modifiedCount;
-				entry.deltaModifiedCount += source.deltaModifiedCount;
-				grouped.set(key, entry);
-			}
-			const capturedTime = Date.now();
-			const complete = drained === true && !snapshot.correlationPending;
-			return {
-				...unavailable, ...boundary, ...identity,
-				capturedTimestamp: new Date(capturedTime).toISOString(),
-				elapsedFocusTimeMs: this._userAttentionService.totalFocusTimeMs - metadata.startFocusTime,
-				elapsedWallTimeMs: capturedTime - metadata.startTime,
-				complete, status: complete ? 'complete' : 'incomplete', reason: complete ? undefined : 'correlationPending', errors: [],
-				excludedAgentHostObservationCount: snapshot.excludedAgentHostObservationCount,
-				sources: selectDetailsSources(grouped, mode).map(([, { representative, modifiedCount, deltaModifiedCount }]) => ({
-					sourceKey: representative.toKey(1), modelId: representative.props.$modelId ?? null, modifiedCount, deltaModifiedCount,
-					sourceSessionId: representative.props.$$sessionId, sourceAgentSessionId: representative.props.$$agentSessionId,
-					sourceChatId: representative.props.$$chatSessionId, sourceRequestId: representative.props.$$requestId,
-				})),
-			};
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			this._logService.error('[EditSourceTrackingImpl] Failed to collect request focus-window snapshot', error);
-			return { ...unavailable, ...identity, capturedTimestamp: new Date().toISOString(), status: 'error', reason: 'collectionError', errors: [message] };
-		}
 	}
 
 	private _sendTelemetryAndLog(mode: EditTelemetryMode, trigger: EditTelemetryTrigger, tracker: DocumentEditSourceTracker, focusTime: number, actualTime: number): void {
@@ -380,7 +297,15 @@ class TrackedDocumentInfo extends Disposable {
 				entry.modifiedCount += range.range.length;
 			}
 		}
-		const entries = selectDetailsSources(telemetryKeys, mode);
+		// Apply the source cap before subdividing by Auto tier and HydraFusion model so no selected source loses contributions.
+		const sourceGroups = groupByMap(Array.from(telemetryKeys), ([, entry]) => getDetailsGroupingKey(entry.representative, entry.representative.toKey(1, { $autoTier: false, $fusionModel: false })));
+		const entries = Array.from(sourceGroups.values(), entries => ({
+			entries,
+			modifiedCount: sumBy(entries, ([, entry]) => entry.modifiedCount),
+		}))
+			.sort(reverseOrder(compareBy(group => group.modifiedCount, numberComparator)))
+			.slice(0, mode === 'longterm' ? 30 : 10)
+			.flatMap(group => group.entries);
 
 		for (const [, telemetryEntry] of entries) {
 			const repr = telemetryEntry.representative;

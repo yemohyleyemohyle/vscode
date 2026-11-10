@@ -34,54 +34,9 @@ import { AgentHostEditAttributionDeferredError, AgentHostEditAttributionUnknownO
 import { IScmRepoAdapter, ScmAdapter } from '../../browser/telemetry/scmAdapter.js';
 import { IRandomService } from '../../browser/randomService.js';
 import { MutableObservableWorkspace } from './editTelemetry.test.js';
-import type { IRequestEditSurvivalBoundary } from '../../../../../platform/agentHost/common/requestEditSurvival.js';
 
 suite('Edit Source Tracking Windows', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
-
-	const boundary: IRequestEditSurvivalBoundary = {
-		sessionId: 'observing-session', chatId: 'observing-chat', observationRequestId: 'observing-request',
-		observationBoundary: 'requestStart', observationTimestamp: '2026-01-01T00:00:00.000Z',
-	};
-
-	test('request snapshots preserve tracker identities, counters, timers, and natural reports', () => runWithFakedTimers({}, async () => {
-		const context = setup();
-		try {
-			await timeout(10);
-			context.document.applyEdit(StringEditWithReason.replace(context.document.findRange('hello'), 'alpha', chatEdit('author-request')));
-			await timeout(1500);
-			const initial = await context.impl.snapshot(boundary);
-			const repeated = await context.impl.snapshot({ ...boundary, observationBoundary: 'requestEnd' });
-			const naturalReportsBeforeRollover = context.allDetails.length;
-			context.fireFocusTimer(10 * 60 * 1000);
-			await timeout(10);
-			const afterRollover = await context.impl.snapshot(boundary);
-			const byMode = new Map(initial.map(record => [record.mode, record.trackerInstanceId]));
-			assert.deepStrictEqual({
-				initial: initial.map(record => ({
-					mode: record.mode, status: record.status, boundary: record.observationRequestId,
-					document: record.documentUri, sources: record.sources.map(source => ({
-						modelId: source.modelId, retained: source.modifiedCount, delta: source.deltaModifiedCount,
-						author: source.sourceRequestId,
-					})),
-				})),
-				stableIdentities: repeated.every(record => record.trackerInstanceId === byMode.get(record.mode)),
-				naturalReportsBeforeRollover,
-				rollover: afterRollover.map(record => ({ mode: record.mode, same: record.trackerInstanceId === byMode.get(record.mode) })),
-				naturalReports: context.allDetails.map(event => ({ mode: event.mode, retained: event.modifiedCount, delta: event.deltaModifiedCount })),
-			}, {
-				initial: ['10minFocusWindow', '20minFocusWindow', 'longterm'].map(mode => ({
-					mode, status: 'complete', boundary: 'observing-request', document: context.document.uri.toString(),
-					sources: [{ modelId: null, retained: 5, delta: 5, author: 'author-request' }],
-				})),
-				stableIdentities: true, naturalReportsBeforeRollover: 0,
-				rollover: [{ mode: '10minFocusWindow', same: false }, { mode: '20minFocusWindow', same: true }, { mode: 'longterm', same: true }],
-				naturalReports: [{ mode: '10minFocusWindow', retained: 5, delta: 5 }],
-			});
-		} finally {
-			context.disposables.dispose();
-		}
-	}));
 
 	test('both focus windows preserve gross insertions across successive external overwrites', () => runWithFakedTimers({}, async () => {
 		const visible = observableValue('visible', true);
@@ -96,138 +51,16 @@ suite('Edit Source Tracking Windows', () => {
 			}));
 			context.document.applyEdit(diskReloadEdit('abcdef', 'aXef'));
 			await timeout(1500);
-			const snapshots = await context.impl.snapshot(boundary);
 			visible.set(false, undefined);
 			await timeout(10);
 			assert.deepStrictEqual({
-				snapshots: snapshots.filter(record => record.mode !== 'longterm').map(record => ({
-					mode: record.mode, counts: record.sources.map(source => [source.deltaModifiedCount, source.modifiedCount]),
-				})),
 				reports: context.allDetails.filter(event => event.mode !== 'longterm').map(event => ({
 					mode: event.mode, inserted: event.deltaModifiedCount, retained: event.modifiedCount,
 				})),
 			}, {
-				snapshots: ['10minFocusWindow', '20minFocusWindow'].map(mode => ({ mode, counts: [[7, 4]] })),
 				reports: ['10minFocusWindow', '20minFocusWindow'].map(mode => ({ mode, inserted: 7, retained: 4 })),
 			});
 		} finally {
-			context.disposables.dispose();
-		}
-	}));
-
-	test('request snapshots distinguish empty, excluded and unresolved attribution from collection success', () => runWithFakedTimers({}, async () => {
-		const correlation = new TestExternalEditCorrelation();
-		const context = setup(observableValue('visible', true), { createCorrelation: () => correlation, prepareFlush: async () => undefined }, false, '');
-		try {
-			await timeout(10);
-			const project = (records: Awaited<ReturnType<EditSourceTrackingImpl['snapshot']>>) => records.map(record => ({
-				mode: record.mode, status: record.status, complete: record.complete, coverage: record.attributionCoverage,
-				excluded: record.excludedAgentHostObservationCount, sources: record.sources.length,
-			}));
-			const empty = project(await context.impl.snapshot(boundary));
-			context.document.applyEdit(diskReloadEdit('', 'abcdef'));
-			await timeout(1500);
-			const pending = project(await context.impl.snapshot(boundary));
-			correlation.resolve(EditSources.agentHostChatApplyEdits({
-				modelId: 'kimi-k3', sessionId: 'session-1', requestId: 'turn-1', harness: 'copilotcli',
-			}));
-			const resolved = project(await context.impl.snapshot(boundary));
-			const repeated = project(await context.impl.snapshot(boundary));
-			const modes = ['10minFocusWindow', '20minFocusWindow', 'longterm'];
-			const expected = modes.map(mode => ({
-				mode, status: 'complete', complete: true,
-				coverage: mode === 'longterm' ? 'rendererExcludingCorrelatedAgentHost' : 'rendererIncludingCorrelatedAgentHost',
-				excluded: 0, sources: 0,
-			}));
-			assert.deepStrictEqual({ empty, pending, resolved, repeated }, {
-				empty: expected,
-				pending: expected.map(record => ({ ...record, status: 'incomplete', complete: false, sources: record.mode === 'longterm' ? 0 : 1 })),
-				resolved: expected.map(record => ({ ...record, excluded: record.mode === 'longterm' ? 1 : 0, sources: record.mode === 'longterm' ? 0 : 1 })),
-				repeated: resolved,
-			});
-		} finally {
-			context.disposables.dispose();
-		}
-	}));
-
-	test('request snapshots do not create trackers for invisible documents', () => runWithFakedTimers({}, async () => {
-		const visible = observableValue('visible', false);
-		const context = setup(visible);
-		try {
-			await timeout(10);
-			const initial = await context.impl.snapshot(boundary);
-			visible.set(true, undefined);
-			await timeout(10);
-			const opened = await context.impl.snapshot(boundary);
-			visible.set(false, undefined);
-			await timeout(10);
-			const closed = await context.impl.snapshot(boundary);
-			assert.deepStrictEqual({
-				initial: initial.map(record => ({ mode: record.mode, status: record.status, id: record.trackerInstanceId, sources: record.sources })),
-				opened: opened.map(record => ({ mode: record.mode, status: record.status, hasId: record.trackerInstanceId !== null })),
-				closed: closed.map(record => ({ mode: record.mode, status: record.status })),
-			}, {
-				initial: ['10minFocusWindow', '20minFocusWindow', 'longterm'].map(mode => ({ mode, status: 'unavailable', id: null, sources: [] })),
-				opened: ['10minFocusWindow', '20minFocusWindow', 'longterm'].map(mode => ({ mode, status: 'complete', hasId: true })),
-				closed: ['10minFocusWindow', '20minFocusWindow', 'longterm'].map(mode => ({ mode, status: mode === 'longterm' ? 'complete' : 'unavailable' })),
-			});
-		} finally {
-			context.disposables.dispose();
-		}
-	}));
-
-	test('request snapshots report unresolved correlations and trackers disposed during sampling', () => runWithFakedTimers({}, async () => {
-		const correlation = new TestExternalEditCorrelation(true);
-		const context = setup(observableValue('visible', true), { createCorrelation: () => correlation, prepareFlush: async () => undefined });
-		try {
-			await timeout(10);
-			context.document.applyEdit(diskReloadEdit('hello', 'external'));
-			await timeout(1500);
-			const pending = await context.impl.snapshot(boundary);
-			const collecting = context.impl.snapshot(boundary);
-			context.document.dispose();
-			const disposed = await collecting;
-			const afterClose = await context.impl.snapshot(boundary);
-			assert.deepStrictEqual({
-				pending: pending.map(record => ({ status: record.status, complete: record.complete, reason: record.reason })),
-				disposed: disposed.map(record => ({ status: record.status, reason: record.reason, sources: record.sources })),
-				afterClose: afterClose.map(record => ({ status: record.status, reason: record.reason, id: record.trackerInstanceId, document: record.documentUri })),
-			}, {
-				pending: ['10minFocusWindow', '20minFocusWindow', 'longterm'].map(() => ({ status: 'incomplete', complete: false, reason: 'correlationPending' })),
-				disposed: ['10minFocusWindow', '20minFocusWindow', 'longterm'].map(() => ({ status: 'incomplete', reason: 'trackerDisposed', sources: [] })),
-				afterClose: ['10minFocusWindow', '20minFocusWindow', 'longterm'].map(() => ({ status: 'unavailable', reason: 'noActiveTracker', id: null, document: null })),
-			});
-		} finally {
-			context.disposables.dispose();
-		}
-	}));
-
-	test('request snapshots report collection errors without consuming trackers', () => runWithFakedTimers({}, async () => {
-		let fail = true;
-		const correlation = new class extends TestExternalEditCorrelation {
-			override async waitForResolution(): Promise<void> {
-				if (fail) {
-					throw new Error('Correlation collection failed');
-				}
-			}
-		};
-		const context = setup(observableValue('visible', true), { createCorrelation: () => correlation, prepareFlush: async () => undefined });
-		try {
-			await timeout(10);
-			const failed = await context.impl.snapshot(boundary);
-			fail = false;
-			const recovered = await context.impl.snapshot(boundary);
-			assert.deepStrictEqual({
-				failed: failed.map(record => ({ status: record.status, complete: record.complete, reason: record.reason, errors: record.errors, sources: record.sources })),
-				recovered: recovered.map((record, index) => ({ status: record.status, sameTracker: record.trackerInstanceId === failed[index].trackerInstanceId })),
-				naturalReports: context.allDetails.length,
-			}, {
-				failed: [0, 1, 2].map(() => ({ status: 'error', complete: false, reason: 'collectionError', errors: ['Correlation collection failed'], sources: [] })),
-				recovered: [0, 1, 2].map(() => ({ status: 'complete', sameTracker: true })),
-				naturalReports: 0,
-			});
-		} finally {
-			fail = false;
 			context.disposables.dispose();
 		}
 	}));
@@ -311,21 +144,15 @@ suite('Edit Source Tracking Windows', () => {
 			));
 		}
 		await timeout(10);
-		const snapshots = await context.impl.snapshot(boundary);
 		context.headHash.set('hash-2', undefined);
 		await timeout(10);
 
 		assert.deepStrictEqual({
-			sampled: snapshots.map(record => ({ mode: record.mode, count: record.sources.length, first: record.sources[0].sourceKey, last: record.sources.at(-1)?.sourceKey })),
 			count: context.details.length,
 			first: context.details[0].sourceKey,
 			last: context.details.at(-1)?.sourceKey,
 			containsSmallest: context.details.some(event => event.sourceKey === 'source:unknown-name:source-1'),
 		}, {
-			sampled: ['10minFocusWindow', '20minFocusWindow', 'longterm'].map(mode => ({
-				mode, count: mode === 'longterm' ? 30 : 10,
-				first: 'source:unknown-name:source-31', last: `source:unknown-name:source-${mode === 'longterm' ? 2 : 22}`,
-			})),
 			count: 30,
 			first: 'source:unknown-name:source-31',
 			last: 'source:unknown-name:source-2',
@@ -964,7 +791,6 @@ suite('Edit Source Tracking Windows', () => {
 			));
 			await timeout(1500);
 		}
-		const snapshots = await context.impl.snapshot(boundary);
 		visible.set(false, undefined);
 		await timeout(10);
 
@@ -991,15 +817,9 @@ suite('Edit Source Tracking Windows', () => {
 			deltaModifiedCount: chatSessionId !== undefined ? index + 4 : 27,
 		}));
 		assert.deepStrictEqual({
-			snapshots: snapshots.filter(record => record.mode !== 'longterm').map(record => Array.from(record.sources)
-				.sort((a, b) => a.modifiedCount - b.modifiedCount).map(source => ({
-					sourceKey: source.sourceKey, conversationId: source.sourceSessionId,
-					chatSessionId: source.sourceChatId, agentSessionId: source.sourceAgentSessionId,
-					modifiedCount: source.modifiedCount, deltaModifiedCount: source.deltaModifiedCount,
-				}))),
 			short: project('10minFocusWindow'),
 			long: project('20minFocusWindow'),
-		}, { snapshots: [expected.map(({ hasChatSessionId: _hasChat, ...entry }) => entry), expected.map(({ hasChatSessionId: _hasChat, ...entry }) => entry)], short: expected, long: expected });
+		}, { short: expected, long: expected });
 		context.disposables.dispose();
 	}));
 

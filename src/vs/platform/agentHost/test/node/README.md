@@ -22,27 +22,29 @@ The `client plugins across chat launches` suite in [copilotAgent.test.ts](./copi
 ./scripts/test.sh --run src/vs/platform/agentHost/test/node/copilotAgent.test.ts --grep 'client plugins across chat launches|createChat exact-chat provisioning \(import\)|MCP configuration preparation|_resumeSession fallback|customization anchoring|standalone client customizations|the prepared turn awaits' --reporter dot
 ```
 
-The snapshot tests in [agentEditAttributionService.test.ts](./agentEditAttributionService.test.ts) separately verify cumulative counts across successive turns, repeated non-destructive reads, and epoch advancement after an explicit flush. They do not replace a live provider check of runtime refreshes and survival logs.
-
 ## Request-survival model metadata
 
 Outgoing contributions receive the explicit or inherited model selection captured by the send path after selection updates. The survival logger captures that selection's identifier synchronously at the originating boundary and retains it independently of later chat model changes. `baseModel` and `observationModel` describe selections, not provider-resolved executing models; Auto/Fusion remains a selection and unresolved values stay null.
 
-The effective-selection cases in [requestDiffSurvival.test.ts](./requestDiffSurvival.test.ts) cover both line and character records, inherited selection, explicit override, unknown values, Auto/Fusion, and later model changes. The model-selection suite in [agentSideEffects.test.ts](./agentSideEffects.test.ts) verifies that the real send path forwards those facts without changing the outgoing message.
+The effective-selection cases in [requestDiffSurvival.test.ts](./requestDiffSurvival.test.ts) cover character-diff records, inherited selection, explicit override, unknown values, Auto/Fusion, and later model changes. The model-selection suite in [agentSideEffects.test.ts](./agentSideEffects.test.ts) verifies that the real send path forwards those facts without changing the outgoing message.
+
+## Request-survival experiment cadence
+
+With `VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG=1`, `requestCharacterDiffSurvivalObservation` is the sole experimental survival record kind. Schema version 2 emits only at request end: index 0 describes the originating request, and indices 1–10 describe the next ten eligible completed requests in the same chat. `maximumObservationCount` is 11 including the initial record; `maximumFollowUpCount` is 10. Index 10 is final and releases the tracker. Requests without available Git checkpoints do not produce observations. Success, cancellation, and non-resumable errors finalize started requests; resumable errors do not.
+
+For a complete initial observation, the states are `(A, B, B)`, so all original additions and deletions survive. The ratio is 1 for a nonempty edit and null for no net edit. Incomplete results must not be interpreted as valid survival. Subsequent observations compare the original start/end checkpoints directly against the latest end checkpoint. Changes between requests and within the next request are therefore combined.
+
+The original character diff remains in memory until its tracker retires or its chat/session state is evicted. Size budgets and idle/max-age expiry are not implemented. Existing Git checkpoint capture and normal editor/host edit telemetry remain unchanged.
+
+The former `requestDiffSurvivalObservation`, `requestCharacterSurvivalSnapshot`, and `requestFocusWindowSurvivalSnapshot` streams and their exclusive collection work have been removed. No line-diff survival computation or original line-diff payload is retained. Consumers of historical logs must distinguish the old start/end cadence from schema-2 end-only character-diff observations.
 
 ## Request-survival attribution coverage
 
-Every experimental `requestDiffSurvivalObservation` and `requestCharacterDiffSurvivalObservation` includes `originalRequestUsedEditTool`. The contribution collects provider-owned tool outcomes synchronously within the originating request, including parent and nested-subagent tools, and freezes the value at success, cancellation, or non-resumable error. Later observations repeat that value; a resumable error does not finalize it. This field does not filter requests or change the observation horizon, diff metrics, character snapshots, telemetry consent, or experiment opt-in.
+Every experimental `requestCharacterDiffSurvivalObservation` includes `originalRequestUsedEditTool`. The contribution collects provider-owned tool outcomes synchronously within the originating request, including parent and nested-subagent tools, and freezes the value at success, cancellation, or non-resumable error. Later observations repeat that value; a resumable error does not finalize it. This field does not filter requests or change the observation horizon, diff metrics, telemetry consent, or experiment opt-in.
 
 `true` means a recognized native edit tool executed, even if it failed or made no change; terminal-only commands and denied-before-execution invocations do not qualify. Copilot reuses `isEditTool(toolName, command)` and its SDK success/failure outcomes (SDK execution-start events precede permission checks and are not sufficient evidence). Claude reuses `isClaudeFileEditTool` and successful results. `false` means a supported provider finished the observed tool lifecycles without such an attempt. `null` means no positive evidence was available and coverage was insufficient: unsupported providers, client/MCP tools, unfinished calls, ambiguous Copilot outcomes, or Claude edit failures that its result stream cannot distinguish from SDK-owned pre-execution denial. Positive evidence remains `true` despite other unknown calls. No editor/other-source activity flag is collected.
 
 `vscode.toolRequest` preserves the provider's root chat and request identity before subagent routing remaps action turn IDs, so reusable descendants and late outcomes cannot be attributed to a later request. Provider evidence metadata is emitted only under the existing experiment opt-in; protocol action turn IDs remain unchanged. Focused cases in `requestDiffSurvival.test.ts`, `copilotAgentSession.test.ts`, `claudeMapSessionEvents.test.ts`, `copilotToolDisplay.test.ts`, `claudeToolDisplay.test.ts`, and `agentToolCallMeta.test.ts` cover execution classification, metadata validation, queued-checkpoint races, request-end freezing, nested routing, and missing coverage.
-
-Schema version 2 of `requestFocusWindowSurvivalSnapshot` separates collection success (`complete`/`status`) from attribution policy (`attributionCoverage`). Renderer longterm excludes correlated host-owned observations; 10/20-minute windows can reattribute them and are not human-only. `excludedAgentHostObservationCount` counts excluded correlated observations, including zero-survivor observations; it is null when no tracker was sampled. It is not a character count or a unique edit total across snapshots.
-
-The host `requestCharacterSurvivalSnapshot` remains a separate session/chat aggregate. Do not sum it with per-document renderer windows or treat an empty renderer component as zero agent survival. Old schema-1 records lack explicit coverage metadata and must remain legacy/unspecified in consumers. New collection metadata does not change consent, eligibility, suppression, or natural-report ownership.
-
-[requestFocusWindowSurvival.test.ts](./requestFocusWindowSurvival.test.ts) verifies coverage survives management IPC and distinguishes unavailable collection. The workbench `editTracker.test.ts` and `editSourceTrackingImpl.test.ts` suites cover exclusion counts, empty versus suppressed sources, unresolved correlation, and unchanged non-destructive sampling.
 
 ## Request-survival experiment log retention
 

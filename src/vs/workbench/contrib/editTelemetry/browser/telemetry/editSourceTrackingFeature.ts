@@ -28,19 +28,13 @@ import { EDIT_TELEMETRY_DETAILS_SETTING_ID, EDIT_TELEMETRY_SHOW_DECORATIONS, EDI
 import { VSCodeWorkspace } from '../helpers/vscodeObservableWorkspace.js';
 import { IExtensionService } from '../../../../services/extensions/common/extensions.js';
 import { AgentHostEditMarkerService } from './agentHostEditMarkerService.js';
-import type { IRequestEditSurvivalBoundary, IRequestFocusWindowSurvivalSnapshot } from '../../../../../platform/agentHost/common/requestEditSurvival.js';
 
 export class EditTrackingFeature extends Disposable {
-	private readonly _impl: EditSourceTrackingImpl;
 
 	private readonly _editSourceTrackingShowDecorations;
 	private readonly _editSourceTrackingShowStatusBar;
 	private readonly _showStateInMarkdownDoc = 'editTelemetry.showDebugDetails';
 	private readonly _toggleDecorations = 'editTelemetry.toggleDebugDecorations';
-
-	snapshot(boundary: IRequestEditSurvivalBoundary): Promise<readonly IRequestFocusWindowSurvivalSnapshot[]> {
-		return this._impl.snapshot(boundary);
-	}
 
 	constructor(
 		private readonly _workspace: VSCodeWorkspace,
@@ -77,7 +71,6 @@ export class EditTrackingFeature extends Disposable {
 		));
 		const markerService = this._register(instantiationServiceWithInterceptedTelemetry.createInstance(AgentHostEditMarkerService));
 		const impl = this._register(instantiationServiceWithInterceptedTelemetry.createInstance(EditSourceTrackingImpl, shouldSendDetails, this._annotatedDocuments, markerService));
-		this._impl = impl;
 
 		this._register(autorun((reader) => {
 			if (!this._editSourceTrackingShowDecorations.read(reader)) {

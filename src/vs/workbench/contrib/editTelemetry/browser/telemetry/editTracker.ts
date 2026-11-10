@@ -16,16 +16,6 @@ import { IExternalEditCorrelation, IExternalEditCorrelationResolution } from './
 const EXTERNAL_OBSERVATION_KEY_PREFIX = 'external-observation:';
 export type ExternalEditCorrelationPolicy = 'suppress' | 'reattribute';
 
-export interface IEditSourceTrackerSnapshot {
-	readonly correlationPending: boolean;
-	readonly excludedAgentHostObservationCount: number;
-	readonly sources: readonly {
-		readonly representative: TextModelEditSource;
-		readonly modifiedCount: number;
-		readonly deltaModifiedCount: number;
-	}[];
-}
-
 /**
  * Tracks a single document.
 */
@@ -146,34 +136,6 @@ export class DocumentEditSourceTracker<T = void> extends Disposable {
 
 	async waitForQueue(): Promise<void> {
 		await this._doc.waitForQueue();
-	}
-
-	public snapshot(): IEditSourceTrackerSnapshot {
-		const counts = new Map(Array.from(this._sumAddedCharactersPerKey, ([key, deltaModifiedCount]) => [key, {
-			representative: this.getRepresentative(key)!,
-			modifiedCount: 0,
-			deltaModifiedCount,
-		}]));
-		for (const [key, insertedCount] of this._pendingAddedCharactersPerKey) {
-			const entry = counts.get(key) ?? { representative: this.getRepresentative(key)!, modifiedCount: 0, deltaModifiedCount: 0 };
-			entry.deltaModifiedCount += insertedCount;
-			counts.set(key, entry);
-		}
-		const edits = this._edits.compose(this._pendingExternalEdits);
-		for (const replacement of edits.replacements) {
-			const entry = counts.get(replacement.data.key);
-			if (entry) {
-				entry.modifiedCount += replacement.getNewLength();
-			}
-		}
-		return {
-			excludedAgentHostObservationCount: Array.from(this._suppressedExternalObservationIds).filter(id =>
-				counts.has(`${EXTERNAL_OBSERVATION_KEY_PREFIX}${id}`) && !this._shouldIncludeKey(`${EXTERNAL_OBSERVATION_KEY_PREFIX}${id}`, false)).length,
-			correlationPending: Array.from(this._externalObservationIds).some(id =>
-				!this._invalidatedExternalObservationIds.has(id) && !this._suppressedExternalObservationIds.has(id)
-				&& !this._reattributedExternalObservations.has(id) && !this._externalEditCorrelation?.getResolution?.(id)),
-			sources: Array.from(counts).filter(([key]) => this._shouldIncludeKey(key, false)).map(([, entry]) => entry),
-		};
 	}
 
 	public getTotalInsertedCharactersCount(key: string, includeSuppressed = false): number {
