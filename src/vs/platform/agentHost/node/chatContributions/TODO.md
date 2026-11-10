@@ -32,7 +32,7 @@ Both remaining items are defects, not extraction work; the btw/sideChat migratio
 
 ### Mementos
 
-- Add disposable-value semantics only when a contribution needs to store disposables. Memento eviction currently drops observables without disposing their values.
+- Keys can opt into cleanup with the third `dispose(value)` argument to `createChatMementoKey` or `createSessionMementoKey`. Deletion, chat/session eviction, contribution unregistration, and service disposal remove entries before cleaning up their current observable values once; failures are logged without stopping other cleanup. Replacing an observable value does not dispose its previous value, so the contribution owns replacement cleanup.
 - Consider a `chatDisposable` helper only when a real contribution needs it; do not add it speculatively.
 
 ### Future hooks

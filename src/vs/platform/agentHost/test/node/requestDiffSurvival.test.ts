@@ -19,6 +19,7 @@ import { createSessionState, MessageKind, SessionStatus, ToolCallCancellationRea
 import { ActionType, type ChatAction } from '../../common/state/sessionActions.js';
 import { AgentHostStateManager } from '../../node/agentHostStateManager.js';
 import { RequestDiffSurvivalContribution } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalContribution.js';
+import { RequestDiffSurvivalBudgetError, RequestDiffSurvivalInputBudget, requestDiffSurvivalLimits } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalLimits.js';
 import { createNoopGitService } from '../common/sessionTestHelpers.js';
 import { type computeRequestCharacterDiffSurvivalMetric, type IRequestCharacterRepositoryDiff } from '../../node/chatContributions/requestDiffSurvival/requestCharacterDiffSurvival.js';
 
@@ -247,7 +248,7 @@ suite('Agent Host Request Diff Survival', () => {
 					&& baseObservation.baseEndTimestamp === laterObservation.baseEndTimestamp,
 			}, {
 				base: {
-					schemaVersion: 2,
+					schemaVersion: 3,
 					originatingRequestId: 'base-request',
 					observationRequestId: 'base-request',
 					baseModel: 'kimi-k3',
@@ -261,7 +262,7 @@ suite('Agent Host Request Diff Survival', () => {
 					diffKeys: ['files', 'errors'],
 				},
 				later: {
-					schemaVersion: 2,
+					schemaVersion: 3,
 					originatingRequestId: 'base-request',
 					observationRequestId: 'later-request',
 					baseModel: 'kimi-k3',
@@ -422,6 +423,7 @@ suite('Agent Host Request Diff Survival', () => {
 						blobReads++;
 						return missingBlob ? undefined : VSBuffer.fromString(ref === 'before' ? 'base' : 'base中文');
 					},
+					getBlobSize: async (_repository, ref) => VSBuffer.fromString(ref === 'before' ? 'base' : 'base中文').byteLength,
 				},
 				createStateManager(),
 			));
@@ -435,7 +437,7 @@ suite('Agent Host Request Diff Survival', () => {
 				unit: character.unit,
 				complete: character.complete,
 				survival: character.survival,
-				ranges: character.diffs.originalRequest.files[0].plus,
+				ranges: character.diffs!.originalRequest.files[0].plus,
 			}, {
 				blobReads: 2,
 				unit: 'utf16CodeUnit', complete: true,
@@ -453,7 +455,7 @@ suite('Agent Host Request Diff Survival', () => {
 			failure.restore();
 			assert.deepStrictEqual(['character-error', 'blob-error'].map(requestId => {
 				const character = logService.characterObservations.find(record => record.originatingRequestId === requestId && record.observationIndex === 0)!;
-				return { characterComplete: character.complete, hasCharacterErrors: character.diffs.originalRequest.errors.length > 0 };
+				return { characterComplete: character.complete, hasCharacterErrors: character.diffs!.originalRequest.errors.length > 0 };
 			}), [
 				{ characterComplete: false, hasCharacterErrors: true },
 				{ characterComplete: false, hasCharacterErrors: true },
@@ -466,8 +468,283 @@ suite('Agent Host Request Diff Survival', () => {
 			}
 		}
 	});
+	suite('budget safeguards', () => {
+		let previousEnvironmentValue: string | undefined;
+		setup(() => {
+			previousEnvironmentValue = process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG;
+			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG = '1';
+		});
+		teardown(() => {
+			if (previousEnvironmentValue === undefined) {
+				delete process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG;
+			} else {
+				process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG = previousEnvironmentValue;
+			}
+		});
 
+		function fixture(repositories: readonly URI[] = [URI.file('/repo')]) {
+			const context = new TestContributionContext();
+			const log = new RecordingObservationLogService();
+			const git = {
+				...createNoopGitService(),
+				computeFileDiffsBetweenRefs: sinon.stub().resolves([{
+					after: { uri: 'file:///repo/file', content: { uri: 'after' } },
+					diff: { added: 1, removed: 0 },
+				}]),
+				getBlobSize: sinon.stub().resolves(2),
+				showBlob: sinon.stub().resolves(VSBuffer.fromString('ab')),
+			};
+			const contribution = disposables.add(new RequestDiffSurvivalContribution(context, log, {
+				...NULL_CHECKPOINT_SERVICE,
+				getTurnStartCheckpointState: async (_session, _chat, turnId) => repositories.map(repository => ({ repository, tree: `${turnId}-start` })),
+				waitForTurnCheckpointPair: async (_session, _chat, turnId) => ({ parent: `${turnId}-start`, current: `${turnId}-end` }),
+			}, git, createStateManager()));
+			const begin = (turnId: string, chat = 'chat') => {
+				contribution.onOutgoingTurn({ session: 'session', chat, turnId, message: { text: 'request', origin: { kind: MessageKind.User } } });
+				contribution.onTurnEnd({ session: 'session', channel: chat, turnId, reason: { kind: 'success' } });
+			};
+			const end = async (turnId: string, chat = 'chat') => {
+				const ended = log.whenRequestEnds(turnId);
+				begin(turnId, chat);
+				await ended;
+			};
+			return { context, log, git, contribution, begin, end };
+		}
 
+		function terminalShape(record: IRecordedCharacterObservation) {
+			return {
+				status: record.status, complete: record.complete, final: record.isFinalObservation,
+				flags: [record.fileInputBudgetExceeded, record.observationInputBudgetExceeded, record.retainedDiffBudgetExceeded],
+				survival: Object.values(record.survival), hasDiffs: Object.hasOwn(record, 'diffs'),
+			};
+		}
+
+		const terminal = {
+			status: 'budgetExceeded', complete: false, final: true,
+			survival: [-1, -1, -1, -1, -1, -1, -1], hasDiffs: false,
+		};
+
+		test('allows the exact production input limits, rejects one byte over, and reports both confirmed violations', () => {
+			const budget = new RequestDiffSurvivalInputBudget();
+			for (let index = 0; index < 8; index++) {
+				budget.consume(512 * 1024);
+			}
+			assert.throws(() => budget.consume(512 * 1024 + 1), error => {
+				assert.ok(error instanceof RequestDiffSurvivalBudgetError);
+				assert.deepStrictEqual({
+					file: error.fileInputBudgetExceeded, observation: error.observationInputBudgetExceeded,
+					retained: error.retainedDiffBudgetExceeded, diagnostics: error.diagnostics,
+				}, {
+					file: true, observation: true, retained: false,
+					diagnostics: { fileInputBytes: 512 * 1024 + 1, observationInputBytes: 4 * 1024 * 1024 + 512 * 1024 + 1 },
+				});
+				return true;
+			});
+		});
+
+		test('rejects initial file input before reading blobs or computing character diffs', async () => {
+			const f = fixture();
+			f.git.getBlobSize.resolves(requestDiffSurvivalLimits.maximumFileInputBytes + 1);
+			const lcs = sinon.spy(LcsDiff.prototype, 'ComputeDiff');
+			await f.end('oversized');
+			assert.deepStrictEqual({
+				record: terminalShape(f.log.characterObservations[0]), reads: f.git.showBlob.callCount, computations: lcs.callCount,
+			}, { record: { ...terminal, flags: [1, 0, 0] }, reads: 0, computations: 0 });
+		});
+
+		test('rejects the first byte past the cumulative observation limit', () => {
+			const budget = new RequestDiffSurvivalInputBudget();
+			for (let index = 0; index < 8; index++) {
+				budget.consume(512 * 1024);
+			}
+			assert.throws(() => budget.consume(1), error =>
+				error instanceof RequestDiffSurvivalBudgetError && !error.fileInputBudgetExceeded && error.observationInputBudgetExceeded
+				&& error.diagnostics.observationInputBytes === 4 * 1024 * 1024 + 1);
+		});
+
+		test('sums repeated input across both follow-up comparisons and permanently retires the origin', async () => {
+			sinon.stub(requestDiffSurvivalLimits, 'maximumFileInputBytes').value(2);
+			sinon.stub(requestDiffSurvivalLimits, 'maximumObservationInputBytes').value(3);
+			const f = fixture();
+			await f.end('base');
+			await f.end('later');
+			await f.end('last');
+			assert.deepStrictEqual({
+				base: f.log.characterObservations.filter(record => record.originatingRequestId === 'base').map(record => ({
+					index: record.observationIndex, status: record.status,
+				})),
+				terminal: terminalShape(f.log.characterObservations[1]),
+				diagnostics: f.log.characterObservations[1].budgetDiagnostics,
+				comparisons: f.git.computeFileDiffsBetweenRefs.callCount,
+				reads: f.git.showBlob.callCount,
+			}, {
+				base: [{ index: 0, status: 'measured' }, { index: 1, status: 'budgetExceeded' }],
+				terminal: { ...terminal, flags: [0, 1, 0] },
+				diagnostics: { fileInputBytes: 2, observationInputBytes: 4 },
+				comparisons: 7, reads: 5,
+			});
+		});
+
+		test('allows combined before/after input exactly at the file limit', async () => {
+			sinon.stub(requestDiffSurvivalLimits, 'maximumFileInputBytes').value(4);
+			sinon.stub(requestDiffSurvivalLimits, 'maximumObservationInputBytes').value(4);
+			const f = fixture();
+			f.git.computeFileDiffsBetweenRefs.resolves([{
+				before: { uri: 'file:///repo/file', content: { uri: 'before' } },
+				after: { uri: 'file:///repo/file', content: { uri: 'after' } },
+				diff: { added: 1, removed: 1 },
+			}]);
+			await f.end('exact');
+			assert.deepStrictEqual({
+				status: f.log.characterObservations[0].status, complete: f.log.characterObservations[0].complete, reads: f.git.showBlob.callCount,
+			}, { status: 'measured', complete: true, reads: 2 });
+		});
+
+		test('shares retained admission across chats, accepts equality, and releases on eviction', async () => {
+			const path = `${URI.file('/repo').toString()}#file`;
+			const retainedBytes = 256 + 256 + 4 + 2 * path.length + 128 + 2 * (path.length + 2);
+			sinon.stub(requestDiffSurvivalLimits, 'maximumRetainedDiffBytes').value(retainedBytes);
+			const f = fixture();
+			await f.end('first', 'first-chat');
+			await f.end('rejected', 'second-chat');
+			f.context.evict('first-chat');
+			await f.end('admitted', 'third-chat');
+			assert.deepStrictEqual({
+				statuses: f.log.characterObservations.map(record => record.status),
+				rejected: terminalShape(f.log.characterObservations[1]),
+			}, {
+				statuses: ['measured', 'budgetExceeded', 'measured'],
+				rejected: { ...terminal, flags: [0, 0, 1] },
+			});
+		});
+
+		test('rolls back partial retained construction when reserving a change exceeds the limit', async () => {
+			const path = `${URI.file('/repo').toString()}#file`;
+			const retainedBytes = 256 + 256 + 4 + 2 * path.length + 128 + 2 * (path.length + 2);
+			sinon.stub(requestDiffSurvivalLimits, 'maximumRetainedDiffBytes').value(retainedBytes - 1);
+			const f = fixture();
+			await f.end('rejected');
+			f.git.computeFileDiffsBetweenRefs.resolves([]);
+			await f.end('empty', 'another-chat');
+			assert.deepStrictEqual({
+				statuses: f.log.characterObservations.map(record => record.status),
+				rejected: terminalShape(f.log.characterObservations[0]),
+				reads: f.git.showBlob.callCount,
+				proposed: f.log.characterObservations[0].budgetDiagnostics?.proposedRetainedDiffBytes,
+			}, {
+				statuses: ['budgetExceeded', 'measured'], rejected: { ...terminal, flags: [0, 0, 1] }, reads: 1,
+				proposed: retainedBytes,
+			});
+		});
+
+		test('concurrent chats reserve against one host-wide counter', async () => {
+			const path = `${URI.file('/repo').toString()}#file`;
+			sinon.stub(requestDiffSurvivalLimits, 'maximumRetainedDiffBytes').value(256 + 256 + 4 + 2 * path.length + 128 + 2 * (path.length + 2));
+			const f = fixture();
+			const gate = new DeferredPromise<number>();
+			const ready = new DeferredPromise<void>();
+			let lookups = 0;
+			f.git.getBlobSize.callsFake(() => {
+				if (++lookups === 2) {
+					ready.complete();
+				}
+				return gate.p;
+			});
+			const first = f.end('first', 'one');
+			const second = f.end('second', 'two');
+			await ready.p;
+			await gate.complete(2);
+			await Promise.all([first, second]);
+			assert.deepStrictEqual(f.log.characterObservations.map(record => record.status).sort(), ['budgetExceeded', 'measured']);
+		});
+
+		test('eviction cancels in-flight work, releases reservations and cannot recreate old state', async () => {
+			const path = `${URI.file('/repo').toString()}#file`;
+			sinon.stub(requestDiffSurvivalLimits, 'maximumRetainedDiffBytes').value(256 + 256 + 4 + 2 * path.length + 128 + 2 * (path.length + 2));
+			const f = fixture();
+			const gate = new DeferredPromise<VSBuffer>();
+			const reading = new DeferredPromise<void>();
+			f.git.showBlob.callsFake(() => {
+				reading.complete();
+				return gate.p;
+			});
+			f.begin('evicted');
+			await reading.p;
+			f.begin('queued-before-eviction');
+			f.context.evict('chat');
+			await gate.complete(VSBuffer.fromString('ab'));
+			f.git.showBlob.resolves(VSBuffer.fromString('ab'));
+			await f.end('fresh');
+			assert.deepStrictEqual(f.log.characterObservations.map(record => ({
+				origin: record.originatingRequestId, status: record.status,
+			})), [{ origin: 'fresh', status: 'measured' }]);
+		});
+
+		test('missing size metadata produces an explicit incomplete observation, never a zero-size fallback', async () => {
+			const f = fixture();
+			f.git.getBlobSize.resolves(undefined);
+			await f.end('missing');
+			const record = f.log.characterObservations[0];
+			assert.deepStrictEqual({
+				status: record.status, complete: record.complete, reads: f.git.showBlob.callCount, errors: record.diffs?.originalRequest.errors,
+			}, {
+				status: 'measured', complete: false, reads: 0,
+				errors: ['Failed to materialize file:///repo/file: Unable to read Git blob size'],
+			});
+		});
+
+		test('accumulates initial input over files and stops before reading the violating file', async () => {
+			sinon.stub(requestDiffSurvivalLimits, 'maximumObservationInputBytes').value(5);
+			const f = fixture();
+			f.git.computeFileDiffsBetweenRefs.resolves(['one', 'two', 'three'].map(name => ({
+				after: { uri: `file:///repo/${name}`, content: { uri: 'after' } },
+				diff: { added: 1, removed: 0 },
+			})));
+			await f.end('multiple-files');
+			assert.deepStrictEqual({
+				record: terminalShape(f.log.characterObservations[0]), reads: f.git.showBlob.callCount,
+				diagnostics: f.log.characterObservations[0].budgetDiagnostics,
+			}, {
+				record: { ...terminal, flags: [0, 1, 0] }, reads: 2,
+				diagnostics: { fileInputBytes: 2, observationInputBytes: 6 },
+			});
+		});
+
+		test('uses the same observation allowance across repository boundaries', async () => {
+			sinon.stub(requestDiffSurvivalLimits, 'maximumObservationInputBytes').value(3);
+			const f = fixture([URI.file('/repo'), URI.file('/other-repo')]);
+			f.git.computeFileDiffsBetweenRefs.callsFake(async (repository: URI) => [{
+				after: { uri: URI.joinPath(repository, 'file').toString(), content: { uri: 'after' } },
+				diff: { added: 1, removed: 0 },
+			}]);
+			await f.end('multiple-repositories');
+			assert.deepStrictEqual({
+				record: terminalShape(f.log.characterObservations[0]), reads: f.git.showBlob.callCount,
+				repositories: f.git.computeFileDiffsBetweenRefs.callCount,
+			}, { record: { ...terminal, flags: [0, 1, 0] }, reads: 1, repositories: 2 });
+		});
+
+		test('releases retained bytes at the follow-up horizon before admitting the next origin', async () => {
+			sinon.stub(requestDiffSurvivalLimits, 'maximumFollowUpCount').value(1);
+			const path = `${URI.file('/repo').toString()}#file`;
+			sinon.stub(requestDiffSurvivalLimits, 'maximumRetainedDiffBytes').value(256 + 256 + 4 + 2 * path.length + 128 + 2 * (path.length + 2));
+			const f = fixture();
+			const fileDiffs = f.git.computeFileDiffsBetweenRefs;
+			fileDiffs.callsFake(async (_repository: URI, options: { fromRef: string; toRef: string }) =>
+				options.fromRef.replace('-start', '') === options.toRef.replace('-end', '') ? [{
+					after: { uri: 'file:///repo/file', content: { uri: 'after' } }, diff: { added: 1, removed: 0 },
+				}] : []);
+			await f.end('first');
+			await f.end('second');
+			assert.deepStrictEqual(f.log.characterObservations.map(record => ({
+				origin: record.originatingRequestId, status: record.status, index: record.observationIndex, final: record.isFinalObservation,
+			})), [
+				{ origin: 'first', status: 'measured', index: 0, final: false },
+				{ origin: 'first', status: 'measured', index: 1, final: true },
+				{ origin: 'second', status: 'measured', index: 0, final: false },
+			]);
+		});
+	});
 });
 
 function observationShape(observation: {
@@ -536,14 +813,19 @@ interface IRecordedObservation {
 	readonly baseEndTimestamp: string;
 	readonly observationTimestamp: string;
 	readonly observationBoundary: string;
-	readonly diffs: { readonly originalRequest: object };
+	readonly diffs?: { readonly originalRequest: object };
 }
 
 interface IRecordedCharacterObservation extends IRecordedObservation {
 	readonly unit: string;
 	readonly complete: boolean;
 	readonly survival: ReturnType<typeof computeRequestCharacterDiffSurvivalMetric>;
-	readonly diffs: {
+	readonly status: 'measured' | 'budgetExceeded';
+	readonly fileInputBudgetExceeded: number;
+	readonly observationInputBudgetExceeded: number;
+	readonly retainedDiffBudgetExceeded: number;
+	readonly budgetDiagnostics?: RequestDiffSurvivalBudgetError['diagnostics'];
+	readonly diffs?: {
 		readonly originalRequest: IRequestCharacterRepositoryDiff;
 		readonly baselineToLatest: IRequestCharacterRepositoryDiff;
 		readonly requestResultToLatest: IRequestCharacterRepositoryDiff;
@@ -579,6 +861,7 @@ type MementoSegment = string | boolean | number;
 class TestContributionContext implements IAgentHostChatContributionContext {
 	readonly contributionId = RequestDiffSurvivalContribution.id;
 	private readonly _values = new Map<string, ISettableObservable<unknown>>();
+	private readonly _cleanups = new Map<string, { resource: ProtocolURI; dispose: () => void }>();
 
 	memento<T, TExtra extends readonly MementoSegment[]>(
 		key: IChatMementoKey<T, TExtra> | ISessionMementoKey<T, TExtra>,
@@ -592,6 +875,7 @@ class TestContributionContext implements IAgentHostChatContributionContext {
 		}
 		const value = observableValue(this, key.create());
 		this._values.set(identity, value as ISettableObservable<unknown>);
+		this._cleanups.set(identity, { resource, dispose: () => key.dispose?.(value.get()) });
 		return value;
 	}
 
@@ -600,6 +884,20 @@ class TestContributionContext implements IAgentHostChatContributionContext {
 		resource: ProtocolURI,
 		...extra: TExtra
 	): void {
-		this._values.delete(JSON.stringify([key.scope, key.debugName, resource, ...extra]));
+		const identity = JSON.stringify([key.scope, key.debugName, resource, ...extra]);
+		const cleanup = this._cleanups.get(identity);
+		this._values.delete(identity);
+		this._cleanups.delete(identity);
+		cleanup?.dispose();
+	}
+
+	evict(resource: ProtocolURI): void {
+		for (const [identity, cleanup] of this._cleanups) {
+			if (cleanup.resource === resource) {
+				this._values.delete(identity);
+				this._cleanups.delete(identity);
+				cleanup.dispose();
+			}
+		}
 	}
 }

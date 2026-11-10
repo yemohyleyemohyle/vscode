@@ -13,7 +13,12 @@ import type { IAgentHostChatContribution, IAgentHostChatContributionContext, IAg
 import { isAhpChatChannel, type Turn, type URI as ProtocolURI } from '../common/state/sessionState.js';
 
 type MementoKeySegment = string | boolean | number;
-type MementoMap = NKeyMap<ISettableObservable<unknown>, [ProtocolURI, string, ...MementoKeySegment[]]>;
+interface IMemento {
+	readonly value: ISettableObservable<unknown>;
+	readonly dispose: (() => void) | undefined;
+}
+
+type MementoMap = NKeyMap<IMemento, [ProtocolURI, string, ...MementoKeySegment[]]>;
 
 interface IRegisteredContribution {
 	readonly id: string;
@@ -22,22 +27,31 @@ interface IRegisteredContribution {
 	readonly index: number;
 }
 
-class AgentHostChatContributionContext implements IAgentHostChatContributionContext {
+class AgentHostChatContributionContext implements IAgentHostChatContributionContext, IDisposable {
 	private readonly _chatMementos: MementoMap = new NKeyMap();
 	private readonly _sessionMementos: MementoMap = new NKeyMap();
 	private readonly _chatsBySession = new Map<ProtocolURI, Set<ProtocolURI>>();
+	private _isDisposed = false;
 
 	/** `chatOwners` is maintained by the contributions service from the session the host passes with every hook. */
-	constructor(readonly contributionId: string, private readonly _chatOwners: ReadonlyMap<ProtocolURI, ProtocolURI>) { }
+	constructor(
+		readonly contributionId: string,
+		private readonly _chatOwners: ReadonlyMap<ProtocolURI, ProtocolURI>,
+		private readonly _logService: ILogService,
+	) { }
 
 	memento<T, TExtra extends readonly MementoKeySegment[]>(key: IChatMementoKey<T, TExtra> | ISessionMementoKey<T, TExtra>, resource: ProtocolURI, ...extra: TExtra): ISettableObservable<T> {
+		if (this._isDisposed) {
+			throw new Error(`Chat contribution context disposed: ${this.contributionId}`);
+		}
 		const mementos = key.scope === 'chat' ? this._chatMementos : this._sessionMementos;
-		const existing = mementos.get(resource, key.debugName, ...extra) as ISettableObservable<T> | undefined;
+		const existing = mementos.get(resource, key.debugName, ...extra);
 		if (existing) {
-			return existing;
+			return existing.value as ISettableObservable<T>;
 		}
 		const memento = observableValue(this, key.create());
-		mementos.set(memento, resource, key.debugName, ...extra);
+		const dispose = key.dispose;
+		mementos.set({ value: memento, dispose: dispose ? () => dispose(memento.get()) : undefined }, resource, key.debugName, ...extra);
 		if (key.scope === 'chat') {
 			this._registerChat(resource);
 		}
@@ -46,26 +60,56 @@ class AgentHostChatContributionContext implements IAgentHostChatContributionCont
 
 	deleteMemento<T, TExtra extends readonly MementoKeySegment[]>(key: IChatMementoKey<T, TExtra> | ISessionMementoKey<T, TExtra>, resource: ProtocolURI, ...extra: TExtra): void {
 		const mementos = key.scope === 'chat' ? this._chatMementos : this._sessionMementos;
+		const memento = mementos.get(resource, key.debugName, ...extra);
 		mementos.delete(resource, key.debugName, ...extra);
+		if (memento) {
+			this._disposeMementos([memento]);
+		}
 	}
 
 	disposeChatState(chat: ProtocolURI): void {
-		this._chatMementos.deleteAll(chat);
+		const mementos = this._takeMementos(this._chatMementos, chat);
 		for (const [session, chats] of this._chatsBySession) {
 			if (chats.delete(chat) && chats.size === 0) {
 				this._chatsBySession.delete(session);
 			}
 		}
+		this._disposeMementos(mementos);
 	}
 
 	disposeSessionState(session: ProtocolURI): void {
-		this._sessionMementos.deleteAll(session);
+		const mementos = this._takeMementos(this._sessionMementos, session);
 		const chats = this._chatsBySession.get(session);
 		if (chats) {
 			for (const chat of chats) {
-				this._chatMementos.deleteAll(chat);
+				mementos.push(...this._takeMementos(this._chatMementos, chat));
 			}
 			this._chatsBySession.delete(session);
+		}
+		this._disposeMementos(mementos);
+	}
+
+	dispose(): void {
+		this._isDisposed = true;
+		const mementos = [...this._takeMementos(this._chatMementos), ...this._takeMementos(this._sessionMementos)];
+		this._chatsBySession.clear();
+		this._disposeMementos(mementos);
+	}
+
+	private _takeMementos(mementos: MementoMap, resource?: ProtocolURI): IMemento[] {
+		const keys: [] | [ProtocolURI] = resource === undefined ? [] : [resource];
+		const removed = [...mementos.getAll(...keys)];
+		mementos.deleteAll(...keys);
+		return removed;
+	}
+
+	private _disposeMementos(mementos: readonly IMemento[]): void {
+		for (const memento of mementos) {
+			try {
+				memento.dispose?.();
+			} catch (err) {
+				this._logService.error(`[AgentHostChatContributions] Contribution '${this.contributionId}' failed to dispose memento: ${err instanceof Error ? err.message : String(err)}`, err);
+			}
 		}
 	}
 
@@ -109,11 +153,12 @@ export class AgentHostChatContributions extends Disposable implements IAgentHost
 				throw new Error(`Chat contribution already registered: ${contributionCtor.id}`);
 			}
 		}
-		const context = new AgentHostChatContributionContext(contributionCtor.id, this._chatOwners);
+		const context = new AgentHostChatContributionContext(contributionCtor.id, this._chatOwners, this._logService);
 		const contribution = this._instantiationService.createInstance(contributionCtor, context);
 		this._registeredContributions.set(contribution, { id: contributionCtor.id, contribution, context, index: this._nextContributionIndex++ });
 		this._contributionRegistrations.set(contribution, toDisposable(() => {
 			this._registeredContributions.delete(contribution);
+			context.dispose();
 			contribution.dispose();
 		}));
 		return toDisposable(() => this._contributionRegistrations.deleteAndDispose(contribution));

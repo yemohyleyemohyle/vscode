@@ -415,6 +415,9 @@ export interface IAgentHostGitService {
 	 */
 	showBlob(workingDirectory: URI, ref: string, repoRelativePath: string): Promise<VSBuffer | undefined>;
 
+	/** Reads a Git object's uncompressed size without loading its contents. */
+	getBlobSize(workingDirectory: URI, ref: string, repoRelativePath: string): Promise<number | undefined>;
+
 	// ---- Checkpoint plumbing (used by IAgentHostCheckpointService) -------
 
 	/**

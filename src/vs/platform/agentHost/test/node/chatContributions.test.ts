@@ -1502,6 +1502,135 @@ suite('AgentHostChatContributions', () => {
 		assert.throws(() => contributions.registerContribution(FirstMementoContribution), /already registered/);
 	});
 
+	test('memento cleanup deletes only the selected entry before invoking its callback once', () => {
+		const cleaned: number[] = [];
+		disposables.add(createContributions(disposables, FirstMementoContribution, SecondMementoContribution));
+		const context = FirstMementoContribution.context!;
+		const chat = 'agent-host-chat://cleanup';
+		const key = createChatMementoKey<number, [messageId: string, retry: number, active: boolean]>('cleanup', () => 0, value => {
+			cleaned.push(value);
+			context.deleteMemento(key, chat, 'drop', 1, true);
+		});
+		context.memento(key, chat, 'drop', 1, true).set(1, undefined);
+		context.memento(key, chat, 'keep', 1, true).set(2, undefined);
+		context.memento(key, chat, 'drop', 2, true).set(3, undefined);
+		context.memento(key, chat, 'drop', 1, false).set(4, undefined);
+		SecondMementoContribution.context!.memento(key, chat, 'drop', 1, true).set(5, undefined);
+
+		context.deleteMemento(key, chat, 'drop', 1, true);
+		context.deleteMemento(key, chat, 'drop', 1, true);
+
+		assert.deepStrictEqual({
+			cleaned,
+			retained: [
+				context.memento(key, chat, 'keep', 1, true).get(),
+				context.memento(key, chat, 'drop', 2, true).get(),
+				context.memento(key, chat, 'drop', 1, false).get(),
+				SecondMementoContribution.context!.memento(key, chat, 'drop', 1, true).get(),
+			],
+		}, { cleaned: [1], retained: [2, 3, 4, 5] });
+	});
+
+	test('memento cleanup owns only the current observable value on chat eviction', () => {
+		const cleaned: string[] = [];
+		const key = createChatMementoKey('cleanup', () => 'initial', value => cleaned.push(value));
+		const contributions = disposables.add(createContributions(disposables, FirstMementoContribution));
+		const context = FirstMementoContribution.context!;
+		const chat = 'agent-host-chat://cleanup';
+		const memento = context.memento(key, chat);
+		memento.set('replacement', undefined);
+		context.memento(key, 'agent-host-chat://retained');
+		assert.deepStrictEqual(cleaned, []);
+
+		contributions.disposeChatState(chat);
+		contributions.disposeChatState(chat);
+		memento.set('detached', undefined);
+
+		assert.deepStrictEqual(cleaned, ['replacement']);
+	});
+
+	test('memento cleanup evicts session and owned chats before running any callbacks', () => {
+		const cleaned: string[] = [];
+		const contributions = disposables.add(createContributions(disposables, FirstMementoContribution));
+		const context = FirstMementoContribution.context!;
+		const session = 'agent-host-session://cleanup';
+		const firstChat = buildChatUri(session, 'first');
+		const secondChat = buildChatUri(session, 'second');
+		const chatKey = createChatMementoKey<string, [messageId: string]>('cleanup', () => '', value => cleaned.push(value));
+		const sessionKey = createSessionMementoKey('cleanup', () => 'session', value => {
+			cleaned.push(value);
+			contributions.disposeSessionState(session);
+			context.deleteMemento(chatKey, firstChat, 'one');
+		});
+		for (const chat of [firstChat, secondChat]) {
+			contributions.turnEnd({ session, channel: chat, turnId: 'turn', reason: { kind: 'success' } });
+		}
+		context.memento(sessionKey, session);
+		context.memento(chatKey, firstChat, 'one').set('first', undefined);
+		context.memento(chatKey, secondChat, 'two').set('second', undefined);
+		context.memento(chatKey, 'agent-host-chat://retained', 'one').set('retained', undefined);
+		context.memento(sessionKey, 'agent-host-session://retained').set('retained-session', undefined);
+
+		contributions.disposeSessionState(session);
+		contributions.disposeSessionState(session);
+
+		assert.deepStrictEqual(cleaned, ['session', 'first', 'second']);
+	});
+
+	test('memento cleanup runs once on contribution unregistration and service disposal', () => {
+		const cleaned: string[] = [];
+		const chatKey = createChatMementoKey('cleanup', () => 'chat', value => cleaned.push(value));
+		const sessionKey = createSessionMementoKey('cleanup', () => 'session', value => cleaned.push(value));
+		const contributions = disposables.add(createContributions(disposables));
+		const registration = disposables.add(contributions.registerContribution(FirstMementoContribution));
+		const first = FirstMementoContribution.context!;
+		first.memento(chatKey, 'agent-host-chat://cleanup');
+		first.memento(sessionKey, 'agent-host-session://cleanup');
+
+		registration.dispose();
+		registration.dispose();
+		disposables.add(contributions.registerContribution(SecondMementoContribution));
+		const second = SecondMementoContribution.context!;
+		second.memento(chatKey, 'agent-host-chat://cleanup').set('second-chat', undefined);
+		second.memento(sessionKey, 'agent-host-session://cleanup').set('second-session', undefined);
+		contributions.dispose();
+		contributions.dispose();
+		first.deleteMemento(chatKey, 'agent-host-chat://cleanup');
+		second.deleteMemento(sessionKey, 'agent-host-session://cleanup');
+
+		assert.deepStrictEqual(cleaned, ['chat', 'session', 'second-chat', 'second-session']);
+	});
+
+	test('memento cleanup logs failures without blocking other values or contributions', () => {
+		const cleaned: string[] = [];
+		const errors: string[] = [];
+		const logService = new class extends NullLogService {
+			override error(message: string | Error): void {
+				errors.push(String(message));
+			}
+		};
+		const instantiationService = disposables.add(new InstantiationService(new ServiceCollection([ILogService, logService]), true));
+		const contributions = disposables.add(new AgentHostChatContributions(logService, instantiationService));
+		disposables.add(contributions.registerContribution(FirstMementoContribution));
+		disposables.add(contributions.registerContribution(SecondMementoContribution));
+		const failing = createChatMementoKey('failing', () => 'failure', value => {
+			cleaned.push(value);
+			throw new Error('cleanup failed');
+		});
+		const succeeding = createSessionMementoKey('succeeding', () => 'success', value => cleaned.push(value));
+		FirstMementoContribution.context!.memento(failing, 'agent-host-chat://cleanup');
+		FirstMementoContribution.context!.memento(succeeding, 'agent-host-session://cleanup');
+		SecondMementoContribution.context!.memento(succeeding, 'agent-host-session://cleanup').set('second', undefined);
+
+		contributions.dispose();
+		contributions.dispose();
+
+		assert.deepStrictEqual({ cleaned, errors }, {
+			cleaned: ['failure', 'success', 'second'],
+			errors: ['[AgentHostChatContributions] Contribution \'firstMemento\' failed to dispose memento: cleanup failed'],
+		});
+	});
+
 	test('distinguishes memento extra key segments and evicts chat state', () => {
 		const keyed = createChatMementoKey<number, [messageId: string, retry: number]>('keyed', () => 0);
 		const contributions = disposables.add(createContributions(disposables, FirstMementoContribution));

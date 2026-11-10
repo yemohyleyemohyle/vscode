@@ -44,6 +44,7 @@ export class TestAgentHostGitService implements IAgentHostGitService {
 	computeSessionFileDiffs(...args: Parameters<IAgentHostGitService['computeSessionFileDiffs']>) { return defaultGitService.computeSessionFileDiffs(...args); }
 	resolveBranchBaselineCommit(...args: Parameters<IAgentHostGitService['resolveBranchBaselineCommit']>) { return defaultGitService.resolveBranchBaselineCommit(...args); }
 	showBlob(...args: Parameters<IAgentHostGitService['showBlob']>) { return defaultGitService.showBlob(...args); }
+	getBlobSize(...args: Parameters<IAgentHostGitService['getBlobSize']>) { return defaultGitService.getBlobSize(...args); }
 	captureWorkingTreeAsTree(...args: Parameters<IAgentHostGitService['captureWorkingTreeAsTree']>) { return defaultGitService.captureWorkingTreeAsTree(...args); }
 	commitTree(...args: Parameters<IAgentHostGitService['commitTree']>) { return defaultGitService.commitTree(...args); }
 	updateRef(...args: Parameters<IAgentHostGitService['updateRef']>) { return defaultGitService.updateRef(...args); }
@@ -96,6 +97,7 @@ export function createNoopGitService(): IAgentHostGitService {
 		computeSessionFileDiffs: async () => undefined,
 		resolveBranchBaselineCommit: async () => undefined,
 		showBlob: async () => undefined,
+		getBlobSize: async () => undefined,
 		captureWorkingTreeAsTree: async () => undefined,
 		commitTree: async () => undefined,
 		updateRef: async () => { },

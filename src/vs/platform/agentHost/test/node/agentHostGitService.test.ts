@@ -4,6 +4,11 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import { execFile } from 'child_process';
+import * as fs from 'fs/promises';
+import * as os from 'os';
+import * as path from '../../../../base/common/path.js';
+import { promisify } from 'util';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { AgentHostGitService, canRestageOntoIndexCopy, formatGitError, getRemoteTrackingRef, GitCheckoutProgressParser, isRetryableWorktreeRemovalError, parseChangedPaths, parseDefaultBranchRef, parseDefaultRemoteBranchRef, parseFetchRemoteUrls, parseGitDiffRawNumstat, parseGitHubRepoFromRemote, parseGitStatusV2, parseGitWorktrees, parseHasGitHubRemote, parseSingleLsTreeEntry, parseUntrackedPaths, summarizeStderrForError } from '../../node/agentHostGitService.js';
 import { buildGitBlobUri } from '../../node/gitDiffContent.js';
@@ -18,6 +23,29 @@ import { NullLogService } from '../../../log/common/log.js';
 
 suite('AgentHostGitService', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
+
+	test('reads Git blob byte sizes without materializing content, including empty and unusual paths', async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'vscode-survival-blob-size-'));
+		const gitCommand = promisify(execFile);
+		try {
+			await gitCommand('git', ['init', '--quiet'], { cwd: directory });
+			const name = 'unicode space\nfile';
+			await fs.writeFile(path.join(directory, name), '中文');
+			await fs.writeFile(path.join(directory, 'empty'), '');
+			await gitCommand('git', ['add', '--', name, 'empty'], { cwd: directory });
+			const { stdout } = await gitCommand('git', ['write-tree'], { cwd: directory });
+			const service = new AgentHostGitService(new class extends mock<IFileService>() { }(), new class extends mock<INativeEnvironmentService>() { }(), new NullLogService());
+			const repository = URI.file(directory);
+			const ref = stdout.trim();
+			assert.deepStrictEqual(await Promise.all([
+				service.getBlobSize(repository, ref, name),
+				service.getBlobSize(repository, ref, 'empty'),
+				service.getBlobSize(repository, ref, 'missing'),
+			]), [6, 0, undefined]);
+		} finally {
+			await fs.rm(directory, { recursive: true, force: true });
+		}
+	});
 
 	test('parses managed inventory branches and unquoted paths without splitting embedded newlines', () => {
 		const path = '/repo.worktrees/path with\n"quotes"';

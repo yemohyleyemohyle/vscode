@@ -214,6 +214,8 @@ export interface IChatMementoKey<T, TExtra extends MementoKeySegments> {
 	readonly scope: 'chat';
 	readonly debugName: string;
 	readonly create: () => T;
+	/** Cleans up the current value on deletion or eviction, not values replaced through the observable. */
+	readonly dispose?: (value: T) => void;
 	readonly _extra?: TExtra;
 }
 
@@ -221,21 +223,24 @@ export interface ISessionMementoKey<T, TExtra extends MementoKeySegments> {
 	readonly scope: 'session';
 	readonly debugName: string;
 	readonly create: () => T;
+	/** Cleans up the current value on deletion or eviction, not values replaced through the observable. */
+	readonly dispose?: (value: T) => void;
 	readonly _extra?: TExtra;
 }
 
-export function createChatMementoKey<T, TExtra extends MementoKeySegments = []>(debugName: string, create: () => T): IChatMementoKey<T, TExtra> {
-	return { scope: 'chat', debugName, create };
+export function createChatMementoKey<T, TExtra extends MementoKeySegments = []>(debugName: string, create: () => T, dispose?: (value: T) => void): IChatMementoKey<T, TExtra> {
+	return { scope: 'chat', debugName, create, dispose };
 }
 
-export function createSessionMementoKey<T, TExtra extends MementoKeySegments = []>(debugName: string, create: () => T): ISessionMementoKey<T, TExtra> {
-	return { scope: 'session', debugName, create };
+export function createSessionMementoKey<T, TExtra extends MementoKeySegments = []>(debugName: string, create: () => T, dispose?: (value: T) => void): ISessionMementoKey<T, TExtra> {
+	return { scope: 'session', debugName, create, dispose };
 }
 
 /**
  * Per-contribution state that is centrally evicted with its owning chat or session.
  * Each registered contribution receives a distinct context, so memento names are
- * automatically namespaced by contribution.
+ * automatically namespaced by contribution. Optional key cleanup runs once after
+ * removal, including contribution unregistration and service disposal; failures are logged and isolated.
  */
 export interface IAgentHostChatContributionContext {
 	readonly contributionId: string;

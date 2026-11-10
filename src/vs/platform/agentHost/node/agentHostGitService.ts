@@ -1027,6 +1027,23 @@ export class AgentHostGitService implements IAgentHostGitService {
 		}
 	}
 
+	async getBlobSize(workingDirectory: URI, ref: string, repoRelativePath: string): Promise<number | undefined> {
+		const repositoryRoot = await this.getRepositoryRoot(workingDirectory);
+		if (!repositoryRoot) {
+			return undefined;
+		}
+		const output = await this._runGit(repositoryRoot, ['cat-file', '-s', `${ref}:${repoRelativePath}`]);
+		if (output === undefined) {
+			return undefined;
+		}
+		const value = output.trim();
+		const size = Number(value);
+		if (!/^\d+$/.test(value) || !Number.isSafeInteger(size) || size < 0) {
+			throw new Error(`Invalid Git blob size for ${ref}:${repoRelativePath}`);
+		}
+		return size;
+	}
+
 	async showBlob(workingDirectory: URI, ref: string, repoRelativePath: string): Promise<VSBuffer | undefined> {
 		const repositoryRoot = await this.getRepositoryRoot(workingDirectory);
 		if (!repositoryRoot) {
