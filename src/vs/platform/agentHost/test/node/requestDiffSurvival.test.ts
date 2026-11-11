@@ -922,7 +922,7 @@ suite('Agent Host Request Diff Survival', () => {
 				base: [{ index: 0, status: 'measured' }, { index: 1, status: 'budgetExceeded' }],
 				terminal: { ...terminal, flags: [0, 1, 0] },
 				diagnostics: { fileInputBytes: 2, observationInputBytes: 4 },
-				comparisons: 7, reads: 5,
+				comparisons: 7, reads: 3,
 			});
 		});
 
@@ -1034,20 +1034,26 @@ suite('Agent Host Request Diff Survival', () => {
 			});
 		});
 
-		test('accumulates initial input over files and stops before reading the violating file', async () => {
+		test('preflights all initial files and rejects before any blob read or character call', async () => {
 			sinon.stub(requestDiffSurvivalLimits, 'maximumObservationInputBytes').value(5);
 			const f = fixture();
 			f.git.computeFileDiffsBetweenRefs.resolves(['one', 'two', 'three'].map(name => ({
 				after: { uri: `file:///repo/${name}`, content: { uri: 'after' } },
 				diff: { added: 1, removed: 0 },
 			})));
+			const lcs = sinon.spy(LcsDiff.prototype, 'ComputeDiff');
 			await f.end('multiple-files');
 			assert.deepStrictEqual({
 				record: terminalShape(f.log.characterObservations[0]), reads: f.git.showBlob.callCount,
 				diagnostics: f.log.characterObservations[0].budgetDiagnostics,
+				computations: lcs.callCount,
+				summary: f.log.computeObservations.filter(event => event.phase === 'observation').map(event => ({
+					status: event.status, started: event.startedFileCount, cpu: event.cpuTotalMs, cpuStatus: event.cpuMeasurementStatus,
+				})),
 			}, {
-				record: { ...terminal, flags: [0, 1, 0] }, reads: 2,
+				record: { ...terminal, flags: [0, 1, 0] }, reads: 0, computations: 0,
 				diagnostics: { fileInputBytes: 2, observationInputBytes: 6 },
+				summary: [{ status: 'budgetRejected', started: 0, cpu: null, cpuStatus: 'notStarted' }],
 			});
 		});
 
@@ -1062,7 +1068,94 @@ suite('Agent Host Request Diff Survival', () => {
 			assert.deepStrictEqual({
 				record: terminalShape(f.log.characterObservations[0]), reads: f.git.showBlob.callCount,
 				repositories: f.git.computeFileDiffsBetweenRefs.callCount,
-			}, { record: { ...terminal, flags: [0, 1, 0] }, reads: 1, repositories: 2 });
+			}, { record: { ...terminal, flags: [0, 1, 0] }, reads: 0, repositories: 2 });
+		});
+
+		test('a late oversized file rejects before computing even the earlier small files', async () => {
+			const f = fixture();
+			f.git.computeFileDiffsBetweenRefs.resolves(['small', 'large'].map(name => ({
+				after: { uri: `file:///repo/${name}`, content: { uri: 'after' } }, diff: { added: 1, removed: 0 },
+			})));
+			f.git.getBlobSize.callsFake(async (_repository: URI, _ref: string, path: string) =>
+				path === 'large' ? requestDiffSurvivalLimits.maximumFileInputBytes + 1 : 2);
+			const lcs = sinon.spy(LcsDiff.prototype, 'ComputeDiff');
+			await f.end('base');
+			assert.deepStrictEqual({
+				terminal: terminalShape(f.log.characterObservations[0]),
+				reads: f.git.showBlob.callCount, computations: lcs.callCount,
+				admissions: f.log.sizeObservations.filter(event => event.phase === 'admission').length,
+			}, { terminal: { ...terminal, flags: [1, 0, 0] }, reads: 0, computations: 0, admissions: 0 });
+		});
+
+		test('the live-run 272-file accepted prefix rejects on size metadata with no character work', async () => {
+			const f = fixture();
+			f.git.computeFileDiffsBetweenRefs.resolves(Array.from({ length: 273 }, (_, index) => ({
+				after: { uri: `file:///repo/file-${index}`, content: { uri: 'after' } }, diff: { added: 1, removed: 0 },
+			})));
+			f.git.getBlobSize.callsFake(async (_repository: URI, _ref: string, path: string) => {
+				const index = Number(path.slice('file-'.length));
+				return index === 272 ? 518_545 : index === 271 ? 23_927 : 15_000;
+			});
+			const lcs = sinon.spy(LcsDiff.prototype, 'ComputeDiff');
+			await f.end('large-update');
+			assert.deepStrictEqual({
+				terminal: terminalShape(f.log.characterObservations[0]),
+				diagnostics: f.log.characterObservations[0].budgetDiagnostics,
+				reads: f.git.showBlob.callCount, computations: lcs.callCount,
+				input: f.log.sizeObservations.filter(event => event.phase === 'budgetRejection').map(event => ({
+					accepted: event.observationInputBytes, proposed: event.proposedObservationInputBytes,
+				})),
+			}, {
+				terminal: { ...terminal, flags: [0, 1, 0] },
+				diagnostics: { fileInputBytes: 518_545, observationInputBytes: 4_607_472 },
+				reads: 0, computations: 0, input: [{ accepted: 4_088_927, proposed: 4_607_472 }],
+			});
+		});
+
+		test('preflights both follow-up comparisons before starting either character comparison', async () => {
+			sinon.stub(requestDiffSurvivalLimits, 'maximumObservationInputBytes').value(3);
+			const f = fixture();
+			await f.end('base');
+			f.git.showBlob.resetHistory();
+			const lcs = sinon.spy(LcsDiff.prototype, 'ComputeDiff');
+			const ended = f.log.whenRequestEnds('later');
+			f.begin('later');
+			await ended;
+			const rejected = f.log.computeObservations.find(event =>
+				event.originatingRequestId === 'base' && event.observationIndex === 1 && event.phase === 'observation');
+			assert.deepStrictEqual({
+				rejected: { status: rejected?.status, calls: rejected?.startedFileCount, cpu: rejected?.cpuTotalMs },
+				terminal: terminalShape(f.log.characterObservations[1]),
+				reads: f.git.showBlob.callCount, computations: lcs.callCount,
+				roles: f.log.sizeObservations.filter(event =>
+					event.originatingRequestId === 'base' && event.observationIndex === 1 && event.phase === 'budgetRejection')
+					.map(event => event.comparisonKind),
+			}, {
+				rejected: { status: 'budgetRejected', calls: 0, cpu: null },
+				terminal: { ...terminal, flags: [0, 1, 0] },
+				reads: 1, computations: 1, roles: ['requestResultToLatest'],
+			});
+		});
+
+		test('preflight counts repeated comparison input without charging it again during materialization', async () => {
+			sinon.stub(requestDiffSurvivalLimits, 'maximumObservationInputBytes').value(4);
+			const f = fixture();
+			await f.end('base');
+			f.git.getBlobSize.resetHistory();
+			f.git.showBlob.resetHistory();
+			const order: string[] = [];
+			f.git.getBlobSize.callsFake(async () => { order.push('size'); return 2; });
+			f.git.showBlob.callsFake(async () => { order.push('blob'); return VSBuffer.fromString('ab'); });
+			await f.end('later');
+			const record = f.log.characterObservations.find(record => record.originatingRequestId === 'base' && record.observationIndex === 1)!;
+			assert.deepStrictEqual({
+				status: record.status, complete: record.complete, order,
+				input: f.log.sizeObservations.filter(event =>
+					event.originatingRequestId === 'base' && event.observationIndex === 1 && event.phase === 'observation')
+					.map(event => event.observationInputBytes),
+			}, {
+				status: 'measured', complete: true, order: ['size', 'size', 'blob', 'blob', 'size', 'blob'], input: [4],
+			});
 		});
 
 		test('separate compute events reuse survival identity and aggregate two follow-up comparisons', async () => {

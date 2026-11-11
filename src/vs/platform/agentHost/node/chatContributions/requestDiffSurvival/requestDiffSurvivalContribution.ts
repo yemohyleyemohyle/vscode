@@ -39,6 +39,25 @@ interface IRepositoryState {
 	readonly ref: string;
 }
 
+interface IPreparedFileInput {
+	readonly beforePath: string | undefined;
+	readonly afterPath: string | undefined;
+	readonly beforeSize: number;
+	readonly afterSize: number;
+}
+
+interface IPreparedComparison {
+	readonly files: {
+		readonly repository: URI;
+		readonly beforeRef: string;
+		readonly afterRef: string;
+		readonly diff: ISessionFileDiff;
+		readonly cost: IRequestDiffSurvivalFileCost;
+		readonly input: IPreparedFileInput | Error;
+	}[];
+	readonly errors: string[];
+}
+
 interface IRequestDiffSurvivalRequestStart {
 	readonly repositories: readonly IRepositoryState[];
 	readonly model: string | null;
@@ -644,10 +663,23 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		let attemptedWrite = false;
 		try {
 			const budget = cost.inputBudget;
+			const originalInput = !tracker.originalRequest
+				? await this._preflightDiff(session, tracker.baseline, latest, budget, state, tracker, 'originalRequest')
+				: undefined;
+			const baselineInput = tracker.observationCount > 0
+				? await this._preflightDiff(session, tracker.baseline, latest, budget, state, tracker, 'baselineToLatest')
+				: undefined;
+			const resultInput = tracker.observationCount > 0
+				? await this._preflightDiff(session, tracker.requestResult, latest, budget, state, tracker, 'requestResultToLatest')
+				: undefined;
+			this._assertTrackerActive(state, tracker, expiryReason);
 			if (!tracker.originalRequest) {
+				if (!originalInput) {
+					throw new Error('Missing original request input preflight');
+				}
 				this._reserveRetained(state, tracker, 256);
 				this._sizeEvent(tracker, { phase: 'admission', status: 'started', retainedBytesDelta: 256 });
-				const original = await this._computeDiff(session, tracker.baseline, latest, budget, state, tracker, 'originalRequest', true);
+				const original = await this._computeDiff(originalInput, state, tracker, 'originalRequest', true);
 				this._assertTrackerActive(state, tracker, expiryReason);
 				tracker.originalRequest = original;
 				this._sizeEvent(tracker, { phase: 'admission', status: 'completed' });
@@ -655,12 +687,12 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 				cost.finishComparison('originalRequest', 'reused');
 			}
 			const originalRequest = tracker.originalRequest;
-			const baselineToLatest = tracker.observationCount === 0
-				? originalRequest
-				: await this._computeDiff(session, tracker.baseline, latest, budget, state, tracker, 'baselineToLatest', false);
-			const requestResultToLatest = tracker.observationCount === 0
-				? { files: [], errors: [] }
-				: await this._computeDiff(session, tracker.requestResult, latest, budget, state, tracker, 'requestResultToLatest', false);
+			const baselineToLatest = baselineInput
+				? await this._computeDiff(baselineInput, state, tracker, 'baselineToLatest', false)
+				: originalRequest;
+			const requestResultToLatest = resultInput
+				? await this._computeDiff(resultInput, state, tracker, 'requestResultToLatest', false)
+				: { files: [], errors: [] };
 			if (tracker.observationCount === 0) {
 				cost.finishComparison('baselineToLatest', 'reused');
 				cost.finishComparison('requestResultToLatest', 'empty');
@@ -755,7 +787,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		this._logService.info(`${CHARACTER_DIFF_LOG_PREFIX}${JSON.stringify(observation)}`);
 	}
 
-	private async _computeDiff(
+	private async _preflightDiff(
 		session: ProtocolURI,
 		before: readonly IRepositoryState[],
 		after: readonly IRepositoryState[],
@@ -763,26 +795,16 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		state: IRequestDiffSurvivalState,
 		tracker: IRequestDiffSurvivalTracker,
 		comparison: RequestDiffSurvivalComparison,
-		retain: boolean,
-	): Promise<IRequestCharacterRepositoryDiff> {
+	): Promise<IPreparedComparison> {
 		const cost = tracker.cost;
 		const expiryReason = tracker.expiryReason;
-		cost.beginComparison(comparison);
-		let outcome: RequestDiffSurvivalCostOutcome = 'failed';
+		const prepared: IPreparedComparison = { files: [], errors: [] };
 		try {
 			const afterByRepository = new Map(after.map(state => [state.repository.toString(), state.ref]));
-			const files = [];
-			const errors: string[] = [];
-			const addError = (message: string) => {
-				if (retain) {
-					this._reserveRetained(state, tracker, 64 + 2 * message.length);
-				}
-				errors.push(message);
-			};
 			for (const [repositoryIndex, beforeRepository] of before.entries()) {
 				const afterRef = afterByRepository.get(beforeRepository.repository.toString());
 				if (!afterRef) {
-					addError(`Missing latest state for repository ${beforeRepository.repository.toString()}`);
+					prepared.errors.push(`Missing latest state for repository ${beforeRepository.repository.toString()}`);
 					continue;
 				}
 				const diffs = await this._gitService.computeFileDiffsBetweenRefs(beforeRepository.repository, {
@@ -792,53 +814,41 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 				});
 				this._assertTrackerActive(state, tracker, expiryReason);
 				if (!diffs) {
-					addError(`Failed to compute diff for repository ${beforeRepository.repository.toString()}`);
+					prepared.errors.push(`Failed to compute diff for repository ${beforeRepository.repository.toString()}`);
 					continue;
 				}
 				for (const [fileIndex, diff] of diffs.entries()) {
-					const retainedBytesBeforeFile = tracker.retainedBytes;
 					const fileCost = cost.createFile(comparison, repositoryIndex, fileIndex);
+					let input: IPreparedFileInput | Error;
 					try {
-						const materialized = await this._materializeFileDiff(beforeRepository.repository, beforeRepository.ref, afterRef, diff, budget, state, tracker, retain, fileCost, expiryReason);
-						files.push(materialized);
-						this._sizeEvent(tracker, { phase: 'fileConstruction', status: 'completed', ...this._fileSizeDetails(fileCost) });
+						input = await this._preflightFileInput(beforeRepository.repository, beforeRepository.ref, afterRef, diff, budget, state, tracker, fileCost, expiryReason);
 					} catch (error) {
-						const fileOutcome = getRequestDiffSurvivalCostOutcome(error);
-						if (!fileCost.computationStarted) {
-							cost.fileNotStarted(fileCost, fileOutcome);
-						}
-						this._sizeEvent(tracker, { phase: 'fileConstruction', status: fileOutcome, ...this._fileSizeDetails(fileCost) });
 						if (error instanceof RequestDiffSurvivalBudgetError || isCancellationError(error)) {
+							cost.fileNotStarted(fileCost, getRequestDiffSurvivalCostOutcome(error));
 							throw error;
 						}
-						this._assertActive(state);
-						if (retain) {
-							const released = tracker.retainedBytes - retainedBytesBeforeFile;
-							this._retainedBytes -= released;
-							tracker.retainedBytes = retainedBytesBeforeFile;
-							this._sizeEvent(tracker, { phase: 'rollback', status: 'failed', retainedBytesDelta: -released, ...this._fileSizeDetails(fileCost) });
-						}
-						const message = `Failed to materialize ${diff.after?.uri ?? diff.before?.uri ?? 'unknown file'}: ${error instanceof Error ? error.message : String(error)}`;
-						addError(message);
+						this._assertTrackerActive(state, tracker, expiryReason);
+						input = error instanceof Error ? error : new Error(String(error));
+						this._sizeEvent(tracker, { phase: 'inputCheck', status: 'failed', ...this._fileSizeDetails(fileCost) });
 					}
+					prepared.files.push({
+						repository: beforeRepository.repository, beforeRef: beforeRepository.ref, afterRef, diff, cost: fileCost, input,
+					});
 				}
 			}
-			outcome = errors.length > 0 ? 'failed' : 'completed';
-			return { files, errors };
+			return prepared;
 		} catch (error) {
-			outcome = getRequestDiffSurvivalCostOutcome(error);
+			cost.finishComparison(comparison, getRequestDiffSurvivalCostOutcome(error));
 			throw error;
-		} finally {
-			cost.finishComparison(comparison, outcome);
 		}
 	}
 
-	private async _materializeFileDiff(
+	private async _preflightFileInput(
 		repository: URI, beforeRef: string, afterRef: string, diff: ISessionFileDiff,
 		budget: RequestDiffSurvivalInputBudget, state: IRequestDiffSurvivalState,
-		tracker: IRequestDiffSurvivalTracker, retain: boolean, fileCost: IRequestDiffSurvivalFileCost,
+		tracker: IRequestDiffSurvivalTracker, fileCost: IRequestDiffSurvivalFileCost,
 		expiryReason?: ExpiryReason,
-	) {
+	): Promise<IPreparedFileInput> {
 		const beforePath = diff.before ? relativePath(repository, URI.parse(diff.before.uri)) : undefined;
 		const afterPath = diff.after ? relativePath(repository, URI.parse(diff.after.uri)) : undefined;
 		if ((diff.before && !beforePath) || (diff.after && !afterPath)) {
@@ -850,7 +860,6 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		]);
 		this._assertTrackerActive(state, tracker, expiryReason);
 		if (beforeSize === undefined || afterSize === undefined || !Number.isSafeInteger(beforeSize) || !Number.isSafeInteger(afterSize) || beforeSize < 0 || afterSize < 0) {
-			this._sizeEvent(tracker, { phase: 'inputCheck', status: 'failed', ...this._fileSizeDetails(fileCost) });
 			throw new Error('Unable to read Git blob size');
 		}
 		const fileInputBytes = beforeSize + afterSize;
@@ -867,6 +876,78 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 			throw error;
 		}
 		this._sizeEvent(tracker, { phase: 'inputCheck', status: 'completed', ...this._fileSizeDetails(fileCost) });
+		return { beforePath, afterPath, beforeSize, afterSize };
+	}
+
+	private async _computeDiff(
+		prepared: IPreparedComparison,
+		state: IRequestDiffSurvivalState,
+		tracker: IRequestDiffSurvivalTracker,
+		comparison: RequestDiffSurvivalComparison,
+		retain: boolean,
+	): Promise<IRequestCharacterRepositoryDiff> {
+		const cost = tracker.cost;
+		const expiryReason = tracker.expiryReason;
+		cost.beginComparison(comparison);
+		let outcome: RequestDiffSurvivalCostOutcome = 'failed';
+		const files = [];
+		const errors: string[] = [];
+		const addError = (message: string) => {
+			if (retain) {
+				this._reserveRetained(state, tracker, 64 + 2 * message.length);
+			}
+			errors.push(message);
+		};
+		try {
+			for (const error of prepared.errors) {
+				addError(error);
+			}
+			for (const file of prepared.files) {
+				this._assertTrackerActive(state, tracker, expiryReason);
+				const retainedBytesBeforeFile = tracker.retainedBytes;
+				const fileCost = file.cost;
+				try {
+					if (file.input instanceof Error) {
+						throw file.input;
+					}
+					files.push(await this._materializeFileDiff(file.repository, file.beforeRef, file.afterRef, file.input, state, tracker, retain, fileCost, expiryReason));
+					this._sizeEvent(tracker, { phase: 'fileConstruction', status: 'completed', ...this._fileSizeDetails(fileCost) });
+				} catch (error) {
+					const fileOutcome = getRequestDiffSurvivalCostOutcome(error);
+					if (!fileCost.computationStarted) {
+						cost.fileNotStarted(fileCost, fileOutcome);
+					}
+					this._sizeEvent(tracker, { phase: 'fileConstruction', status: fileOutcome, ...this._fileSizeDetails(fileCost) });
+					if (error instanceof RequestDiffSurvivalBudgetError || isCancellationError(error)) {
+						throw error;
+					}
+					this._assertTrackerActive(state, tracker, expiryReason);
+					if (retain) {
+						const released = tracker.retainedBytes - retainedBytesBeforeFile;
+						this._retainedBytes -= released;
+						tracker.retainedBytes = retainedBytesBeforeFile;
+						this._sizeEvent(tracker, { phase: 'rollback', status: 'failed', retainedBytesDelta: -released, ...this._fileSizeDetails(fileCost) });
+					}
+					addError(`Failed to materialize ${file.diff.after?.uri ?? file.diff.before?.uri ?? 'unknown file'}: ${error instanceof Error ? error.message : String(error)}`);
+				}
+			}
+			outcome = errors.length > 0 ? 'failed' : 'completed';
+			return { files, errors };
+		} catch (error) {
+			outcome = getRequestDiffSurvivalCostOutcome(error);
+			throw error;
+		} finally {
+			cost.finishComparison(comparison, outcome);
+		}
+	}
+
+	private async _materializeFileDiff(
+		repository: URI, beforeRef: string, afterRef: string, input: IPreparedFileInput,
+		state: IRequestDiffSurvivalState, tracker: IRequestDiffSurvivalTracker,
+		retain: boolean, fileCost: IRequestDiffSurvivalFileCost, expiryReason?: ExpiryReason,
+	) {
+		const { beforePath, afterPath, beforeSize, afterSize } = input;
+		const fileInputBytes = beforeSize + afterSize;
 		const originalPath = beforePath ? `${repository.toString()}#${beforePath}` : undefined;
 		const modifiedPath = afterPath ? `${repository.toString()}#${afterPath}` : undefined;
 		if (retain) {

@@ -54,6 +54,12 @@ The former `requestDiffSurvivalObservation`, `requestCharacterSurvivalSnapshot`,
 
 ## Request-survival compute and size events
 
+Input protection now preflights the entire observation before any blob-content reads or character-diff calls. It enumerates changed files and reads before/after blob-size metadata for A→B at index 0, or for both A→C and B→C at follow-up/expiry. All repositories and required comparisons share the existing 4 MiB allowance; repeated inputs count again and equality remains allowed. Preflight stops as soon as a file or cumulative input violation is known, without scanning the remaining files just to calculate a full rejected total. A late oversized file, repository, or second-comparison rejection therefore prevents character work for the whole observation, not just its unprocessed suffix.
+
+Preflight stores only file descriptors, immutable checkpoint refs, sizes, and explicit errors, never blob contents. Admitted work reuses that metadata rather than repeating size queries or charging input twice; loaded content must still match its preflight size. Missing metadata remains an explicit incomplete file result, not a zero-size estimate. Retained-output reservations still run during construction and can reject after character work has begun. No CPU-time deadline is added, so under-budget difficult inputs can still be expensive.
+
+For these builds, `observationInputBytes` is accepted/preflight-admitted input, not a claim that those bytes were loaded or character-processed. An input-rejected observation emits a compute summary with `status: 'budgetRejected'`, `startedFileCount: 0`, `cpuMeasurementStatus: 'notStarted'`, and null CPU/elapsed timings. The existing available-CPU plot intentionally omits these records; inspect unfiltered summaries and size/survival terminals to verify early rejection. Prefix builds before this change could spend CPU on accepted files before discovering the same violation. Record the implementation revision when comparing runs; event schemas and threshold values are unchanged.
+
 The same `VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG=1` opt-in now emits two additional local diagnostic event kinds, each with schema version 1:
 
 - `[RequestCharacterDiffComputeObservation] ` / `requestCharacterDiffComputeObservation`
