@@ -20,6 +20,33 @@ export interface IOffsetEdit {
 	newText: string;
 }
 
+export type SurvivalDiffAlgorithm = 'character' | 'hybrid';
+
+export interface ISurvivalDiffChange {
+	readonly originalStart: number;
+	readonly originalLength: number;
+	readonly modifiedStart: number;
+	readonly modifiedLength: number;
+}
+
+export interface ISurvivalDiffMeasurement {
+	readonly elapsedMs: number;
+	readonly cpuMeasurementStatus: 'available' | 'unsupported' | 'failed';
+	readonly cpuUserMs: number | null;
+	readonly cpuSystemMs: number | null;
+	readonly cpuMeasurementError?: string;
+}
+
+export type ISurvivalDiffResult = {
+	readonly measurement: ISurvivalDiffMeasurement;
+} & ({
+	readonly status: 'completed';
+	readonly changes: readonly ISurvivalDiffChange[];
+} | {
+	readonly status: 'failed' | 'timedOut';
+	readonly error: string;
+});
+
 export interface IDetailedDiffResult {
 	added: number;
 	removed: number;
@@ -71,6 +98,9 @@ export const DEFAULT_DIFF_TIMEOUT_MS = 5000;
  */
 export interface IDiffComputeService {
 	readonly _serviceBrand: undefined;
+
+	/** Computes raw UTF-16 changes and thread-local cost for the opt-in survival experiment. */
+	computeSurvivalDiff(original: string, modified: string, algorithm: SurvivalDiffAlgorithm, timeoutMs?: number): Promise<ISurvivalDiffResult>;
 
 	/**
 	 * Computes whitespace-insensitive line counts and whitespace-sensitive character edits between two text strings.

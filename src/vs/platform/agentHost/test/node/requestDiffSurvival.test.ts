@@ -23,10 +23,24 @@ import { RequestDiffSurvivalBudgetError, RequestDiffSurvivalInputBudget, request
 import { RequestDiffSurvivalCostObservation, type IRequestDiffSurvivalSizeDetails } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalCost.js';
 import { createNoopGitService } from '../common/sessionTestHelpers.js';
 import { type computeRequestCharacterDiffSurvivalMetric, type IRequestCharacterRepositoryDiff } from '../../node/chatContributions/requestDiffSurvival/requestCharacterDiffSurvival.js';
+import { InProcessDiffComputeService } from './inProcessDiffComputeService.js';
+import { computeSurvivalDiff } from '../../node/survivalDiff.js';
 
 suite('Agent Host Request Diff Survival', () => {
 	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
-	teardown(() => sinon.restore());
+	let previousEngine: string | undefined;
+	setup(() => {
+		previousEngine = process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE;
+		delete process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE;
+	});
+	teardown(() => {
+		sinon.restore();
+		if (previousEngine === undefined) {
+			delete process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE;
+		} else {
+			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE = previousEngine;
+		}
+	});
 
 	function createStateManager(provider = 'copilotcli'): AgentHostStateManager {
 		const manager = disposables.add(new AgentHostStateManager(new NullLogService()));
@@ -70,7 +84,7 @@ suite('Agent Host Request Diff Survival', () => {
 						},
 						waitForTurnCheckpointPair: async () => ({ parent: 'before', current: 'after' }),
 					},
-					createNoopGitService(), createStateManager(scenario.provider),
+					createNoopGitService(), createStateManager(scenario.provider), new InProcessDiffComputeService(),
 				));
 				const send = (turnId: string) => contribution.onOutgoingTurn({
 					session: 'session', chat: 'chat', turnId,
@@ -157,7 +171,7 @@ suite('Agent Host Request Diff Survival', () => {
 						getTurnStartCheckpointState: async () => [{ repository, tree: 'before' }],
 						waitForTurnCheckpointPair: async () => ({ parent: 'before', current: 'after' }),
 					},
-					createNoopGitService(), createStateManager(),
+					createNoopGitService(), createStateManager(), new InProcessDiffComputeService(),
 				));
 				const ended = logService.whenRequestEnds('base');
 				const effectiveModel = scenario.effective === undefined ? undefined : { id: scenario.effective };
@@ -218,7 +232,7 @@ suite('Agent Host Request Diff Survival', () => {
 				logService,
 				checkpointService,
 				gitService,
-				createStateManager(),
+				createStateManager(), new InProcessDiffComputeService(),
 			));
 			const session = 'ahp-session:/session';
 			const chat = 'ahp-chat:/chat';
@@ -249,7 +263,7 @@ suite('Agent Host Request Diff Survival', () => {
 					&& baseObservation.baseEndTimestamp === laterObservation.baseEndTimestamp,
 			}, {
 				base: {
-					schemaVersion: 4,
+					schemaVersion: 5,
 					originatingRequestId: 'base-request',
 					observationRequestId: 'base-request',
 					baseModel: 'kimi-k3',
@@ -263,7 +277,7 @@ suite('Agent Host Request Diff Survival', () => {
 					diffKeys: ['files', 'errors'],
 				},
 				later: {
-					schemaVersion: 4,
+					schemaVersion: 5,
 					originatingRequestId: 'base-request',
 					observationRequestId: 'later-request',
 					baseModel: 'kimi-k3',
@@ -310,7 +324,7 @@ suite('Agent Host Request Diff Survival', () => {
 						return [];
 					},
 				},
-				createStateManager(),
+				createStateManager(), new InProcessDiffComputeService(),
 			));
 			for (let index = 0; index < 12; index++) {
 				const turnId = `request-${index}`;
@@ -372,7 +386,7 @@ suite('Agent Host Request Diff Survival', () => {
 					waitForTurnCheckpointPair: async () => ({ parent: 'before', current: 'after' }),
 				},
 				{ ...createNoopGitService(), computeFileDiffsBetweenRefs: async () => [] },
-				createStateManager(),
+				createStateManager(), new InProcessDiffComputeService(),
 			));
 			for (const [index, chat] of ['first', 'second', 'first'].entries()) {
 				const turnId = `request-${index}`;
@@ -426,7 +440,7 @@ suite('Agent Host Request Diff Survival', () => {
 					},
 					getBlobSize: async (_repository, ref) => VSBuffer.fromString(ref === 'before' ? 'base' : 'base中文').byteLength,
 				},
-				createStateManager(),
+				createStateManager(), new InProcessDiffComputeService(),
 			));
 			const ended = logService.whenRequestEnds('request');
 			contribution.onOutgoingTurn({ session: 'session', chat: 'chat', turnId: 'request', message: { text: 'request', origin: { kind: MessageKind.User }, model: { id: 'model' } } });
@@ -501,7 +515,8 @@ suite('Agent Host Request Diff Survival', () => {
 				waitForTurnCheckpointPair: async (_session, _chat, turnId) => ({ parent: `${turnId}-start`, current: `${turnId}-end` }),
 			} satisfies IAgentHostCheckpointService;
 			const Contribution = lifetime ? TestLifetimeContribution : RequestDiffSurvivalContribution;
-			const contribution = disposables.add(new Contribution(context, log, checkpoint, git, createStateManager()));
+			const diffService = new InProcessDiffComputeService();
+			const contribution = disposables.add(new Contribution(context, log, checkpoint, git, createStateManager(), diffService));
 			const begin = (turnId: string, chat = 'chat') => {
 				contribution.onOutgoingTurn({ session: 'session', chat, turnId, message: { text: 'request', origin: { kind: MessageKind.User } } });
 				contribution.onTurnEnd({ session: 'session', channel: chat, turnId, reason: { kind: 'success' } });
@@ -512,7 +527,7 @@ suite('Agent Host Request Diff Survival', () => {
 				await ended;
 			};
 			return {
-				context, log, git, checkpoint, contribution, begin, end,
+				context, log, git, checkpoint, contribution, begin, end, diffService,
 				clock: contribution instanceof TestLifetimeContribution ? contribution.clock : undefined,
 			};
 		}
@@ -529,6 +544,74 @@ suite('Agent Host Request Diff Survival', () => {
 			status: 'budgetExceeded', complete: false, final: true,
 			survival: [-1, -1, -1, -1, -1, -1, -1], hasDiffs: false,
 		};
+
+		for (const engine of ['worker-character', 'worker-hybrid']) {
+			test(`${engine} uses the service for initial and follow-up comparisons with correlated costs`, async () => {
+				process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE = engine;
+				const f = fixture();
+				const calls = sinon.spy(f.diffService, 'computeSurvivalDiff');
+				await f.end('base');
+				await f.end('later');
+				assert.deepStrictEqual({
+					algorithms: calls.args.map(args => args[2]),
+					observations: f.log.characterObservations.map(record => [record.originatingRequestId, record.observationIndex, record.complete]),
+				}, {
+					algorithms: Array(4).fill(engine === 'worker-hybrid' ? 'hybrid' : 'character'),
+					observations: [['base', 0, true], ['base', 1, true], ['later', 0, true]],
+				});
+			});
+
+			test(`${engine} rejects oversized metadata before dispatching any worker job`, async () => {
+				process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE = engine;
+				const f = fixture();
+				const calls = sinon.spy(f.diffService, 'computeSurvivalDiff');
+				f.git.getBlobSize.resolves(requestDiffSurvivalLimits.maximumFileInputBytes + 1);
+				await f.end('base');
+				assert.deepStrictEqual({
+					calls: calls.callCount, reads: f.git.showBlob.callCount, status: f.log.characterObservations[0].status,
+				}, { calls: 0, reads: 0, status: 'budgetExceeded' });
+			});
+		}
+
+		test('worker timeout terminates unavailable rather than retaining an approximate original', async () => {
+			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE = 'worker-hybrid';
+			const f = fixture();
+			sinon.stub(f.diffService, 'computeSurvivalDiff').resolves({
+				status: 'timedOut', error: 'timed out',
+				measurement: { elapsedMs: 5, cpuMeasurementStatus: 'available', cpuUserMs: 3, cpuSystemMs: 1 },
+			});
+			await f.end('base');
+			await f.end('later');
+			assert.deepStrictEqual(f.log.characterObservations.filter(record => record.originatingRequestId === 'base').map(record => ({
+				status: record.status, complete: record.complete, reason: record.unavailableReason, final: record.isFinalObservation,
+				survival: Object.values(record.survival), hasDiffs: Object.hasOwn(record, 'diffs'),
+			})), [{
+				status: 'unavailable', complete: false, reason: 'computationFailed', final: true,
+				survival: [-1, -1, -1, -1, -1, -1, -1], hasDiffs: false,
+			}]);
+		});
+
+		test('retirement during worker execution discards the result without restoring retained ownership', async () => {
+			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE = 'worker-hybrid';
+			const f = fixture();
+			const dispatched = new DeferredPromise<void>();
+			const finish = new DeferredPromise<void>();
+			sinon.stub(f.diffService, 'computeSurvivalDiff').callsFake(async (before, after, algorithm, timeoutMs) => {
+				dispatched.complete();
+				await finish.p;
+				return computeSurvivalDiff(before, after, algorithm, timeoutMs ?? 5000);
+			});
+			const ended = f.log.whenComputeEnds('base');
+			f.begin('base');
+			await dispatched.p;
+			f.context.evict('chat');
+			await finish.complete();
+			await ended;
+			assert.deepStrictEqual({
+				observations: f.log.characterObservations.length,
+				retained: f.log.sizeObservations.at(-1)?.hostEstimatedRetainedBytes,
+			}, { observations: 0, retained: 0 });
+		});
 
 		suite('tracker lifetime', () => {
 			function lifetimeFixture() {
@@ -1434,6 +1517,13 @@ class RecordingObservationLogService extends NullLogService {
 	readonly sizeObservations: IRecordedSizeObservation[] = [];
 	private readonly _requestEnds = new Map<string, DeferredPromise<void>>();
 	private readonly _expiries = new Map<string, DeferredPromise<void>>();
+	private readonly _computeEnds = new Map<string, DeferredPromise<void>>();
+
+	whenComputeEnds(requestId: string): Promise<void> {
+		const ended = new DeferredPromise<void>();
+		this._computeEnds.set(requestId, ended);
+		return ended.p;
+	}
 
 	whenExpires(requestId: string): Promise<void> {
 		const expired = new DeferredPromise<void>();
@@ -1449,7 +1539,12 @@ class RecordingObservationLogService extends NullLogService {
 
 	override info(message: string): void {
 		if (message.startsWith(RequestDiffSurvivalCostObservation.computeLogPrefix)) {
-			this.computeObservations.push(JSON.parse(message.slice(RequestDiffSurvivalCostObservation.computeLogPrefix.length)));
+			const observation: IRecordedComputeObservation = JSON.parse(message.slice(RequestDiffSurvivalCostObservation.computeLogPrefix.length));
+			this.computeObservations.push(observation);
+			if (observation.phase === 'observation') {
+				this._computeEnds.get(observation.originatingRequestId)?.complete();
+				this._computeEnds.delete(observation.originatingRequestId);
+			}
 			return;
 		}
 		if (message.startsWith(RequestDiffSurvivalCostObservation.sizeLogPrefix)) {

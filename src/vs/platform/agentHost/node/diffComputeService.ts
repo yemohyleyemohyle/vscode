@@ -7,7 +7,9 @@ import { Worker } from 'worker_threads';
 import { Disposable } from '../../../base/common/lifecycle.js';
 import { FileAccess } from '../../../base/common/network.js';
 import { ILogService } from '../../log/common/log.js';
-import { DEFAULT_DIFF_TIMEOUT_MS, IDiffComputeService, type IDetailedDiffResult, type IDiffCountResult, type IDiffHunksResult } from '../common/diffComputeService.js';
+import { DEFAULT_DIFF_TIMEOUT_MS, IDiffComputeService, type IDetailedDiffResult, type IDiffCountResult, type IDiffHunksResult, type ISurvivalDiffResult, type SurvivalDiffAlgorithm } from '../common/diffComputeService.js';
+
+type DiffResult = IDiffCountResult | IDetailedDiffResult | IDiffHunksResult | ISurvivalDiffResult;
 
 /**
  * Node.js implementation of {@link IDiffComputeService} that runs
@@ -21,12 +23,16 @@ export class NodeWorkerDiffComputeService extends Disposable implements IDiffCom
 	private _worker: Worker | undefined;
 	private _workerFailures = 0;
 	private _nextId = 1;
-	private readonly _pending = new Map<number, { resolve: (value: IDiffCountResult | IDetailedDiffResult | IDiffHunksResult) => void; reject: (err: Error) => void }>();
+	private readonly _pending = new Map<number, { resolve: (value: DiffResult) => void; reject: (err: Error) => void }>();
 
 	constructor(
 		@ILogService private readonly _logService: ILogService,
 	) {
 		super();
+	}
+
+	async computeSurvivalDiff(original: string, modified: string, algorithm: SurvivalDiffAlgorithm, timeoutMs: number = DEFAULT_DIFF_TIMEOUT_MS): Promise<ISurvivalDiffResult> {
+		return this._callWorker('computeSurvivalDiff', original, modified, algorithm, timeoutMs);
 	}
 
 	async computeDiffCounts(original: string, modified: string, timeoutMs: number = DEFAULT_DIFF_TIMEOUT_MS): Promise<IDiffCountResult> {
@@ -41,13 +47,16 @@ export class NodeWorkerDiffComputeService extends Disposable implements IDiffCom
 		return this._callWorker('computeDiffHunks', original, modified, timeoutMs);
 	}
 
-	private async _callWorker<T extends IDiffCountResult | IDetailedDiffResult | IDiffHunksResult>(functionName: string, original: string, modified: string, timeoutMs: number): Promise<T> {
+	private async _callWorker<T extends DiffResult>(functionName: string, ...args: readonly (string | number)[]): Promise<T> {
+		if (this._store.isDisposed) {
+			throw new Error('DiffComputeService disposed');
+		}
 		const worker = this._ensureWorker();
 		const id = this._nextId++;
 		return new Promise<T>((resolve, reject) => {
 			this._pending.set(id, { resolve: value => resolve(value as T), reject });
 			try {
-				worker.postMessage({ id, fn: functionName, args: [original, modified, timeoutMs] });
+				worker.postMessage({ id, fn: functionName, args });
 			} catch (err) {
 				this._pending.delete(id);
 				reject(err instanceof Error ? err : new Error(String(err)));
@@ -62,7 +71,7 @@ export class NodeWorkerDiffComputeService extends Disposable implements IDiffCom
 		if (!this._worker) {
 			const workerPath = FileAccess.asFileUri('vs/platform/agentHost/node/diffWorkerMain.js').fsPath;
 			const w = new Worker(workerPath, { name: 'Diff compute worker' });
-			w.on('message', (msg: { id: number; res?: IDiffCountResult | IDetailedDiffResult | IDiffHunksResult; err?: { message: string; stack?: string } }) => {
+			w.on('message', (msg: { id: number; res?: DiffResult; err?: { message: string; stack?: string } }) => {
 				const handler = this._pending.get(msg.id);
 				if (!handler) {
 					return;
@@ -82,6 +91,19 @@ export class NodeWorkerDiffComputeService extends Disposable implements IDiffCom
 				this._logService.error('[DiffComputeService] Worker error', err);
 				for (const [, handler] of this._pending) {
 					handler.reject(err);
+				}
+				this._pending.clear();
+				this._worker = undefined;
+				this._workerFailures++;
+			});
+			w.on('exit', code => {
+				if (this._worker !== w) {
+					return;
+				}
+				const error = new Error(`Diff compute worker exited unexpectedly (${code})`);
+				this._logService.error('[DiffComputeService]', error);
+				for (const handler of this._pending.values()) {
+					handler.reject(error);
 				}
 				this._pending.clear();
 				this._worker = undefined;

@@ -4,12 +4,13 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { parentPort } from 'worker_threads';
+import { computeSurvivalDiff } from './survivalDiff.js';
 import { IArcTextReplacement } from '../../../base/common/editArcTracker.js';
 import { StopWatch } from '../../../base/common/stopwatch.js';
 import { DefaultLinesDiffComputer } from '../../../editor/common/diff/defaultLinesDiffComputer/defaultLinesDiffComputer.js';
 import type { ILinesDiffComputerOptions } from '../../../editor/common/diff/linesDiffComputer.js';
 import type { RangeMapping } from '../../../editor/common/diff/rangeMapping.js';
-import type { IDetailedDiffResult, IDiffCountResult, IDiffHunk, IDiffHunksResult } from '../common/diffComputeService.js';
+import type { IDetailedDiffResult, IDiffCountResult, IDiffHunk, IDiffHunksResult, SurvivalDiffAlgorithm } from '../common/diffComputeService.js';
 
 export function computeDiffCounts(originalText: string, modifiedText: string, timeoutMs: number): IDiffCountResult {
 	const stopwatch = StopWatch.create();
@@ -182,7 +183,10 @@ function main() {
 
 	port.on('message', ({ id, fn, args }: { id: number; fn: string; args: unknown[] }) => {
 		try {
-			if (fn === 'computeDiffCounts') {
+			if (fn === 'computeSurvivalDiff') {
+				const res = computeSurvivalDiff(args[0] as string, args[1] as string, args[2] as SurvivalDiffAlgorithm, args[3] as number);
+				port.postMessage({ id, res });
+			} else if (fn === 'computeDiffCounts') {
 				const res = computeDiffCounts(args[0] as string, args[1] as string, args[2] as number);
 				port.postMessage({ id, res });
 			} else if (fn === 'computeDetailedDiff') {

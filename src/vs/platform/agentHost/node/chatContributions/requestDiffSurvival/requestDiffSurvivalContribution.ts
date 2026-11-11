@@ -12,14 +12,15 @@ import { ILogService } from '../../../../log/common/log.js';
 import { IAgentHostCheckpointService } from '../../../common/agentHostCheckpointService.js';
 import { createChatMementoKey, type IAgentHostChatContribution, type IAgentHostChatContributionContext, type IDispatchedAction, type IOutgoingTurn, type ITurnEnd } from '../../../common/agentHostChatContributionsService.js';
 import { IAgentHostGitService } from '../../../common/agentHostGitService.js';
+import { DEFAULT_DIFF_TIMEOUT_MS, IDiffComputeService } from '../../../common/diffComputeService.js';
 import { CLAUDE_AGENT_PROVIDER_ID, COPILOT_CLI_AGENT_PROVIDER_ID } from '../../../common/agent.js';
 import { readToolCallMeta } from '../../../common/meta/agentToolCallMeta.js';
 import { ActionType } from '../../../common/state/sessionActions.js';
 import type { ISessionFileDiff, URI as ProtocolURI } from '../../../common/state/sessionState.js';
 import { AgentHostStateManager, IAgentHostStateManager } from '../../agentHostStateManager.js';
-import { computeRequestCharacterDiffFile, computeRequestCharacterDiffSurvivalMetric, type IRequestCharacterRepositoryDiff } from './requestCharacterDiffSurvival.js';
+import { computeRequestCharacterDiffFile, computeRequestCharacterDiffSurvivalMetric, materializeRequestCharacterDiffFile, type IRequestCharacterRepositoryDiff } from './requestCharacterDiffSurvival.js';
 import { RequestDiffSurvivalBudgetError, RequestDiffSurvivalInputBudget, requestDiffSurvivalLimits } from './requestDiffSurvivalLimits.js';
-import { getRequestDiffSurvivalCostOutcome, RequestDiffSurvivalCostObservation, type IRequestDiffSurvivalFileCost, type IRequestDiffSurvivalSizeDetails, type RequestDiffSurvivalComparison, type RequestDiffSurvivalCostOutcome } from './requestDiffSurvivalCost.js';
+import { getRequestDiffSurvivalCostOutcome, RequestDiffSurvivalComputationError, RequestDiffSurvivalCostObservation, type IRequestDiffSurvivalFileCost, type IRequestDiffSurvivalSizeDetails, type RequestDiffSurvivalComparison, type RequestDiffSurvivalCostOutcome, type RequestDiffSurvivalEngine } from './requestDiffSurvivalCost.js';
 
 const CHARACTER_DIFF_LOG_PREFIX = '[RequestCharacterDiffSurvivalObservation] ';
 const ENABLED_ENVIRONMENT_VARIABLE = 'VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG';
@@ -101,7 +102,8 @@ interface IRequestEditToolEvidence {
 }
 
 interface IRequestCharacterDiffSurvivalObservation {
-	readonly schemaVersion: 4;
+	readonly schemaVersion: 5;
+	readonly engine: RequestDiffSurvivalEngine;
 	readonly recordKind: 'requestCharacterDiffSurvivalObservation';
 	readonly unit: 'utf16CodeUnit';
 	readonly sessionId: ProtocolURI;
@@ -143,6 +145,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 	readonly order = 150;
 
 	private readonly _enabled = process.env[ENABLED_ENVIRONMENT_VARIABLE] === '1';
+	private readonly _engine: RequestDiffSurvivalEngine;
 	private readonly _observations = new SequencerByKey<ProtocolURI>();
 	private readonly _states = new Map<ProtocolURI, IRequestDiffSurvivalState>();
 	protected readonly _expiryScheduler = this._register(this._createExpiryScheduler(() => this._expireTrackers()));
@@ -190,10 +193,16 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		@IAgentHostCheckpointService private readonly _checkpointService: IAgentHostCheckpointService,
 		@IAgentHostGitService private readonly _gitService: IAgentHostGitService,
 		@IAgentHostStateManager private readonly _stateManager: AgentHostStateManager,
+		@IDiffComputeService private readonly _diffComputeService: IDiffComputeService,
 	) {
 		super();
+		const engine = this._enabled ? process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE ?? 'host-character' : 'host-character';
+		if (engine !== 'host-character' && engine !== 'worker-character' && engine !== 'worker-hybrid') {
+			throw new Error(`Invalid VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE: ${engine}`);
+		}
+		this._engine = engine;
 		if (this._enabled) {
-			this._logService.info('[RequestDiffSurvival] Enabled for Agent Host chats');
+			this._logService.info(`[RequestDiffSurvival] Enabled for Agent Host chats; engine=${this._engine}`);
 		}
 	}
 
@@ -326,7 +335,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 				cost: new RequestDiffSurvivalCostObservation(this._logService, {
 					sessionId: turn.session, chatId: turn.channel, originatingRequestId: turnId,
 					observationRequestId: turnId, observationIndex: 0,
-				}),
+				}, undefined, this._engine),
 			};
 			state.trackers.push(tracker);
 			this._expireTrackers();
@@ -480,7 +489,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		tracker.cost = new RequestDiffSurvivalCostObservation(this._logService, {
 			sessionId: state.session, chatId: chat, originatingRequestId: tracker.originatingRequestId,
 			observationRequestId: tracker.lastObservationRequestId, observationIndex: tracker.observationCount,
-		});
+		}, undefined, this._engine);
 	}
 
 	private _writeUnavailableExpiry(state: IRequestDiffSurvivalState, chat: ProtocolURI, tracker: IRequestDiffSurvivalTracker, reason: UnavailableReason): void {
@@ -658,7 +667,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		const cost = expiryReason || tracker.observationCount === 0 ? tracker.cost : tracker.cost = new RequestDiffSurvivalCostObservation(this._logService, {
 			sessionId: session, chatId: chat, originatingRequestId: tracker.originatingRequestId,
 			observationRequestId, observationIndex: tracker.observationCount,
-		});
+		}, undefined, this._engine);
 		let outcome: RequestDiffSurvivalCostOutcome = 'failed';
 		let attemptedWrite = false;
 		try {
@@ -720,6 +729,10 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 				this._assertActive(state);
 				this._writeObservation(session, chat, observationRequestId, observationModel, observationTimestamp, tracker, undefined, error, expiryReason);
 				this._retireTracker(state, tracker, 'budgetRejected');
+			} else if (error instanceof RequestDiffSurvivalComputationError && !state.isDisposed && !tracker.isRetired) {
+				this._logService.warn(`[RequestDiffSurvival] Worker computation failed for ${chat}`, error);
+				this._writeObservation(session, chat, observationRequestId, observationModel, observationTimestamp, tracker, undefined, undefined, expiryReason, 'computationFailed');
+				this._retireTracker(state, tracker, expiryReason ?? 'failed');
 			} else if (expiryReason && !state.isDisposed && !this._store.isDisposed) {
 				this._logService.warn(`[RequestDiffSurvival] Expiry computation failed for ${chat}`, error);
 				this._writeObservation(session, chat, observationRequestId, observationModel, observationTimestamp, tracker, undefined, undefined, expiryReason, 'computationFailed');
@@ -752,7 +765,8 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 			diffs = undefined;
 		}
 		const observation: IRequestCharacterDiffSurvivalObservation = {
-			schemaVersion: 4,
+			schemaVersion: 5,
+			engine: this._engine,
 			recordKind: 'requestCharacterDiffSurvivalObservation',
 			unit: 'utf16CodeUnit',
 			sessionId: session,
@@ -769,7 +783,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 			observationIndex: tracker.observationCount,
 			maximumObservationCount: requestDiffSurvivalLimits.maximumFollowUpCount + 1,
 			maximumFollowUpCount: requestDiffSurvivalLimits.maximumFollowUpCount,
-			isFinalObservation: !!expiryReason || !!error || tracker.observationCount === requestDiffSurvivalLimits.maximumFollowUpCount,
+			isFinalObservation: !!expiryReason || !!error || !!unavailableReason || tracker.observationCount === requestDiffSurvivalLimits.maximumFollowUpCount,
 			complete: !!diffs && Object.values(diffs).every(diff => diff.errors.length === 0),
 			status: error ? 'budgetExceeded' : unavailableReason ? 'unavailable' : 'measured',
 			terminalReason: expiryReason,
@@ -918,7 +932,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 						cost.fileNotStarted(fileCost, fileOutcome);
 					}
 					this._sizeEvent(tracker, { phase: 'fileConstruction', status: fileOutcome, ...this._fileSizeDetails(fileCost) });
-					if (error instanceof RequestDiffSurvivalBudgetError || isCancellationError(error)) {
+					if (error instanceof RequestDiffSurvivalBudgetError || error instanceof RequestDiffSurvivalComputationError || isCancellationError(error)) {
 						throw error;
 					}
 					this._assertTrackerActive(state, tracker, expiryReason);
@@ -972,7 +986,15 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		const modifiedText = after?.toString() ?? '';
 		fileCost.beforeUtf16Length = originalText.length;
 		fileCost.afterUtf16Length = modifiedText.length;
-		return tracker.cost.measureFile(fileCost, () => computeRequestCharacterDiffFile(originalPath, modifiedPath, originalText, modifiedText,
-			retain ? (path, length) => this._reserveRetained(state, tracker, 128 + 2 * (path.length + length), fileCost) : undefined));
+		const reserve = retain ? (path: string, length: number) => this._reserveRetained(state, tracker, 128 + 2 * (path.length + length), fileCost) : undefined;
+		if (this._engine === 'host-character') {
+			return tracker.cost.measureFile(fileCost, () => computeRequestCharacterDiffFile(originalPath, modifiedPath, originalText, modifiedText, reserve));
+		}
+		return tracker.cost.measureWorkerFile(fileCost,
+			() => this._diffComputeService.computeSurvivalDiff(originalText, modifiedText, this._engine === 'worker-hybrid' ? 'hybrid' : 'character', DEFAULT_DIFF_TIMEOUT_MS),
+			changes => {
+				this._assertTrackerActive(state, tracker, expiryReason);
+				return materializeRequestCharacterDiffFile(originalPath, modifiedPath, originalText, modifiedText, changes, reserve);
+			});
 	}
 }

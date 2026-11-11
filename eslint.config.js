@@ -1796,7 +1796,7 @@ export default defineConfig(
 					]
 				},
 				{
-					'target': 'src/vs/platform/agentHost/node/diffWorkerMain.ts',
+					'target': 'src/vs/platform/agentHost/node/{diffWorkerMain,survivalDiff}.ts',
 					'layer': 'node',
 					'restrictions': [
 						'vs/base/~',

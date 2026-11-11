@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { LcsDiff, StringDiffSequence } from '../../../../../base/common/diff/diff.js';
+import type { ISurvivalDiffChange } from '../../../common/diffComputeService.js';
 
 interface IRequestCharacterDiffSurvivalMetric {
 	readonly survivingAdditions: number;
@@ -41,22 +42,31 @@ export function computeRequestCharacterDiffFile(
 	after: string,
 	reserveChange?: (path: string, textLength: number) => void,
 ): IRequestCharacterDiffFile {
-	const minus: IRequestCharacterChange[] = [];
-	const plus: IRequestCharacterChange[] = [];
+	let changes: readonly ISurvivalDiffChange[] = [];
 	if (before !== after) {
 		const result = new LcsDiff(new StringDiffSequence(before), new StringDiffSequence(after)).ComputeDiff(false);
 		if (result.quitEarly) {
 			throw new Error('Character diff did not complete');
 		}
-		for (const change of result.changes) {
-			if (change.originalLength > 0) {
-				reserveChange?.(beforePath ?? afterPath ?? '', change.originalLength);
-				minus.push({ path: beforePath ?? afterPath ?? '', offset: change.originalStart, length: change.originalLength, text: before.slice(change.originalStart, change.originalStart + change.originalLength) });
-			}
-			if (change.modifiedLength > 0) {
-				reserveChange?.(afterPath ?? beforePath ?? '', change.modifiedLength);
-				plus.push({ path: afterPath ?? beforePath ?? '', offset: change.modifiedStart, length: change.modifiedLength, text: after.slice(change.modifiedStart, change.modifiedStart + change.modifiedLength) });
-			}
+		changes = result.changes;
+	}
+	return materializeRequestCharacterDiffFile(beforePath, afterPath, before, after, changes, reserveChange);
+}
+
+export function materializeRequestCharacterDiffFile(
+	beforePath: string | undefined, afterPath: string | undefined, before: string, after: string,
+	changes: readonly ISurvivalDiffChange[], reserveChange?: (path: string, textLength: number) => void,
+): IRequestCharacterDiffFile {
+	const minus: IRequestCharacterChange[] = [];
+	const plus: IRequestCharacterChange[] = [];
+	for (const change of changes) {
+		if (change.originalLength > 0) {
+			reserveChange?.(beforePath ?? afterPath ?? '', change.originalLength);
+			minus.push({ path: beforePath ?? afterPath ?? '', offset: change.originalStart, length: change.originalLength, text: before.slice(change.originalStart, change.originalStart + change.originalLength) });
+		}
+		if (change.modifiedLength > 0) {
+			reserveChange?.(afterPath ?? beforePath ?? '', change.modifiedLength);
+			plus.push({ path: afterPath ?? beforePath ?? '', offset: change.modifiedStart, length: change.modifiedLength, text: after.slice(change.modifiedStart, change.modifiedStart + change.modifiedLength) });
 		}
 	}
 	return { beforePath, afterPath, minus, plus };

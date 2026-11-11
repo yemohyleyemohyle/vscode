@@ -6,7 +6,7 @@
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../log/common/log.js';
-import { computeRequestCharacterDiffFile } from '../../node/chatContributions/requestDiffSurvival/requestCharacterDiffSurvival.js';
+import { computeRequestCharacterDiffFile, materializeRequestCharacterDiffFile } from '../../node/chatContributions/requestDiffSurvival/requestCharacterDiffSurvival.js';
 import { RequestDiffSurvivalCostObservation, type IRequestDiffSurvivalCostClock } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalCost.js';
 
 interface ICostEvent {
@@ -23,6 +23,10 @@ interface ICostEvent {
 	readonly startedFileCount: number;
 	readonly addedCharacters: number | null;
 	readonly comparisonKind: string;
+	readonly schemaVersion: number;
+	readonly engine: string;
+	readonly measurementScope: string;
+	readonly serviceCallElapsedMs: number | null;
 }
 
 class CostLog extends NullLogService {
@@ -101,6 +105,51 @@ suite('Agent Host Request Diff Survival Cost', () => {
 		assert.deepStrictEqual({
 			status: event.status, elapsed: event.elapsedMs, cpu: event.cpuTotalMs, added: event.addedCharacters, started: event.startedFileCount,
 		}, { status: 'failed', elapsed: 2, cpu: 1, added: null, started: 1 });
+	});
+
+	test('aggregates worker CPU, not host CPU or service-call latency', async () => {
+		const log = new CostLog();
+		let now = 0;
+		const cost = new RequestDiffSurvivalCostObservation(log, identity, {
+			now: () => now,
+			cpuUsage: () => { throw new Error('Host CPU must not be sampled'); },
+		}, 'worker-hybrid');
+		cost.beginComparison('originalRequest');
+		for (let index = 0; index < 2; index++) {
+			await cost.measureWorkerFile(cost.createFile('originalRequest', 0, index), async () => {
+				now += 100;
+				return {
+					status: 'completed', changes: [{ originalStart: 0, originalLength: 0, modifiedStart: 0, modifiedLength: 1 }],
+					measurement: { elapsedMs: 7, cpuMeasurementStatus: 'available', cpuUserMs: 4, cpuSystemMs: 1 },
+				};
+			}, changes => materializeRequestCharacterDiffFile('file', 'file', '', 'x', changes));
+		}
+		cost.finishComparison('originalRequest', 'completed');
+		cost.finishObservation('completed');
+		const event = log.events.find(event => event.phase === 'observation')!;
+		assert.deepStrictEqual({
+			schema: event.schemaVersion, engine: event.engine, scope: event.measurementScope,
+			elapsed: event.elapsedMs, serviceElapsed: event.serviceCallElapsedMs, cpu: event.cpuTotalMs, warnings: log.warnings,
+		}, { schema: 2, engine: 'worker-hybrid', scope: 'diffAndOffsetMapping', elapsed: 14, serviceElapsed: 200, cpu: 10, warnings: [] });
+	});
+
+	test('worker timeout reports consumed CPU and transport failure is unknown, not zero', async () => {
+		const log = new CostLog();
+		const cost = new RequestDiffSurvivalCostObservation(log, identity, { now: () => 0 }, 'worker-character');
+		await assert.rejects(cost.measureWorkerFile(cost.createFile('originalRequest', 0, 0), async () => ({
+			status: 'timedOut', error: 'timed out',
+			measurement: { elapsedMs: 5, cpuMeasurementStatus: 'available', cpuUserMs: 3, cpuSystemMs: 1 },
+		}), () => { throw new Error('Must not materialize'); }), /timed out/);
+		await assert.rejects(cost.measureWorkerFile(cost.createFile('originalRequest', 0, 1),
+			async () => { throw new Error('worker exited'); }, () => { throw new Error('Must not materialize'); }), /worker exited/);
+		cost.finishObservation('failed');
+		assert.deepStrictEqual(log.events.filter(event => event.phase !== 'comparison').map(event => ({
+			phase: event.phase, status: event.status, elapsed: event.elapsedMs, cpuStatus: event.cpuMeasurementStatus, cpu: event.cpuTotalMs,
+		})), [
+			{ phase: 'file', status: 'failed', elapsed: 5, cpuStatus: 'available', cpu: 4 },
+			{ phase: 'file', status: 'failed', elapsed: null, cpuStatus: 'failed', cpu: null },
+			{ phase: 'observation', status: 'failed', elapsed: null, cpuStatus: 'failed', cpu: null },
+		]);
 	});
 
 	test('marks unsupported CPU explicitly while preserving elapsed timing', () => {

@@ -53,6 +53,8 @@ import { AgentConfigurationService, IAgentConfigurationService } from '../../nod
 import { IAgentHostChangesetService } from '../../common/agentHostChangesetService.js';
 import { IAgentHostGitStateService } from '../../common/agentHostGitStateService.js';
 import { IAgentHostGitService } from '../../common/agentHostGitService.js';
+import { IDiffComputeService } from '../../common/diffComputeService.js';
+import { InProcessDiffComputeService } from './inProcessDiffComputeService.js';
 import type { IAgentHostCustomizationEnablementService } from '../../node/agentHostCustomizationEnablementService.js';
 import { AgentSideEffects } from '../../node/agentSideEffects.js';
 import { AgentHostStateManager, IAgentHostStateManager } from '../../node/agentHostStateManager.js';
@@ -215,6 +217,7 @@ suite('AgentSideEffects — turn hang telemetry', () => {
 			[IAgentHostCheckpointService, checkpointService],
 			[IAgentHostGitStateService, createNoopGitStateService()],
 			[IAgentHostGitService, createNoopGitService()],
+			[IDiffComputeService, new InProcessDiffComputeService()],
 			[IAgentHostStateManager, stateManager],
 			[IAgentSessionRegistry, disposables.add(new AgentSessionRegistry(disposables.add(new AgentHostDatabase(':memory:'))))],
 			[IFileService, disposables.add(new FileService(logService))],

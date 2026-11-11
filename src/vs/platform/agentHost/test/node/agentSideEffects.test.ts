@@ -59,6 +59,8 @@ import { IAgentHostChatContributions } from '../../common/agentHostChatContribut
 import { IAgentEditAttributionService, NullAgentEditAttributionService } from '../../common/fileEditAttribution.js';
 import { IAgentHostChangesetService, StaticChangesetKind } from '../../common/agentHostChangesetService.js';
 import { IAgentHostGitService } from '../../common/agentHostGitService.js';
+import { IDiffComputeService } from '../../common/diffComputeService.js';
+import { InProcessDiffComputeService } from './inProcessDiffComputeService.js';
 import { IAgentHostGitStateService } from '../../common/agentHostGitStateService.js';
 import { AgentSideEffects, IAgentSideEffectsOptions } from '../../node/agentSideEffects.js';
 import { AgentHostLocalTurns, IAgentHostLocalTurns } from '../../node/agentHostLocalTurns.js';
@@ -279,6 +281,7 @@ function createTestSideEffects(
 		[IAgentHostCheckpointService, checkpointService],
 		[IAgentHostGitStateService, options.gitStateService ?? new NoopGitStateService()],
 		[IAgentHostGitService, gitService],
+		[IDiffComputeService, new InProcessDiffComputeService()],
 		[IAgentHostStateManager, stateManager],
 		[IAgentSessionRegistry, disposables.add(new AgentSessionRegistry(disposables.add(new AgentHostDatabase(':memory:'))))],
 		[IFileService, options.fileService ?? contributionFileService],

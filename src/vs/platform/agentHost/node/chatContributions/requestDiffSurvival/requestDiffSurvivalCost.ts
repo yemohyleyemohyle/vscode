@@ -6,11 +6,15 @@
 import { isCancellationError } from '../../../../../base/common/errors.js';
 import type { ILogService } from '../../../../log/common/log.js';
 import type { URI as ProtocolURI } from '../../../common/state/sessionState.js';
+import type { ISurvivalDiffChange, ISurvivalDiffResult } from '../../../common/diffComputeService.js';
 import type { IRequestCharacterDiffFile } from './requestCharacterDiffSurvival.js';
 import { RequestDiffSurvivalBudgetError, RequestDiffSurvivalInputBudget, requestDiffSurvivalLimits } from './requestDiffSurvivalLimits.js';
 
 export type RequestDiffSurvivalComparison = 'originalRequest' | 'baselineToLatest' | 'requestResultToLatest';
 export type RequestDiffSurvivalCostOutcome = 'completed' | 'failed' | 'budgetRejected' | 'cancelled';
+export type RequestDiffSurvivalEngine = 'host-character' | 'worker-character' | 'worker-hybrid';
+
+export class RequestDiffSurvivalComputationError extends Error { }
 
 interface ICostIdentity {
 	readonly sessionId: ProtocolURI;
@@ -58,6 +62,7 @@ interface IComputeTotals {
 	elapsedMs: number;
 	cpuUserMs: number;
 	cpuSystemMs: number;
+	serviceCallElapsedMs: number;
 }
 
 const comparisons: readonly RequestDiffSurvivalComparison[] = ['originalRequest', 'baselineToLatest', 'requestResultToLatest'];
@@ -67,7 +72,7 @@ const defaultClock: IRequestDiffSurvivalCostClock = {
 };
 
 function createTotals(): IComputeTotals {
-	return { fileCount: 0, startedFileCount: 0, completedFileCount: 0, failedFileCount: 0, elapsedMs: 0, cpuUserMs: 0, cpuSystemMs: 0 };
+	return { fileCount: 0, startedFileCount: 0, completedFileCount: 0, failedFileCount: 0, elapsedMs: 0, cpuUserMs: 0, cpuSystemMs: 0, serviceCallElapsedMs: 0 };
 }
 
 export function getRequestDiffSurvivalCostOutcome(error: unknown): RequestDiffSurvivalCostOutcome {
@@ -84,13 +89,15 @@ export class RequestDiffSurvivalCostObservation {
 	private readonly _totals = createTotals();
 	private _cpuStatus: 'available' | 'unsupported' | 'failed';
 	private _pendingSizeEvents: object[] | undefined;
+	private _elapsedAvailable = true;
 
 	constructor(
 		private readonly _logService: ILogService,
 		private readonly _identity: ICostIdentity,
 		private readonly _clock: IRequestDiffSurvivalCostClock = defaultClock,
+		private readonly _engine: RequestDiffSurvivalEngine = 'host-character',
 	) {
-		this._cpuStatus = _clock.cpuUsage ? 'available' : 'unsupported';
+		this._cpuStatus = _engine !== 'host-character' || _clock.cpuUsage ? 'available' : 'unsupported';
 	}
 
 	beginComparison(comparison: RequestDiffSurvivalComparison): void {
@@ -125,11 +132,70 @@ export class RequestDiffSurvivalCostObservation {
 			}
 			const totals: IComputeTotals = {
 				fileCount: 1, startedFileCount: 1, completedFileCount: result ? 1 : 0, failedFileCount: result ? 0 : 1,
-				elapsedMs, cpuUserMs: (cpu?.user ?? 0) / 1000, cpuSystemMs: (cpu?.system ?? 0) / 1000,
+				elapsedMs, cpuUserMs: (cpu?.user ?? 0) / 1000, cpuSystemMs: (cpu?.system ?? 0) / 1000, serviceCallElapsedMs: 0,
 			};
 			this._addFileTotals(file.comparisonKind, totals);
 			this._computeEvent('file', outcome, totals, {
 				...file,
+				addedCharacters: result?.plus.reduce((sum, change) => sum + change.length, 0) ?? null,
+				removedCharacters: result?.minus.reduce((sum, change) => sum + change.length, 0) ?? null,
+				changeRangeCount: result ? result.plus.length + result.minus.length : null,
+			});
+		}
+
+	}
+
+	async measureWorkerFile(
+		file: IRequestDiffSurvivalFileCost,
+		compute: () => Promise<ISurvivalDiffResult>,
+		materialize: (changes: readonly ISurvivalDiffChange[]) => IRequestCharacterDiffFile,
+	): Promise<IRequestCharacterDiffFile> {
+		const started = this._clock.now();
+		file.computationStarted = true;
+		let response: ISurvivalDiffResult | undefined;
+		let result: IRequestCharacterDiffFile | undefined;
+		let serviceCallElapsedMs = 0;
+		let outcome: RequestDiffSurvivalCostOutcome = 'failed';
+		try {
+			try {
+				response = await compute();
+			} finally {
+				serviceCallElapsedMs = this._clock.now() - started;
+			}
+			if (response.status !== 'completed') {
+				throw new RequestDiffSurvivalComputationError(response.error);
+			}
+			result = materialize(response.changes);
+			outcome = 'completed';
+			return result;
+		} catch (error) {
+			outcome = getRequestDiffSurvivalCostOutcome(error);
+			if (!response && outcome !== 'cancelled') {
+				throw new RequestDiffSurvivalComputationError(error instanceof Error ? error.message : String(error));
+			}
+			throw error;
+		} finally {
+			const measurement = response?.measurement;
+			if (!measurement) {
+				this._cpuStatus = 'failed';
+				this._elapsedAvailable = false;
+				this._logService.warn('[RequestDiffSurvivalCost] Worker measurement unavailable');
+			} else {
+				if (measurement.cpuMeasurementStatus !== 'available') {
+					this._cpuStatus = measurement.cpuMeasurementStatus;
+				}
+				if (measurement.cpuMeasurementError) {
+					this._logService.warn('[RequestDiffSurvivalCost] Worker thread CPU measurement failed', measurement.cpuMeasurementError);
+				}
+			}
+			const totals: IComputeTotals = {
+				fileCount: 1, startedFileCount: 1, completedFileCount: result ? 1 : 0, failedFileCount: result ? 0 : 1,
+				elapsedMs: measurement?.elapsedMs ?? 0, cpuUserMs: measurement?.cpuUserMs ?? 0, cpuSystemMs: measurement?.cpuSystemMs ?? 0,
+				serviceCallElapsedMs,
+			};
+			this._addFileTotals(file.comparisonKind, totals);
+			this._computeEvent('file', outcome, totals, {
+				...file, computationOutcome: response?.status ?? 'unknown',
 				addedCharacters: result?.plus.reduce((sum, change) => sum + change.length, 0) ?? null,
 				removedCharacters: result?.minus.reduce((sum, change) => sum + change.length, 0) ?? null,
 				changeRangeCount: result ? result.plus.length + result.minus.length : null,
@@ -187,6 +253,7 @@ export class RequestDiffSurvivalCostObservation {
 			target.elapsedMs += file.elapsedMs;
 			target.cpuUserMs += file.cpuUserMs;
 			target.cpuSystemMs += file.cpuSystemMs;
+			target.serviceCallElapsedMs += file.serviceCallElapsedMs;
 		}
 	}
 
@@ -196,16 +263,21 @@ export class RequestDiffSurvivalCostObservation {
 		totals: IComputeTotals,
 		details: { readonly comparisonKind?: RequestDiffSurvivalComparison; readonly reason?: RequestDiffSurvivalCostOutcome } & Partial<IRequestDiffSurvivalFileCost> & {
 			readonly addedCharacters?: number | null; readonly removedCharacters?: number | null; readonly changeRangeCount?: number | null;
+			readonly computationOutcome?: string;
 		} = {},
 	): void {
 		const measured = totals.startedFileCount > 0;
 		const cpuAvailable = measured && this._cpuStatus === 'available';
 		this._write(RequestDiffSurvivalCostObservation.computeLogPrefix, {
-			...this._identity, schemaVersion: 1, recordKind: 'requestCharacterDiffComputeObservation',
+			...this._identity, schemaVersion: 2, recordKind: 'requestCharacterDiffComputeObservation',
+			engine: this._engine, algorithm: this._engine === 'worker-hybrid' ? 'hybrid' : 'character',
+			executionLocation: this._engine === 'host-character' ? 'host' : 'worker',
+			measurementScope: this._engine === 'host-character' ? 'characterDiffAndConstruction' : 'diffAndOffsetMapping',
 			timestamp: new Date().toISOString(), phase, status, timeUnit: 'milliseconds', characterUnit: 'utf16CodeUnit',
 			fileCount: totals.fileCount, startedFileCount: totals.startedFileCount,
 			completedFileCount: totals.completedFileCount, failedFileCount: totals.failedFileCount,
-			elapsedMs: measured ? totals.elapsedMs : null,
+			elapsedMs: measured && this._elapsedAvailable ? totals.elapsedMs : null,
+			serviceCallElapsedMs: measured && this._engine !== 'host-character' ? totals.serviceCallElapsedMs : null,
 			cpuMeasurementStatus: measured ? this._cpuStatus : 'notStarted',
 			cpuUserMs: cpuAvailable ? totals.cpuUserMs : null,
 			cpuSystemMs: cpuAvailable ? totals.cpuSystemMs : null,

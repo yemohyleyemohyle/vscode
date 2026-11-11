@@ -315,6 +315,7 @@ suite('Agent Host Edit ARC Reporter', () => {
 		const detailedResult = new DeferredPromise<IDetailedDiffResult>();
 		const diffComputeService: IDiffComputeService = {
 			_serviceBrand: undefined,
+			computeSurvivalDiff: async () => { throw new Error('Unexpected survival diff'); },
 			computeDiffCounts: async () => ({ added: 0, removed: 0, changes: [] }),
 			computeDetailedDiff: async () => {
 				detailedStarted.complete();

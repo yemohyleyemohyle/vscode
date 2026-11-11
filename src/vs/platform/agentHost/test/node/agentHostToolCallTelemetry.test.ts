@@ -60,6 +60,8 @@ import { AgentConfigurationService, IAgentConfigurationService } from '../../nod
 import { IAgentHostChangesetService } from '../../common/agentHostChangesetService.js';
 import { IAgentHostGitStateService } from '../../common/agentHostGitStateService.js';
 import { IAgentHostGitService } from '../../common/agentHostGitService.js';
+import { IDiffComputeService } from '../../common/diffComputeService.js';
+import { InProcessDiffComputeService } from './inProcessDiffComputeService.js';
 import { AgentSideEffects } from '../../node/agentSideEffects.js';
 import type { IAgentHostCustomizationEnablementService } from '../../node/agentHostCustomizationEnablementService.js';
 import { AgentHostStateManager, IAgentHostStateManager, creationTimeChatStorageResource } from '../../node/agentHostStateManager.js';
@@ -263,6 +265,7 @@ suite('AgentSideEffects — tool call telemetry', () => {
 			[IAgentHostCheckpointService, NULL_CHECKPOINT_SERVICE],
 			[IAgentHostGitStateService, createNoopGitStateService()],
 			[IAgentHostGitService, createNoopGitService()],
+			[IDiffComputeService, new InProcessDiffComputeService()],
 			[IAgentHostStateManager, stateManager],
 			[IAgentSessionRegistry, disposables.add(new AgentSessionRegistry(disposables.add(new AgentHostDatabase(':memory:'))))],
 			[IFileService, disposables.add(new FileService(logService))],

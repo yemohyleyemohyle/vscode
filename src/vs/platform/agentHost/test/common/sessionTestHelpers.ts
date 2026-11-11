@@ -7,7 +7,7 @@ import type { IReference } from '../../../../base/common/lifecycle.js';
 import { Schemas } from '../../../../base/common/network.js';
 import { URI } from '../../../../base/common/uri.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
-import type { IDetailedDiffResult, IDiffComputeService, IDiffCountResult, IDiffHunksResult } from '../../common/diffComputeService.js';
+import type { IDetailedDiffResult, IDiffComputeService, IDiffCountResult, IDiffHunksResult, ISurvivalDiffResult } from '../../common/diffComputeService.js';
 import { MAX_TERMINAL_OUTPUT_BYTES, MAX_TOOL_RESULT_RESOURCE_BYTES, type IFileEditContent, type IFileEditRecord, type IPersistedTurnRecord, type IReviewedFileRecord, type ISessionCatalogSyncAcknowledgement, type ISessionCatalogSyncPendingSnapshot, type ISessionCatalogSyncSnapshot, type ISessionDatabase, type ISessionDataService, type ISessionRowsWatermark, type IToolResultResource, type SessionCatalogSyncTransitionResult, type SessionCatalogSyncWriteResult, type SessionCatalogSyncWriteValidator, SESSION_FOREIGN_TURN_IDS_METADATA_KEY, SESSION_ROW_OWNER_CHAT_METADATA_KEY, type ITurnCheckpointRecord, type StoredAssistantResponsePart } from '../../common/sessionDataService.js';
 import type { IAgentHostCheckpointService } from '../../common/agentHostCheckpointService.js';
 import type { IAgentHostGitStateService } from '../../common/agentHostGitStateService.js';
@@ -838,6 +838,10 @@ export class TestDiffComputeService implements IDiffComputeService {
 	detailedCallCount = 0;
 
 	constructor(private readonly _result?: IDiffCountResult) { }
+
+	async computeSurvivalDiff(): Promise<ISurvivalDiffResult> {
+		throw new Error('Survival diff not implemented by TestDiffComputeService');
+	}
 
 	async computeDiffCounts(original: string, modified: string): Promise<IDiffCountResult> {
 		this.callCount++;

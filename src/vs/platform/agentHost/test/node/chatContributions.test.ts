@@ -28,6 +28,8 @@ import { IAgentEditAttributionService, NullAgentEditAttributionService } from '.
 import { AgentHostClientType } from '../../common/agentHostClientInfo.js';
 import { IAgentHostGitStateService } from '../../common/agentHostGitStateService.js';
 import { IAgentHostGitService } from '../../common/agentHostGitService.js';
+import { IDiffComputeService } from '../../common/diffComputeService.js';
+import { InProcessDiffComputeService } from './inProcessDiffComputeService.js';
 import { AgentHostLaunchKind, createUnknownAgentHostClientTelemetryContext } from '../../common/agentHostTelemetry.js';
 import { createChatMementoKey, createSessionMementoKey, IAgentHostChatContributions, type IAgentHostChatContribution, type IAgentHostChatContributionContext, type IAgentHostChatContributionHost, type IHydrationContext, type IIncomingRequest, type IAppliedClientAction, type IDispatchedAction, type IOutgoingTurn, type IOutgoingTurnContributionResult, type IRestoredChat, type ITurnEnd, type IncomingRequestDisposition } from '../../common/agentHostChatContributionsService.js';
 import { AgentHostArtifactIntegrationsConfigKey, AgentHostArtifactToolsConfigKey, AgentHostMarkdownPlanRichLinksEnabledConfigKey, AgentHostWorkspaceSnapshotEnabledConfigKey, type ISchema, type SchemaDefinition, type SchemaValue } from '../../common/agentHostSchema.js';
@@ -941,6 +943,7 @@ function createBuiltInContributions(disposables: ReturnType<typeof ensureNoDispo
 		[IAgentHostStateManager, stateManager],
 		[IAgentHostGitStateService, gitStateService],
 		[IAgentHostGitService, gitService],
+		[IDiffComputeService, new InProcessDiffComputeService()],
 		[IAgentSessionRegistry, sessionRegistry],
 		[IFileService, fileService],
 		[IAgentEditAttributionService, new NullAgentEditAttributionService()],
