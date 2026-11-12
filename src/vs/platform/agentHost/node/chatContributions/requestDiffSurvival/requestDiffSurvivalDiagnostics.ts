@@ -8,7 +8,7 @@ import { IntervalTimer } from '../../../../../base/common/async.js';
 import { Disposable, type IDisposable } from '../../../../../base/common/lifecycle.js';
 import { generateUuid } from '../../../../../base/common/uuid.js';
 import type { ILogService } from '../../../../log/common/log.js';
-import type { RequestDiffSurvivalCostOutcome, RequestDiffSurvivalEngine } from './requestDiffSurvivalCost.js';
+import type { RequestDiffSurvivalCostOutcome } from './requestDiffSurvivalCost.js';
 
 const LOG_PREFIX = '[RequestDiffSurvivalDiagnostics] ';
 const WINDOW_INTERVAL_MS = 1000;
@@ -87,7 +87,7 @@ export type RequestDiffSurvivalDiagnosticRecord = DiagnosticDetails & {
 	readonly timestamp: string;
 	readonly timeUnit: 'ms';
 	readonly timingKind: 'elapsed';
-	readonly engine: RequestDiffSurvivalEngine | 'disabled';
+	readonly engine: 'worker-hybrid' | 'disabled';
 };
 
 export interface IRequestDiffSurvivalDiagnosticTask {
@@ -112,7 +112,7 @@ export class RequestDiffSurvivalDiagnostics extends Disposable {
 	private _lastEligibleTurnEndAt: number | undefined;
 
 	constructor(
-		private readonly _engine: RequestDiffSurvivalEngine | 'disabled',
+		private readonly _engine: 'worker-hybrid' | 'disabled',
 		private readonly _logService: ILogService,
 		private readonly _runtime: IRequestDiffSurvivalDiagnosticsRuntime = defaultRuntime,
 	) {

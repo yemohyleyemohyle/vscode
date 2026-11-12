@@ -6,8 +6,9 @@
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../log/common/log.js';
-import { computeRequestCharacterDiffFile, materializeRequestCharacterDiffFile } from '../../node/chatContributions/requestDiffSurvival/requestCharacterDiffSurvival.js';
-import { RequestDiffSurvivalCostObservation, type IRequestDiffSurvivalCostClock } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalCost.js';
+import type { ISurvivalDiffMeasurement } from '../../common/diffComputeService.js';
+import { materializeRequestCharacterDiffFile } from '../../node/chatContributions/requestDiffSurvival/requestCharacterDiffSurvival.js';
+import { RequestDiffSurvivalCostObservation } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalCost.js';
 
 interface ICostEvent {
 	readonly recordKind: string;
@@ -43,99 +44,42 @@ class CostLog extends NullLogService {
 suite('Agent Host Request Diff Survival Cost', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
 	const identity = { sessionId: 'session', chatId: 'chat', originatingRequestId: 'base', observationRequestId: 'later', observationIndex: 3 };
+	const changes = [{ originalStart: 0, originalLength: 0, modifiedStart: 0, modifiedLength: 1 }];
+	const materialize = () => materializeRequestCharacterDiffFile('file', 'file', '', 'x', changes);
 
-	function fixture() {
-		const log = new CostLog();
-		let elapsed = 0;
-		let user = 0;
-		let system = 0;
-		const clock: IRequestDiffSurvivalCostClock = {
-			now: () => elapsed,
-			cpuUsage: previous => ({ user: user - (previous?.user ?? 0), system: system - (previous?.system ?? 0) }),
-		};
-		const advance = (ms: number, cpuUser: number, cpuSystem: number) => {
-			elapsed += ms;
-			user += cpuUser;
-			system += cpuSystem;
-		};
-		return { log, clock, advance, cost: new RequestDiffSurvivalCostObservation(log, identity, clock) };
-	}
-
-	test('records per-file timing and sums the same base request/index at comparison and observation scope', () => {
-		const f = fixture();
-		const file = f.cost.createFile('originalRequest', 0, 0);
-		file.fileInputBytes = 2;
-		file.beforeUtf16Length = 0;
-		file.afterUtf16Length = 2;
-		f.cost.beginComparison('originalRequest');
-		const first = f.cost.measureFile(file, () => {
-			f.advance(7, 4000, 1000);
-			return computeRequestCharacterDiffFile(undefined, 'file', '', 'xy');
-		});
-		f.cost.finishComparison('originalRequest', 'completed');
-		f.cost.beginComparison('baselineToLatest');
-		f.cost.measureFile(f.cost.createFile('baselineToLatest', 1, 0), () => {
-			f.advance(3, 2000, 500);
-			return first;
-		});
-		f.cost.finishComparison('baselineToLatest', 'completed');
-		f.cost.finishComparison('requestResultToLatest', 'reused');
-		f.cost.finishObservation('completed');
-		assert.deepStrictEqual(f.log.events.map(event => ({
-			phase: event.phase, comparison: event.comparisonKind, base: event.originatingRequestId, index: event.observationIndex,
-			status: event.status, elapsed: event.elapsedMs, cpu: [event.cpuUserMs, event.cpuSystemMs, event.cpuTotalMs],
-		})), [
-			{ phase: 'file', comparison: 'originalRequest', base: 'base', index: 3, status: 'completed', elapsed: 7, cpu: [4, 1, 5] },
-			{ phase: 'comparison', comparison: 'originalRequest', base: 'base', index: 3, status: 'completed', elapsed: 7, cpu: [4, 1, 5] },
-			{ phase: 'file', comparison: 'baselineToLatest', base: 'base', index: 3, status: 'completed', elapsed: 3, cpu: [2, 0.5, 2.5] },
-			{ phase: 'comparison', comparison: 'baselineToLatest', base: 'base', index: 3, status: 'completed', elapsed: 3, cpu: [2, 0.5, 2.5] },
-			{ phase: 'comparison', comparison: 'requestResultToLatest', base: 'base', index: 3, status: 'reused', elapsed: null, cpu: [null, null, null] },
-			{ phase: 'observation', comparison: undefined, base: 'base', index: 3, status: 'completed', elapsed: 10, cpu: [6, 1.5, 7.5] },
-		]);
-	});
-
-	test('records a failed call without replacing its exception or fabricating output', () => {
-		const f = fixture();
-		const failure = new Error('diff failed');
-		assert.throws(() => f.cost.measureFile(f.cost.createFile('originalRequest', 0, 0), () => {
-			f.advance(2, 1000, 0);
-			throw failure;
-		}), error => error === failure);
-		const event = f.log.events[0];
-		assert.deepStrictEqual({
-			status: event.status, elapsed: event.elapsedMs, cpu: event.cpuTotalMs, added: event.addedCharacters, started: event.startedFileCount,
-		}, { status: 'failed', elapsed: 2, cpu: 1, added: null, started: 1 });
-	});
-
-	test('aggregates worker CPU, not host CPU or service-call latency', async () => {
+	test('aggregates worker CPU at file, comparison and observation scope, not service-call latency', async () => {
 		const log = new CostLog();
 		let now = 0;
-		const cost = new RequestDiffSurvivalCostObservation(log, identity, {
-			now: () => now,
-			cpuUsage: () => { throw new Error('Host CPU must not be sampled'); },
-		}, 'worker-hybrid');
-		cost.beginComparison('originalRequest');
-		for (let index = 0; index < 2; index++) {
-			await cost.measureWorkerFile(cost.createFile('originalRequest', 0, index), async () => {
+		const cost = new RequestDiffSurvivalCostObservation(log, identity, { now: () => now });
+		for (const [comparison, elapsedMs, cpuUserMs, cpuSystemMs] of [
+			['originalRequest', 7, 4, 1], ['baselineToLatest', 3, 2, 0.5],
+		] as const) {
+			cost.beginComparison(comparison);
+			await cost.measureWorkerFile(cost.createFile(comparison, 0, 0), async () => {
 				now += 100;
-				return {
-					status: 'completed', changes: [{ originalStart: 0, originalLength: 0, modifiedStart: 0, modifiedLength: 1 }],
-					measurement: { elapsedMs: 7, cpuMeasurementStatus: 'available', cpuUserMs: 4, cpuSystemMs: 1 },
-				};
-			}, changes => materializeRequestCharacterDiffFile('file', 'file', '', 'x', changes));
+				return { status: 'completed', changes, measurement: { elapsedMs, cpuMeasurementStatus: 'available', cpuUserMs, cpuSystemMs } };
+			}, materialize);
+			cost.finishComparison(comparison, 'completed');
 		}
-		cost.finishComparison('originalRequest', 'completed');
+		cost.finishComparison('requestResultToLatest', 'reused');
 		cost.finishObservation('completed');
-		const event = log.events.find(event => event.phase === 'observation')!;
-		assert.deepStrictEqual({
+		assert.deepStrictEqual(log.events.map(event => ({
+			phase: event.phase, comparison: event.comparisonKind, base: event.originatingRequestId, index: event.observationIndex,
+			status: event.status, elapsed: event.elapsedMs, serviceElapsed: event.serviceCallElapsedMs, cpu: event.cpuTotalMs,
 			schema: event.schemaVersion, engine: event.engine, scope: event.measurementScope,
-			elapsed: event.elapsedMs, serviceElapsed: event.serviceCallElapsedMs, cpu: event.cpuTotalMs, warnings: log.warnings,
-		}, { schema: 2, engine: 'worker-hybrid', scope: 'diffAndOffsetMapping', elapsed: 14, serviceElapsed: 200, cpu: 10, warnings: [] });
+		})), [
+			{ phase: 'file', comparison: 'originalRequest', base: 'base', index: 3, status: 'completed', elapsed: 7, serviceElapsed: 100, cpu: 5, schema: 2, engine: 'worker-hybrid', scope: 'diffAndOffsetMapping' },
+			{ phase: 'comparison', comparison: 'originalRequest', base: 'base', index: 3, status: 'completed', elapsed: 7, serviceElapsed: 100, cpu: 5, schema: 2, engine: 'worker-hybrid', scope: 'diffAndOffsetMapping' },
+			{ phase: 'file', comparison: 'baselineToLatest', base: 'base', index: 3, status: 'completed', elapsed: 3, serviceElapsed: 100, cpu: 2.5, schema: 2, engine: 'worker-hybrid', scope: 'diffAndOffsetMapping' },
+			{ phase: 'comparison', comparison: 'baselineToLatest', base: 'base', index: 3, status: 'completed', elapsed: 3, serviceElapsed: 100, cpu: 2.5, schema: 2, engine: 'worker-hybrid', scope: 'diffAndOffsetMapping' },
+			{ phase: 'comparison', comparison: 'requestResultToLatest', base: 'base', index: 3, status: 'reused', elapsed: null, serviceElapsed: null, cpu: null, schema: 2, engine: 'worker-hybrid', scope: 'diffAndOffsetMapping' },
+			{ phase: 'observation', comparison: undefined, base: 'base', index: 3, status: 'completed', elapsed: 10, serviceElapsed: 200, cpu: 7.5, schema: 2, engine: 'worker-hybrid', scope: 'diffAndOffsetMapping' },
+		]);
 	});
 
 	test('worker timeout reports consumed CPU and transport failure is unknown, not zero', async () => {
 		const log = new CostLog();
-		const cost = new RequestDiffSurvivalCostObservation(log, identity, { now: () => 0 }, 'worker-character');
+		const cost = new RequestDiffSurvivalCostObservation(log, identity, { now: () => 0 });
 		await assert.rejects(cost.measureWorkerFile(cost.createFile('originalRequest', 0, 0), async () => ({
 			status: 'timedOut', error: 'timed out',
 			measurement: { elapsedMs: 5, cpuMeasurementStatus: 'available', cpuUserMs: 3, cpuSystemMs: 1 },
@@ -152,48 +96,33 @@ suite('Agent Host Request Diff Survival Cost', () => {
 		]);
 	});
 
-	test('marks unsupported CPU explicitly while preserving elapsed timing', () => {
-		const log = new CostLog();
-		let now = 0;
-		const cost = new RequestDiffSurvivalCostObservation(log, identity, { now: () => now++ });
-		cost.measureFile(cost.createFile('originalRequest', 0, 0), () => computeRequestCharacterDiffFile('file', 'file', 'x', 'y'));
-		const event = log.events[0];
-		assert.deepStrictEqual({
-			elapsed: event.elapsedMs, cpuStatus: event.cpuMeasurementStatus, cpu: [event.cpuUserMs, event.cpuSystemMs, event.cpuTotalMs],
-		}, { elapsed: 1, cpuStatus: 'unsupported', cpu: [null, null, null] });
-	});
-
-	for (const failAt of [1, 2]) {
-		test(`CPU read ${failAt} failure is logged and does not change a successful diff`, () => {
+	for (const status of ['unsupported', 'failed'] as const) {
+		test(`preserves successful output when worker CPU measurement is ${status}`, async () => {
 			const log = new CostLog();
-			let reads = 0;
-			const cost = new RequestDiffSurvivalCostObservation(log, identity, {
-				now: () => 0,
-				cpuUsage: () => {
-					if (++reads === failAt) {
-						throw new Error('CPU unavailable');
-					}
-					return { user: 0, system: 0 };
-				},
-			});
-			const expected = computeRequestCharacterDiffFile('file', 'file', 'x', 'y');
-			const result = cost.measureFile(cost.createFile('originalRequest', 0, 0), () => expected);
+			const cost = new RequestDiffSurvivalCostObservation(log, identity, { now: () => 0 });
+			const measurement: ISurvivalDiffMeasurement = {
+				elapsedMs: 1, cpuMeasurementStatus: status, cpuUserMs: null, cpuSystemMs: null,
+				...(status === 'failed' ? { cpuMeasurementError: 'CPU unavailable' } : {}),
+			};
+			const result = await cost.measureWorkerFile(cost.createFile('originalRequest', 0, 0),
+				async () => ({ status: 'completed', changes, measurement }), materialize);
 			assert.deepStrictEqual({
-				sameResult: result === expected, status: log.events[0].status, cpu: log.events[0].cpuTotalMs,
-				cpuStatus: log.events[0].cpuMeasurementStatus, warnings: log.warnings,
+				result, status: log.events[0].status, elapsed: log.events[0].elapsedMs,
+				cpu: log.events[0].cpuTotalMs, cpuStatus: log.events[0].cpuMeasurementStatus, warnings: log.warnings,
 			}, {
-				sameResult: true, status: 'completed', cpu: null, cpuStatus: 'failed',
-				warnings: ['[RequestDiffSurvivalCost] Thread CPU measurement failed'],
+				result: materialize(), status: 'completed', elapsed: 1, cpu: null, cpuStatus: status,
+				warnings: status === 'failed' ? ['[RequestDiffSurvivalCost] Worker thread CPU measurement failed'] : [],
 			});
 		});
 	}
 
 	test('not-started work and unattempted comparisons have unavailable timing, not zero CPU', () => {
-		const f = fixture();
-		f.cost.fileNotStarted(f.cost.createFile('originalRequest', 0, 0), 'budgetRejected');
-		f.cost.finishComparison('originalRequest', 'budgetRejected');
-		f.cost.finishObservation('budgetRejected');
-		assert.deepStrictEqual(f.log.events.map(event => ({
+		const log = new CostLog();
+		const cost = new RequestDiffSurvivalCostObservation(log, identity);
+		cost.fileNotStarted(cost.createFile('originalRequest', 0, 0), 'budgetRejected');
+		cost.finishComparison('originalRequest', 'budgetRejected');
+		cost.finishObservation('budgetRejected');
+		assert.deepStrictEqual(log.events.map(event => ({
 			phase: event.phase, status: event.status, started: event.startedFileCount, elapsed: event.elapsedMs, cpu: event.cpuTotalMs,
 		})), [
 			{ phase: 'file', status: 'budgetRejected', started: 0, elapsed: null, cpu: null },
@@ -204,33 +133,28 @@ suite('Agent Host Request Diff Survival Cost', () => {
 		]);
 	});
 
-	test('defers size-event logging inside budget callbacks until both ending readings', () => {
-		const order: string[] = [];
-		const log = new class extends CostLog {
-			override info(message: string): void {
-				order.push(message.startsWith(RequestDiffSurvivalCostObservation.sizeLogPrefix) ? 'log:size' : 'log:compute');
-				super.info(message);
-			}
-		}();
-		const cost = new RequestDiffSurvivalCostObservation(log, identity, {
-			now: () => { order.push('time'); return 0; },
-			cpuUsage: () => { order.push('cpu'); return { user: 0, system: 0 }; },
-		});
-		cost.measureFile(cost.createFile('originalRequest', 0, 0), () => {
-			order.push('compute');
-			cost.size({ phase: 'release', status: 'completed', reason: 'budgetRejected', trackerEstimatedRetainedBytes: 0, hostEstimatedRetainedBytes: 0 });
-			return computeRequestCharacterDiffFile('file', 'file', '', '');
-		});
-		assert.deepStrictEqual(order, ['cpu', 'time', 'compute', 'time', 'cpu', 'log:size', 'log:compute']);
+	test('materialization failure preserves its exception and the completed worker measurement', async () => {
+		const log = new CostLog();
+		const cost = new RequestDiffSurvivalCostObservation(log, identity, { now: () => 0 });
+		const failure = new Error('construction failed');
+		await assert.rejects(cost.measureWorkerFile(cost.createFile('originalRequest', 0, 0), async () => ({
+			status: 'completed', changes,
+			measurement: { elapsedMs: 2, cpuMeasurementStatus: 'available', cpuUserMs: 1, cpuSystemMs: 0 },
+		}), () => { throw failure; }), error => error === failure);
+		assert.deepStrictEqual({
+			status: log.events[0].status, elapsed: log.events[0].elapsedMs, cpu: log.events[0].cpuTotalMs, added: log.events[0].addedCharacters,
+		}, { status: 'failed', elapsed: 2, cpu: 1, added: null });
 	});
 
-	test('cost logging failure is explicit and cannot replace a diff exception', () => {
+	test('cost logging failure is explicit and cannot replace a diff exception', async () => {
 		const log = new class extends CostLog {
 			override info(): void { throw new Error('logger failed'); }
 		}();
 		const cost = new RequestDiffSurvivalCostObservation(log, identity, { now: () => 0 });
-		const failure = new Error('diff failed');
-		assert.throws(() => cost.measureFile(cost.createFile('originalRequest', 0, 0), () => { throw failure; }), error => error === failure);
+		await assert.rejects(cost.measureWorkerFile(cost.createFile('originalRequest', 0, 0), async () => ({
+			status: 'failed', error: 'diff failed',
+			measurement: { elapsedMs: 0, cpuMeasurementStatus: 'available', cpuUserMs: 0, cpuSystemMs: 0 },
+		}), materialize), /diff failed/);
 		assert.deepStrictEqual(log.warnings, ['[RequestDiffSurvivalCost] Cost event logging failed']);
 	});
 });

@@ -7,7 +7,6 @@ import assert from 'assert';
 import sinon from 'sinon';
 import { DeferredPromise, timeout } from '../../../../base/common/async.js';
 import { VSBuffer } from '../../../../base/common/buffer.js';
-import { LcsDiff } from '../../../../base/common/diff/diff.js';
 import { observableValue, type ISettableObservable } from '../../../../base/common/observable.js';
 import { URI } from '../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
@@ -29,21 +28,13 @@ import { RequestDiffSurvivalDiagnostics, type RequestDiffSurvivalDiagnosticRecor
 
 suite('Agent Host Request Diff Survival', () => {
 	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
-	let previousEngine: string | undefined;
 	let previousDiagnostics: string | undefined;
 	setup(() => {
-		previousEngine = process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE;
 		previousDiagnostics = process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_DIAGNOSTICS;
-		delete process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE;
 		delete process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_DIAGNOSTICS;
 	});
 	teardown(() => {
 		sinon.restore();
-		if (previousEngine === undefined) {
-			delete process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE;
-		} else {
-			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE = previousEngine;
-		}
 		if (previousDiagnostics === undefined) {
 			delete process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_DIAGNOSTICS;
 		} else {
@@ -468,22 +459,15 @@ suite('Agent Host Request Diff Survival', () => {
 				survival: { survivingAdditions: 2, survivingDeletions: 0, totalAdditions: 2, totalDeletions: 0, totalSurviving: 2, totalEdits: 2, ratio: 1 },
 				ranges: [{ path: `${repository.toString()}#file`, offset: 4, length: 2, text: '中文' }],
 			});
-			const failure = sinon.stub(LcsDiff.prototype, 'ComputeDiff').throws(new Error('character calculation failed'));
-			for (const requestId of ['character-error', 'blob-error']) {
-				missingBlob = requestId === 'blob-error';
-				const finished = logService.whenRequestEnds(requestId);
-				contribution.onOutgoingTurn({ session: 'session', chat: 'chat', turnId: requestId, message: { text: 'request', origin: { kind: MessageKind.User } } });
-				contribution.onTurnEnd({ session: 'session', channel: 'chat', turnId: requestId, reason: { kind: 'success' } });
-				await finished;
-			}
-			failure.restore();
-			assert.deepStrictEqual(['character-error', 'blob-error'].map(requestId => {
-				const character = logService.characterObservations.find(record => record.originatingRequestId === requestId && record.observationIndex === 0)!;
-				return { characterComplete: character.complete, hasCharacterErrors: character.diffs!.originalRequest.errors.length > 0 };
-			}), [
-				{ characterComplete: false, hasCharacterErrors: true },
-				{ characterComplete: false, hasCharacterErrors: true },
-			]);
+			missingBlob = true;
+			const finished = logService.whenRequestEnds('blob-error');
+			contribution.onOutgoingTurn({ session: 'session', chat: 'chat', turnId: 'blob-error', message: { text: 'request', origin: { kind: MessageKind.User } } });
+			contribution.onTurnEnd({ session: 'session', channel: 'chat', turnId: 'blob-error', reason: { kind: 'success' } });
+			await finished;
+			const incomplete = logService.characterObservations.find(record => record.originatingRequestId === 'blob-error' && record.observationIndex === 0)!;
+			assert.deepStrictEqual({
+				complete: incomplete.complete, hasErrors: incomplete.diffs!.originalRequest.errors.length > 0,
+			}, { complete: false, hasErrors: true });
 		} finally {
 			if (previousValue === undefined) {
 				delete process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG;
@@ -554,61 +538,68 @@ suite('Agent Host Request Diff Survival', () => {
 			survival: [-1, -1, -1, -1, -1, -1, -1], hasDiffs: false,
 		};
 
-		for (const engine of ['worker-character', 'worker-hybrid']) {
-			test(`${engine} uses the service for initial and follow-up comparisons with correlated costs`, async () => {
-				process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE = engine;
+		test('hybrid uses the service for initial and follow-up comparisons with correlated costs', async () => {
+			const f = fixture();
+			const calls = sinon.spy(f.diffService, 'computeSurvivalDiff');
+			await f.end('base');
+			await f.end('later');
+			assert.deepStrictEqual({
+				timeouts: calls.args.map(args => args[2]),
+				observations: f.log.characterObservations.map(record => [record.originatingRequestId, record.observationIndex, record.complete]),
+			}, {
+				timeouts: Array(4).fill(5000),
+				observations: [['base', 0, true], ['base', 1, true], ['later', 0, true]],
+			});
+		});
+
+		test('hybrid rejects oversized metadata before dispatching any worker job', async () => {
+			const f = fixture();
+			const calls = sinon.spy(f.diffService, 'computeSurvivalDiff');
+			f.git.getBlobSize.resolves(requestDiffSurvivalLimits.maximumFileInputBytes + 1);
+			await f.end('base');
+			assert.deepStrictEqual({
+				calls: calls.callCount, reads: f.git.showBlob.callCount, status: f.log.characterObservations[0].status,
+			}, { calls: 0, reads: 0, status: 'budgetExceeded' });
+		});
+
+		for (const outcome of ['timedOut', 'failed', 'transportFailed'] as const) {
+			test(`worker ${outcome} terminates unavailable and releases retained ownership`, async () => {
 				const f = fixture();
-				const calls = sinon.spy(f.diffService, 'computeSurvivalDiff');
+				const compute = sinon.stub(f.diffService, 'computeSurvivalDiff');
+				if (outcome === 'transportFailed') {
+					compute.rejects(new Error('worker exited'));
+				} else {
+					compute.resolves({
+						status: outcome, error: 'computation failed',
+						measurement: { elapsedMs: 5, cpuMeasurementStatus: 'available', cpuUserMs: 3, cpuSystemMs: 1 },
+					});
+				}
 				await f.end('base');
 				await f.end('later');
 				assert.deepStrictEqual({
-					algorithms: calls.args.map(args => args[2]),
-					observations: f.log.characterObservations.map(record => [record.originatingRequestId, record.observationIndex, record.complete]),
+					observations: f.log.characterObservations.filter(record => record.originatingRequestId === 'base').map(record => ({
+						status: record.status, complete: record.complete, reason: record.unavailableReason, final: record.isFinalObservation,
+						survival: Object.values(record.survival), hasDiffs: Object.hasOwn(record, 'diffs'),
+					})),
+					retained: f.log.sizeObservations.at(-1)?.hostEstimatedRetainedBytes,
 				}, {
-					algorithms: Array(4).fill(engine === 'worker-hybrid' ? 'hybrid' : 'character'),
-					observations: [['base', 0, true], ['base', 1, true], ['later', 0, true]],
+					observations: [{
+						status: 'unavailable', complete: false, reason: 'computationFailed', final: true,
+						survival: [-1, -1, -1, -1, -1, -1, -1], hasDiffs: false,
+					}],
+					retained: 0,
 				});
-			});
-
-			test(`${engine} rejects oversized metadata before dispatching any worker job`, async () => {
-				process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE = engine;
-				const f = fixture();
-				const calls = sinon.spy(f.diffService, 'computeSurvivalDiff');
-				f.git.getBlobSize.resolves(requestDiffSurvivalLimits.maximumFileInputBytes + 1);
-				await f.end('base');
-				assert.deepStrictEqual({
-					calls: calls.callCount, reads: f.git.showBlob.callCount, status: f.log.characterObservations[0].status,
-				}, { calls: 0, reads: 0, status: 'budgetExceeded' });
 			});
 		}
 
-		test('worker timeout terminates unavailable rather than retaining an approximate original', async () => {
-			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE = 'worker-hybrid';
-			const f = fixture();
-			sinon.stub(f.diffService, 'computeSurvivalDiff').resolves({
-				status: 'timedOut', error: 'timed out',
-				measurement: { elapsedMs: 5, cpuMeasurementStatus: 'available', cpuUserMs: 3, cpuSystemMs: 1 },
-			});
-			await f.end('base');
-			await f.end('later');
-			assert.deepStrictEqual(f.log.characterObservations.filter(record => record.originatingRequestId === 'base').map(record => ({
-				status: record.status, complete: record.complete, reason: record.unavailableReason, final: record.isFinalObservation,
-				survival: Object.values(record.survival), hasDiffs: Object.hasOwn(record, 'diffs'),
-			})), [{
-				status: 'unavailable', complete: false, reason: 'computationFailed', final: true,
-				survival: [-1, -1, -1, -1, -1, -1, -1], hasDiffs: false,
-			}]);
-		});
-
 		test('retirement during worker execution discards the result without restoring retained ownership', async () => {
-			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE = 'worker-hybrid';
 			const f = fixture();
 			const dispatched = new DeferredPromise<void>();
 			const finish = new DeferredPromise<void>();
-			sinon.stub(f.diffService, 'computeSurvivalDiff').callsFake(async (before, after, algorithm, timeoutMs) => {
+			sinon.stub(f.diffService, 'computeSurvivalDiff').callsFake(async (before, after, timeoutMs) => {
 				dispatched.complete();
 				await finish.p;
-				return computeSurvivalDiff(before, after, algorithm, timeoutMs ?? 5000);
+				return computeSurvivalDiff(before, after, timeoutMs ?? 5000);
 			});
 			const ended = f.log.whenComputeEnds('base');
 			f.begin('base');
@@ -996,10 +987,10 @@ suite('Agent Host Request Diff Survival', () => {
 		test('rejects initial file input before reading blobs or computing character diffs', async () => {
 			const f = fixture();
 			f.git.getBlobSize.resolves(requestDiffSurvivalLimits.maximumFileInputBytes + 1);
-			const lcs = sinon.spy(LcsDiff.prototype, 'ComputeDiff');
+			const computation = sinon.spy(f.diffService, 'computeSurvivalDiff');
 			await f.end('oversized');
 			assert.deepStrictEqual({
-				record: terminalShape(f.log.characterObservations[0]), reads: f.git.showBlob.callCount, computations: lcs.callCount,
+				record: terminalShape(f.log.characterObservations[0]), reads: f.git.showBlob.callCount, computations: computation.callCount,
 			}, { record: { ...terminal, flags: [1, 0, 0] }, reads: 0, computations: 0 });
 		});
 
@@ -1151,12 +1142,12 @@ suite('Agent Host Request Diff Survival', () => {
 				after: { uri: `file:///repo/${name}`, content: { uri: 'after' } },
 				diff: { added: 1, removed: 0 },
 			})));
-			const lcs = sinon.spy(LcsDiff.prototype, 'ComputeDiff');
+			const computation = sinon.spy(f.diffService, 'computeSurvivalDiff');
 			await f.end('multiple-files');
 			assert.deepStrictEqual({
 				record: terminalShape(f.log.characterObservations[0]), reads: f.git.showBlob.callCount,
 				diagnostics: f.log.characterObservations[0].budgetDiagnostics,
-				computations: lcs.callCount,
+				computations: computation.callCount,
 				summary: f.log.computeObservations.filter(event => event.phase === 'observation').map(event => ({
 					status: event.status, started: event.startedFileCount, cpu: event.cpuTotalMs, cpuStatus: event.cpuMeasurementStatus,
 				})),
@@ -1188,11 +1179,11 @@ suite('Agent Host Request Diff Survival', () => {
 			})));
 			f.git.getBlobSize.callsFake(async (_repository: URI, _ref: string, path: string) =>
 				path === 'large' ? requestDiffSurvivalLimits.maximumFileInputBytes + 1 : 2);
-			const lcs = sinon.spy(LcsDiff.prototype, 'ComputeDiff');
+			const computation = sinon.spy(f.diffService, 'computeSurvivalDiff');
 			await f.end('base');
 			assert.deepStrictEqual({
 				terminal: terminalShape(f.log.characterObservations[0]),
-				reads: f.git.showBlob.callCount, computations: lcs.callCount,
+				reads: f.git.showBlob.callCount, computations: computation.callCount,
 				admissions: f.log.sizeObservations.filter(event => event.phase === 'admission').length,
 			}, { terminal: { ...terminal, flags: [1, 0, 0] }, reads: 0, computations: 0, admissions: 0 });
 		});
@@ -1206,12 +1197,12 @@ suite('Agent Host Request Diff Survival', () => {
 				const index = Number(path.slice('file-'.length));
 				return index === 272 ? 518_545 : index === 271 ? 23_927 : 15_000;
 			});
-			const lcs = sinon.spy(LcsDiff.prototype, 'ComputeDiff');
+			const computation = sinon.spy(f.diffService, 'computeSurvivalDiff');
 			await f.end('large-update');
 			assert.deepStrictEqual({
 				terminal: terminalShape(f.log.characterObservations[0]),
 				diagnostics: f.log.characterObservations[0].budgetDiagnostics,
-				reads: f.git.showBlob.callCount, computations: lcs.callCount,
+				reads: f.git.showBlob.callCount, computations: computation.callCount,
 				input: f.log.sizeObservations.filter(event => event.phase === 'budgetRejection').map(event => ({
 					accepted: event.observationInputBytes, proposed: event.proposedObservationInputBytes,
 				})),
@@ -1227,7 +1218,7 @@ suite('Agent Host Request Diff Survival', () => {
 			const f = fixture();
 			await f.end('base');
 			f.git.showBlob.resetHistory();
-			const lcs = sinon.spy(LcsDiff.prototype, 'ComputeDiff');
+			const computation = sinon.spy(f.diffService, 'computeSurvivalDiff');
 			const ended = f.log.whenRequestEnds('later');
 			f.begin('later');
 			await ended;
@@ -1236,7 +1227,7 @@ suite('Agent Host Request Diff Survival', () => {
 			assert.deepStrictEqual({
 				rejected: { status: rejected?.status, calls: rejected?.startedFileCount, cpu: rejected?.cpuTotalMs },
 				terminal: terminalShape(f.log.characterObservations[1]),
-				reads: f.git.showBlob.callCount, computations: lcs.callCount,
+				reads: f.git.showBlob.callCount, computations: computation.callCount,
 				roles: f.log.sizeObservations.filter(event =>
 					event.originatingRequestId === 'base' && event.observationIndex === 1 && event.phase === 'budgetRejection')
 					.map(event => event.comparisonKind),
@@ -1380,9 +1371,9 @@ suite('Agent Host Request Diff Survival', () => {
 			}, { input: null, accepted: 0, status: 'failed', compute: false, rollbacks: [{ delta: 0, tracker: 256 }] });
 		});
 
-		test('failed character computation rolls back file retention before retaining the error record', async () => {
+		test('failed blob loading rolls back file retention before retaining the error record', async () => {
 			const f = fixture();
-			sinon.stub(LcsDiff.prototype, 'ComputeDiff').throws(new Error('diff failed'));
+			f.git.showBlob.rejects(new Error('blob failed'));
 			await f.end('failed');
 			const path = `${URI.file('/repo').toString()}#file`;
 			const rolledBack = f.log.sizeObservations.find(event => event.phase === 'rollback')!;
@@ -1413,7 +1404,6 @@ suite('Agent Host Request Diff Survival', () => {
 
 		test('diagnostics correlate each observation with its queued turn-end batch', async () => {
 			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_DIAGNOSTICS = '1';
-			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE = 'worker-hybrid';
 			const f = fixture();
 			const first = f.log.whenDiagnosticTaskEnds('base');
 			await f.end('base');

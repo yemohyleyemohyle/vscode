@@ -3,7 +3,6 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { LcsDiff, StringDiffSequence } from '../../../../../base/common/diff/diff.js';
 import type { ISurvivalDiffChange } from '../../../common/diffComputeService.js';
 
 interface IRequestCharacterDiffSurvivalMetric {
@@ -33,24 +32,6 @@ export interface IRequestCharacterDiffFile {
 export interface IRequestCharacterRepositoryDiff {
 	readonly files: readonly IRequestCharacterDiffFile[];
 	readonly errors: readonly string[];
-}
-
-export function computeRequestCharacterDiffFile(
-	beforePath: string | undefined,
-	afterPath: string | undefined,
-	before: string,
-	after: string,
-	reserveChange?: (path: string, textLength: number) => void,
-): IRequestCharacterDiffFile {
-	let changes: readonly ISurvivalDiffChange[] = [];
-	if (before !== after) {
-		const result = new LcsDiff(new StringDiffSequence(before), new StringDiffSequence(after)).ComputeDiff(false);
-		if (result.quitEarly) {
-			throw new Error('Character diff did not complete');
-		}
-		changes = result.changes;
-	}
-	return materializeRequestCharacterDiffFile(beforePath, afterPath, before, after, changes, reserveChange);
 }
 
 export function materializeRequestCharacterDiffFile(

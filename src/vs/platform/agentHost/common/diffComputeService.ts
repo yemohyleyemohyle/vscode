@@ -20,8 +20,6 @@ export interface IOffsetEdit {
 	newText: string;
 }
 
-export type SurvivalDiffAlgorithm = 'character' | 'hybrid';
-
 export interface ISurvivalDiffChange {
 	readonly originalStart: number;
 	readonly originalLength: number;
@@ -99,8 +97,8 @@ export const DEFAULT_DIFF_TIMEOUT_MS = 5000;
 export interface IDiffComputeService {
 	readonly _serviceBrand: undefined;
 
-	/** Computes raw UTF-16 changes and thread-local cost for the opt-in survival experiment. */
-	computeSurvivalDiff(original: string, modified: string, algorithm: SurvivalDiffAlgorithm, timeoutMs?: number): Promise<ISurvivalDiffResult>;
+	/** Computes hybrid UTF-16 changes and thread-local cost for the opt-in survival experiment. */
+	computeSurvivalDiff(original: string, modified: string, timeoutMs?: number): Promise<ISurvivalDiffResult>;
 
 	/**
 	 * Computes whitespace-insensitive line counts and whitespace-sensitive character edits between two text strings.

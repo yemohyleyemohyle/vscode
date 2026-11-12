@@ -140,7 +140,7 @@ suite('Agent Host Request Diff Survival Diagnostics', () => {
 	test('reports unfinished work on shutdown, releases timers, and ignores late completions', () => {
 		const log = new DiagnosticLogService();
 		const runtime = new DiagnosticRuntime();
-		const collector = disposables.add(new RequestDiffSurvivalDiagnostics('worker-character', log, runtime));
+		const collector = disposables.add(new RequestDiffSurvivalDiagnostics('worker-hybrid', log, runtime));
 		const task = collector.enqueueTask(identity);
 		task.start();
 		collector.enqueueTask({ ...identity, requestId: 'queued' });
@@ -167,7 +167,7 @@ suite('Agent Host Request Diff Survival Diagnostics', () => {
 	test('cancelled queued tasks and observations without a task settle once and remove idle chats', () => {
 		const log = new DiagnosticLogService();
 		const runtime = new DiagnosticRuntime();
-		const collector = disposables.add(new RequestDiffSurvivalDiagnostics('host-character', log, runtime));
+		const collector = disposables.add(new RequestDiffSurvivalDiagnostics('worker-hybrid', log, runtime));
 		const task = collector.enqueueTask(identity);
 		task.finish('cancelled');
 		task.finish('cancelled');

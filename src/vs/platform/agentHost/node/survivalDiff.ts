@@ -3,9 +3,8 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { LcsDiff, StringDiffSequence } from '../../../base/common/diff/diff.js';
 import { DefaultLinesDiffComputer } from '../../../editor/common/diff/defaultLinesDiffComputer/defaultLinesDiffComputer.js';
-import type { ISurvivalDiffChange, ISurvivalDiffMeasurement, ISurvivalDiffResult, SurvivalDiffAlgorithm } from '../common/diffComputeService.js';
+import type { ISurvivalDiffChange, ISurvivalDiffMeasurement, ISurvivalDiffResult } from '../common/diffComputeService.js';
 
 export interface ISurvivalDiffClock {
 	readonly now: () => number;
@@ -13,7 +12,7 @@ export interface ISurvivalDiffClock {
 }
 
 /** Measures only synchronous diff computation and exact-offset mapping on the executing thread. */
-export function computeSurvivalDiff(original: string, modified: string, algorithm: SurvivalDiffAlgorithm, timeoutMs: number, clock: ISurvivalDiffClock = {
+export function computeSurvivalDiff(original: string, modified: string, timeoutMs: number, clock: ISurvivalDiffClock = {
 	now: () => performance.now(),
 	cpuUsage: typeof process.threadCpuUsage === 'function' ? previous => process.threadCpuUsage(previous) : undefined,
 }): ISurvivalDiffResult {
@@ -37,12 +36,6 @@ export function computeSurvivalDiff(original: string, modified: string, algorith
 	try {
 		if (original === modified) {
 			outcome = { status: 'completed', changes: [] };
-		} else if (algorithm === 'character') {
-			const result = new LcsDiff(new StringDiffSequence(original), new StringDiffSequence(modified),
-				() => timeoutMs === 0 || clock.now() - started < timeoutMs).ComputeDiff(false);
-			outcome = result.quitEarly
-				? { status: 'timedOut', error: 'Character diff timed out' }
-				: { status: 'completed', changes: result.changes };
 		} else {
 			const originalStarts = lineStarts(original);
 			const modifiedStarts = lineStarts(modified);

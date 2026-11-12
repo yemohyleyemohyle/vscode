@@ -12,8 +12,6 @@ import { RequestDiffSurvivalBudgetError, RequestDiffSurvivalInputBudget, request
 
 export type RequestDiffSurvivalComparison = 'originalRequest' | 'baselineToLatest' | 'requestResultToLatest';
 export type RequestDiffSurvivalCostOutcome = 'completed' | 'failed' | 'budgetRejected' | 'cancelled';
-export type RequestDiffSurvivalEngine = 'host-character' | 'worker-character' | 'worker-hybrid';
-
 export class RequestDiffSurvivalComputationError extends Error { }
 
 interface ICostIdentity {
@@ -26,7 +24,6 @@ interface ICostIdentity {
 
 export interface IRequestDiffSurvivalCostClock {
 	readonly now: () => number;
-	readonly cpuUsage?: (previous?: NodeJS.CpuUsage) => NodeJS.CpuUsage;
 }
 
 export interface IRequestDiffSurvivalFileCost {
@@ -68,7 +65,6 @@ interface IComputeTotals {
 const comparisons: readonly RequestDiffSurvivalComparison[] = ['originalRequest', 'baselineToLatest', 'requestResultToLatest'];
 const defaultClock: IRequestDiffSurvivalCostClock = {
 	now: () => performance.now(),
-	cpuUsage: typeof process.threadCpuUsage === 'function' ? previous => process.threadCpuUsage(previous) : undefined,
 };
 
 function createTotals(): IComputeTotals {
@@ -87,18 +83,14 @@ export class RequestDiffSurvivalCostObservation {
 	readonly inputBudget = new RequestDiffSurvivalInputBudget();
 	private readonly _comparisonTotals = new Map<RequestDiffSurvivalComparison, IComputeTotals>();
 	private readonly _totals = createTotals();
-	private _cpuStatus: 'available' | 'unsupported' | 'failed';
-	private _pendingSizeEvents: object[] | undefined;
+	private _cpuStatus: 'available' | 'unsupported' | 'failed' = 'available';
 	private _elapsedAvailable = true;
 
 	constructor(
 		private readonly _logService: ILogService,
 		private readonly _identity: ICostIdentity,
 		private readonly _clock: IRequestDiffSurvivalCostClock = defaultClock,
-		private readonly _engine: RequestDiffSurvivalEngine = 'host-character',
-	) {
-		this._cpuStatus = _engine !== 'host-character' || _clock.cpuUsage ? 'available' : 'unsupported';
-	}
+	) { }
 
 	beginComparison(comparison: RequestDiffSurvivalComparison): void {
 		this._comparisonTotals.set(comparison, createTotals());
@@ -106,43 +98,6 @@ export class RequestDiffSurvivalCostObservation {
 
 	createFile(comparisonKind: RequestDiffSurvivalComparison, repositoryIndex: number, fileIndex: number): IRequestDiffSurvivalFileCost {
 		return { comparisonKind, repositoryIndex, fileIndex, fileInputBytes: null, beforeUtf16Length: null, afterUtf16Length: null, computationStarted: false };
-	}
-
-	measureFile(file: IRequestDiffSurvivalFileCost, compute: () => IRequestCharacterDiffFile): IRequestCharacterDiffFile {
-		const cpuBefore = this._readCpu();
-		this._pendingSizeEvents = [];
-		const started = this._clock.now();
-		file.computationStarted = true;
-		let outcome: RequestDiffSurvivalCostOutcome = 'failed';
-		let result: IRequestCharacterDiffFile | undefined;
-		try {
-			result = compute();
-			outcome = 'completed';
-			return result;
-		} catch (error) {
-			outcome = getRequestDiffSurvivalCostOutcome(error);
-			throw error;
-		} finally {
-			const elapsedMs = this._clock.now() - started;
-			const cpu = cpuBefore ? this._readCpu(cpuBefore) : undefined;
-			const pendingSizeEvents = this._pendingSizeEvents;
-			this._pendingSizeEvents = undefined;
-			for (const event of pendingSizeEvents) {
-				this._write(RequestDiffSurvivalCostObservation.sizeLogPrefix, event);
-			}
-			const totals: IComputeTotals = {
-				fileCount: 1, startedFileCount: 1, completedFileCount: result ? 1 : 0, failedFileCount: result ? 0 : 1,
-				elapsedMs, cpuUserMs: (cpu?.user ?? 0) / 1000, cpuSystemMs: (cpu?.system ?? 0) / 1000, serviceCallElapsedMs: 0,
-			};
-			this._addFileTotals(file.comparisonKind, totals);
-			this._computeEvent('file', outcome, totals, {
-				...file,
-				addedCharacters: result?.plus.reduce((sum, change) => sum + change.length, 0) ?? null,
-				removedCharacters: result?.minus.reduce((sum, change) => sum + change.length, 0) ?? null,
-				changeRangeCount: result ? result.plus.length + result.minus.length : null,
-			});
-		}
-
 	}
 
 	async measureWorkerFile(
@@ -231,12 +186,7 @@ export class RequestDiffSurvivalCostObservation {
 			observationInputBytes: this.inputBudget.inputBytes, limits: requestDiffSurvivalLimits,
 			...details,
 		};
-		if (this._pendingSizeEvents) {
-			// Budget callbacks can release ownership inside the timed call; serialize only after ending readings.
-			this._pendingSizeEvents.push(event);
-		} else {
-			this._write(RequestDiffSurvivalCostObservation.sizeLogPrefix, event);
-		}
+		this._write(RequestDiffSurvivalCostObservation.sizeLogPrefix, event);
 	}
 
 	private _addFileTotals(comparison: RequestDiffSurvivalComparison, file: IComputeTotals): void {
@@ -270,33 +220,20 @@ export class RequestDiffSurvivalCostObservation {
 		const cpuAvailable = measured && this._cpuStatus === 'available';
 		this._write(RequestDiffSurvivalCostObservation.computeLogPrefix, {
 			...this._identity, schemaVersion: 2, recordKind: 'requestCharacterDiffComputeObservation',
-			engine: this._engine, algorithm: this._engine === 'worker-hybrid' ? 'hybrid' : 'character',
-			executionLocation: this._engine === 'host-character' ? 'host' : 'worker',
-			measurementScope: this._engine === 'host-character' ? 'characterDiffAndConstruction' : 'diffAndOffsetMapping',
+			engine: 'worker-hybrid', algorithm: 'hybrid',
+			executionLocation: 'worker',
+			measurementScope: 'diffAndOffsetMapping',
 			timestamp: new Date().toISOString(), phase, status, timeUnit: 'milliseconds', characterUnit: 'utf16CodeUnit',
 			fileCount: totals.fileCount, startedFileCount: totals.startedFileCount,
 			completedFileCount: totals.completedFileCount, failedFileCount: totals.failedFileCount,
 			elapsedMs: measured && this._elapsedAvailable ? totals.elapsedMs : null,
-			serviceCallElapsedMs: measured && this._engine !== 'host-character' ? totals.serviceCallElapsedMs : null,
+			serviceCallElapsedMs: measured ? totals.serviceCallElapsedMs : null,
 			cpuMeasurementStatus: measured ? this._cpuStatus : 'notStarted',
 			cpuUserMs: cpuAvailable ? totals.cpuUserMs : null,
 			cpuSystemMs: cpuAvailable ? totals.cpuSystemMs : null,
 			cpuTotalMs: cpuAvailable ? totals.cpuUserMs + totals.cpuSystemMs : null,
 			...details,
 		});
-	}
-
-	private _readCpu(previous?: NodeJS.CpuUsage): NodeJS.CpuUsage | undefined {
-		if (this._cpuStatus !== 'available') {
-			return undefined;
-		}
-		try {
-			return this._clock.cpuUsage?.(previous);
-		} catch (error) {
-			this._cpuStatus = 'failed';
-			this._logService.warn('[RequestDiffSurvivalCost] Thread CPU measurement failed', error);
-			return undefined;
-		}
 	}
 
 	private _write(prefix: string, record: object): void {

@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import type { IDetailedDiffResult, IDiffComputeService, IDiffCountResult, IDiffHunksResult, ISurvivalDiffResult, SurvivalDiffAlgorithm } from '../../common/diffComputeService.js';
+import type { IDetailedDiffResult, IDiffComputeService, IDiffCountResult, IDiffHunksResult, ISurvivalDiffResult } from '../../common/diffComputeService.js';
 import { computeDetailedDiff, computeDiffCounts, computeDiffHunks } from '../../node/diffWorkerMain.js';
 import { computeSurvivalDiff } from '../../node/survivalDiff.js';
 
@@ -14,8 +14,8 @@ export class InProcessDiffComputeService implements IDiffComputeService {
 	hitTimeout = false;
 	onDetailedDiff: (() => Promise<void>) | undefined;
 
-	async computeSurvivalDiff(original: string, modified: string, algorithm: SurvivalDiffAlgorithm, timeoutMs = 5000): Promise<ISurvivalDiffResult> {
-		return computeSurvivalDiff(original, modified, algorithm, timeoutMs);
+	async computeSurvivalDiff(original: string, modified: string, timeoutMs = 5000): Promise<ISurvivalDiffResult> {
+		return computeSurvivalDiff(original, modified, timeoutMs);
 	}
 
 	async computeDiffCounts(original: string, modified: string): Promise<IDiffCountResult> {

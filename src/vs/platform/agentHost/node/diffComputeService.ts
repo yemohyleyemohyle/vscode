@@ -7,7 +7,7 @@ import { Worker } from 'worker_threads';
 import { Disposable } from '../../../base/common/lifecycle.js';
 import { FileAccess } from '../../../base/common/network.js';
 import { ILogService } from '../../log/common/log.js';
-import { DEFAULT_DIFF_TIMEOUT_MS, IDiffComputeService, type IDetailedDiffResult, type IDiffCountResult, type IDiffHunksResult, type ISurvivalDiffResult, type SurvivalDiffAlgorithm } from '../common/diffComputeService.js';
+import { DEFAULT_DIFF_TIMEOUT_MS, IDiffComputeService, type IDetailedDiffResult, type IDiffCountResult, type IDiffHunksResult, type ISurvivalDiffResult } from '../common/diffComputeService.js';
 
 type DiffResult = IDiffCountResult | IDetailedDiffResult | IDiffHunksResult | ISurvivalDiffResult;
 
@@ -31,8 +31,8 @@ export class NodeWorkerDiffComputeService extends Disposable implements IDiffCom
 		super();
 	}
 
-	async computeSurvivalDiff(original: string, modified: string, algorithm: SurvivalDiffAlgorithm, timeoutMs: number = DEFAULT_DIFF_TIMEOUT_MS): Promise<ISurvivalDiffResult> {
-		return this._callWorker('computeSurvivalDiff', original, modified, algorithm, timeoutMs);
+	async computeSurvivalDiff(original: string, modified: string, timeoutMs: number = DEFAULT_DIFF_TIMEOUT_MS): Promise<ISurvivalDiffResult> {
+		return this._callWorker('computeSurvivalDiff', original, modified, timeoutMs);
 	}
 
 	async computeDiffCounts(original: string, modified: string, timeoutMs: number = DEFAULT_DIFF_TIMEOUT_MS): Promise<IDiffCountResult> {

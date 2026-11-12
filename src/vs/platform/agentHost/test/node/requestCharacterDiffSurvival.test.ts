@@ -5,7 +5,8 @@
 
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-import { computeRequestCharacterDiffFile, computeRequestCharacterDiffSurvivalMetric, type IRequestCharacterRepositoryDiff } from '../../node/chatContributions/requestDiffSurvival/requestCharacterDiffSurvival.js';
+import { materializeRequestCharacterDiffFile, computeRequestCharacterDiffSurvivalMetric, type IRequestCharacterRepositoryDiff } from '../../node/chatContributions/requestDiffSurvival/requestCharacterDiffSurvival.js';
+import { computeSurvivalDiff } from '../../node/survivalDiff.js';
 
 suite('Agent Host Request Character Diff Survival', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
@@ -69,4 +70,12 @@ suite('Agent Host Request Character Diff Survival', () => {
 
 function diff(before: string, after: string): IRequestCharacterRepositoryDiff {
 	return { files: [computeRequestCharacterDiffFile('file', 'file', before, after)], errors: [] };
+}
+
+function computeRequestCharacterDiffFile(beforePath: string | undefined, afterPath: string | undefined, before: string, after: string) {
+	const result = computeSurvivalDiff(before, after, 5000);
+	if (result.status !== 'completed') {
+		throw new Error(result.error);
+	}
+	return materializeRequestCharacterDiffFile(beforePath, afterPath, before, after, result.changes);
 }
