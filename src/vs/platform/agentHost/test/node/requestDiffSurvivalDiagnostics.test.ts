@@ -202,10 +202,11 @@ suite('Agent Host Request Diff Survival Diagnostics', () => {
 			runCount: new Set(log.records.map(record => record.diagnosticsRunId)).size,
 			kinds: [...new Set(log.records.map(record => record.recordKind))],
 			versions: [...new Set(log.records.map(record => record.schemaVersion))],
+			strategies: [...new Set(log.records.map(record => record.storageStrategy))],
 			sequences: log.records.map(record => record.sequence),
 			timestampsValid: log.records.every(record => Number.isFinite(Date.parse(record.timestamp))),
 		}, {
-			runCount: 1, kinds: ['requestDiffSurvivalDiagnostics'], versions: [1],
+			runCount: 1, kinds: ['requestDiffSurvivalDiagnostics'], versions: [2], strategies: ['checkpointIds'],
 			sequences: [1, 2, 3, 4, 5, 6, 7], timestampsValid: true,
 		});
 	});

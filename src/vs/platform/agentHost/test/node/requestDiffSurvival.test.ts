@@ -20,11 +20,18 @@ import { AgentHostStateManager } from '../../node/agentHostStateManager.js';
 import { RequestDiffSurvivalContribution, RequestDiffSurvivalExpiryScheduler } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalContribution.js';
 import { RequestDiffSurvivalBudgetError, RequestDiffSurvivalInputBudget, requestDiffSurvivalLimits } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalLimits.js';
 import { RequestDiffSurvivalCostObservation, type IRequestDiffSurvivalSizeDetails } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalCost.js';
-import { createNoopGitService } from '../common/sessionTestHelpers.js';
+import { createNoopGitService as createBaseGitService } from '../common/sessionTestHelpers.js';
 import { type computeRequestCharacterDiffSurvivalMetric, type IRequestCharacterRepositoryDiff } from '../../node/chatContributions/requestDiffSurvival/requestCharacterDiffSurvival.js';
 import { InProcessDiffComputeService } from './inProcessDiffComputeService.js';
 import { computeSurvivalDiff } from '../../node/survivalDiff.js';
 import { RequestDiffSurvivalDiagnostics, type RequestDiffSurvivalDiagnosticRecord } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalDiagnostics.js';
+
+function createNoopGitService(): IAgentHostGitService {
+	return {
+		...createBaseGitService(),
+		revParse: async (_repository, expression) => expression.replace(/\^\{tree\}$/, ''),
+	};
+}
 
 suite('Agent Host Request Diff Survival', () => {
 	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
@@ -263,7 +270,7 @@ suite('Agent Host Request Diff Survival', () => {
 					&& baseObservation.baseEndTimestamp === laterObservation.baseEndTimestamp,
 			}, {
 				base: {
-					schemaVersion: 5,
+					schemaVersion: 6,
 					originatingRequestId: 'base-request',
 					observationRequestId: 'base-request',
 					baseModel: 'kimi-k3',
@@ -277,7 +284,7 @@ suite('Agent Host Request Diff Survival', () => {
 					diffKeys: ['files', 'errors'],
 				},
 				later: {
-					schemaVersion: 5,
+					schemaVersion: 6,
 					originatingRequestId: 'base-request',
 					observationRequestId: 'later-request',
 					baseModel: 'kimi-k3',
@@ -528,7 +535,7 @@ suite('Agent Host Request Diff Survival', () => {
 		function terminalShape(record: IRecordedCharacterObservation) {
 			return {
 				status: record.status, complete: record.complete, final: record.isFinalObservation,
-				flags: [record.fileInputBudgetExceeded, record.observationInputBudgetExceeded, record.retainedDiffBudgetExceeded],
+				flags: [record.fileInputBudgetExceeded, record.observationInputBudgetExceeded],
 				survival: Object.values(record.survival), hasDiffs: Object.hasOwn(record, 'diffs'),
 			};
 		}
@@ -547,7 +554,7 @@ suite('Agent Host Request Diff Survival', () => {
 				timeouts: calls.args.map(args => args[2]),
 				observations: f.log.characterObservations.map(record => [record.originatingRequestId, record.observationIndex, record.complete]),
 			}, {
-				timeouts: Array(4).fill(5000),
+				timeouts: Array(5).fill(5000),
 				observations: [['base', 0, true], ['base', 1, true], ['later', 0, true]],
 			});
 		});
@@ -562,8 +569,94 @@ suite('Agent Host Request Diff Survival', () => {
 			}, { calls: 0, reads: 0, status: 'budgetExceeded' });
 		});
 
+		test('reconstructs the originating A to B after later edits and stores only checkpoint metadata', async () => {
+			const f = fixture();
+			const textByRef: Record<string, string> = {
+				'base-start': 'header\nold\n', 'b-tree': 'header\nnew\n',
+				'later-start': 'header\nnew\n', 'c-tree': 'header\nnext\n',
+			};
+			const resolve = sinon.stub(f.git, 'revParse').callsFake(async (_repository, expression) =>
+				expression === 'base-end^{tree}' ? 'b-tree' : 'c-tree');
+			f.git.computeFileDiffsBetweenRefs.resolves([{
+				before: { uri: 'file:///repo/file', content: { uri: 'before' } },
+				after: { uri: 'file:///repo/file', content: { uri: 'after' } }, diff: { added: 1, removed: 1 },
+			}]);
+			f.git.getBlobSize.callsFake(async (_repository: URI, ref: string) => VSBuffer.fromString(textByRef[ref]).byteLength);
+			f.git.showBlob.callsFake(async (_repository: URI, ref: string) => VSBuffer.fromString(textByRef[ref]));
+			await f.end('base');
+			const initial = f.log.characterObservations[0].diffs!.originalRequest;
+			f.git.computeFileDiffsBetweenRefs.resetHistory();
+			await f.end('later');
+			const followUp = f.log.characterObservations.find(record => record.originatingRequestId === 'base' && record.observationIndex === 1)!;
+			const snapshot = f.context.snapshot();
+			assert.deepStrictEqual({
+				resolutions: resolve.args.map(args => args[1]),
+				pairs: f.git.computeFileDiffsBetweenRefs.args.map(args => [args[1].fromRef, args[1].toRef]),
+				sameOriginal: followUp.diffs!.originalRequest,
+				ready: snapshot.includes('"initialObservationReady":true'),
+				retainsDiff: /"(?:files|retainedBytes|plus|minus)"\s*:/.test(snapshot),
+				schemas: [
+					followUp, f.log.computeObservations[0], f.log.sizeObservations[0],
+				].map(record => [record.schemaVersion, record.storageStrategy]),
+			}, {
+				resolutions: ['base-end^{tree}', 'later-end^{tree}'],
+				pairs: [['base-start', 'b-tree'], ['base-start', 'c-tree'], ['b-tree', 'c-tree'], ['later-start', 'c-tree']],
+				sameOriginal: initial, ready: true, retainsDiff: false,
+				schemas: [[6, 'checkpointIds'], [3, 'checkpointIds'], [2, 'checkpointIds']],
+			});
+		});
+
+		test('initial log failure never marks a tracker ready or schedules an expiry measurement', async () => {
+			const f = fixture();
+			const failed = new DeferredPromise<void>();
+			sinon.stub(f.log, 'info').callThrough().withArgs(sinon.match(message =>
+				typeof message === 'string' && message.startsWith('[RequestCharacterDiffSurvivalObservation] '))).callsFake(() => {
+					failed.complete();
+					throw new Error('initial log failed');
+				});
+			await f.contribution.onOutgoingTurn({ session: 'session', chat: 'chat', turnId: 'base', message: { text: 'request', origin: { kind: MessageKind.User } } });
+			f.contribution.onTurnEnd({ session: 'session', channel: 'chat', turnId: 'base', reason: { kind: 'success' } });
+			await failed.p;
+			await timeout(0);
+			assert.deepStrictEqual({
+				ready: f.context.snapshot().includes('"initialObservationReady":true'),
+				trackersEmpty: f.context.snapshot().includes('"trackers":[]'),
+				retirements: f.log.sizeObservations.filter(event => event.phase === 'retirement').map(event => event.reason),
+			}, { ready: false, trackersEmpty: true, retirements: ['failed'] });
+		});
+
+		test('unresolvable end checkpoint is explicit and does not create a tracker', async () => {
+			const f = fixture();
+			sinon.stub(f.git, 'revParse').resolves(undefined);
+			await f.contribution.onOutgoingTurn({ session: 'session', chat: 'chat', turnId: 'base', message: { text: 'request', origin: { kind: MessageKind.User } } });
+			const warned = new DeferredPromise<void>();
+			sinon.stub(f.log, 'warn').callsFake(() => { warned.complete(); });
+			f.contribution.onTurnEnd({ session: 'session', channel: 'chat', turnId: 'base', reason: { kind: 'success' } });
+			await warned.p;
+			await timeout(0);
+			assert.deepStrictEqual({
+				observations: f.log.characterObservations.length, reads: f.git.showBlob.callCount,
+				trackersEmpty: f.context.snapshot().includes('"trackers":[]'),
+			}, { observations: 0, reads: 0, trackersEmpty: true });
+		});
+
+		test('missing originating checkpoint objects are incomplete, not an empty successful original', async () => {
+			const f = fixture();
+			await f.end('base');
+			f.git.getBlobSize.callsFake(async (_repository: URI, ref: string) => ref === 'base-end' ? undefined : 2);
+			await f.end('later');
+			const record = f.log.characterObservations.find(record => record.originatingRequestId === 'base' && record.observationIndex === 1)!;
+			assert.deepStrictEqual({
+				complete: record.complete, originalErrors: record.diffs?.originalRequest.errors,
+				resultErrors: record.diffs?.requestResultToLatest.errors,
+			}, {
+				complete: false, originalErrors: ['Failed to materialize file:///repo/file: Unable to read Git blob size'],
+				resultErrors: [],
+			});
+		});
+
 		for (const outcome of ['timedOut', 'failed', 'transportFailed'] as const) {
-			test(`worker ${outcome} terminates unavailable and releases retained ownership`, async () => {
+			test(`worker ${outcome} terminates unavailable and retires tracking`, async () => {
 				const f = fixture();
 				const compute = sinon.stub(f.diffService, 'computeSurvivalDiff');
 				if (outcome === 'transportFailed') {
@@ -581,18 +674,18 @@ suite('Agent Host Request Diff Survival', () => {
 						status: record.status, complete: record.complete, reason: record.unavailableReason, final: record.isFinalObservation,
 						survival: Object.values(record.survival), hasDiffs: Object.hasOwn(record, 'diffs'),
 					})),
-					retained: f.log.sizeObservations.at(-1)?.hostEstimatedRetainedBytes,
+					retired: f.log.sizeObservations.filter(event => event.phase === 'retirement').length,
 				}, {
 					observations: [{
 						status: 'unavailable', complete: false, reason: 'computationFailed', final: true,
 						survival: [-1, -1, -1, -1, -1, -1, -1], hasDiffs: false,
 					}],
-					retained: 0,
+					retired: 2,
 				});
 			});
 		}
 
-		test('retirement during worker execution discards the result without restoring retained ownership', async () => {
+		test('retirement during worker execution discards the result without reviving tracking', async () => {
 			const f = fixture();
 			const dispatched = new DeferredPromise<void>();
 			const finish = new DeferredPromise<void>();
@@ -609,8 +702,8 @@ suite('Agent Host Request Diff Survival', () => {
 			await ended;
 			assert.deepStrictEqual({
 				observations: f.log.characterObservations.length,
-				retained: f.log.sizeObservations.at(-1)?.hostEstimatedRetainedBytes,
-			}, { observations: 0, retained: 0 });
+				retired: f.log.sizeObservations.filter(event => event.phase === 'retirement').length,
+			}, { observations: 0, retired: 1 });
 		});
 
 		suite('tracker lifetime', () => {
@@ -669,16 +762,14 @@ suite('Agent Host Request Diff Survival', () => {
 				assert.deepStrictEqual({
 					record: expiryShape(record), captures: f.capture.callCount,
 					refs: comparisonRefs.map(ref => [ref.fromRef, ref.toRef]),
-					releases: f.log.sizeObservations.filter(record => record.reason === 'idleExpired').map(record => ({
-						index: record.observationIndex, tracker: record.trackerEstimatedRetainedBytes, host: record.hostEstimatedRetainedBytes,
-					})),
+					retirements: f.log.sizeObservations.filter(record => record.reason === 'idleExpired').map(record => record.observationIndex),
 				}, {
 					record: {
 						index: 1, request: 'base', boundary: 'expiry', final: true, status: 'measured',
 						reason: 'idleExpired', unavailable: undefined, complete: true, ratio: 1
 					},
-					captures: 1, refs: [['base-start', 'expiry-tree'], ['base-end', 'expiry-tree']],
-					releases: [{ index: 1, tracker: 0, host: 0 }],
+					captures: 1, refs: [['base-start', 'base-end'], ['base-start', 'expiry-tree'], ['base-end', 'expiry-tree']],
+					retirements: [1],
 				});
 				f.clock.advance(requestDiffSurvivalLimits.maximumTrackerAgeMs);
 				await f.end('later');
@@ -708,8 +799,10 @@ suite('Agent Host Request Diff Survival', () => {
 			test('fresh expiry state measures edits removed after the last request rather than reusing its 100% result', async () => {
 				const f = lifetimeFixture();
 				await f.end('base');
-				f.git.computeFileDiffsBetweenRefs.callsFake(async (_repository: URI, options: { fromRef: string }) =>
-					options.fromRef === 'base-start' ? [] : [{
+				f.git.computeFileDiffsBetweenRefs.callsFake(async (_repository: URI, options: { fromRef: string; toRef: string }) =>
+					options.toRef === 'base-end' ? [{
+						after: { uri: 'file:///repo/file', content: { uri: 'after' } }, diff: { added: 2, removed: 0 },
+					}] : options.fromRef === 'base-start' ? [] : [{
 						before: { uri: 'file:///repo/file', content: { uri: 'before' } }, diff: { added: 0, removed: 2 },
 					}]);
 				const expired = f.log.whenExpires('base');
@@ -759,8 +852,8 @@ suite('Agent Host Request Diff Survival', () => {
 				await warning.p;
 				assert.deepStrictEqual({
 					attempts: info.getCalls().filter(call => call.args[0].startsWith('[RequestCharacterDiffSurvivalObservation] ')).length,
-					host: f.log.sizeObservations.at(-1)?.hostEstimatedRetainedBytes, scheduled: f.clock.isScheduled(),
-				}, { attempts: 1, host: 0, scheduled: false });
+					retirements: f.log.sizeObservations.filter(event => event.phase === 'retirement').length, scheduled: f.clock.isScheduled(),
+				}, { attempts: 1, retirements: 1, scheduled: false });
 			});
 
 			test('maximum age wins over idle expiry when both are overdue', async () => {
@@ -831,10 +924,10 @@ suite('Agent Host Request Diff Survival', () => {
 						status: f.log.characterObservations[1].status, unavailable: f.log.characterObservations[1].unavailableReason,
 						survival: Object.values(f.log.characterObservations[1].survival),
 						diffs: f.log.characterObservations[1].diffs,
-						host: f.log.sizeObservations.at(-1)?.hostEstimatedRetainedBytes, scheduled: f.clock.isScheduled(),
+						retired: f.log.sizeObservations.at(-1)?.phase, scheduled: f.clock.isScheduled(),
 					}, {
 						status: 'unavailable', unavailable: 'captureFailed', survival: [-1, -1, -1, -1, -1, -1, -1],
-						diffs: undefined, host: 0, scheduled: false
+						diffs: undefined, retired: 'retirement', scheduled: false
 					});
 				});
 			}
@@ -851,7 +944,7 @@ suite('Agent Host Request Diff Survival', () => {
 					record: terminalShape(f.log.characterObservations[1]),
 					reason: f.log.characterObservations[1].terminalReason,
 					reads: f.git.showBlob.callCount - reads, comparisons: f.git.computeFileDiffsBetweenRefs.callCount,
-				}, { record: { ...terminal, flags: [1, 0, 0] }, reason: 'idleExpired', reads: 0, comparisons: 2 });
+				}, { record: { ...terminal, flags: [1, 0] }, reason: 'idleExpired', reads: 0, comparisons: 2 });
 			});
 
 			test('incomplete final comparisons are unavailable, never valid survival loss', async () => {
@@ -922,7 +1015,7 @@ suite('Agent Host Request Diff Survival', () => {
 				assert.deepStrictEqual({
 					records: f.log.characterObservations.filter(record => record.originatingRequestId === 'base').map(record => record.observationBoundary),
 					unavailable: f.log.characterObservations[1].unavailableReason,
-					releases: f.log.sizeObservations.filter(record => record.originatingRequestId === 'base' && record.phase === 'release').length,
+					releases: f.log.sizeObservations.filter(record => record.originatingRequestId === 'base' && record.phase === 'retirement').length,
 				}, { records: ['requestEnd', 'expiry'], unavailable: 'observationInProgress', releases: 1 });
 			});
 
@@ -960,8 +1053,8 @@ suite('Agent Host Request Diff Survival', () => {
 					await timeout(0);
 					assert.deepStrictEqual({
 						records: f.log.characterObservations.length, captures: f.capture.callCount,
-						scheduled: f.clock.isScheduled(), host: f.log.sizeObservations.at(-1)?.hostEstimatedRetainedBytes,
-					}, { records: 1, captures: disposal === 'capturing' ? 1 : 0, scheduled: false, host: 0 });
+						scheduled: f.clock.isScheduled(), retired: f.log.sizeObservations.at(-1)?.phase,
+					}, { records: 1, captures: disposal === 'capturing' ? 1 : 0, scheduled: false, retired: 'retirement' });
 				});
 			}
 		});
@@ -975,9 +1068,9 @@ suite('Agent Host Request Diff Survival', () => {
 				assert.ok(error instanceof RequestDiffSurvivalBudgetError);
 				assert.deepStrictEqual({
 					file: error.fileInputBudgetExceeded, observation: error.observationInputBudgetExceeded,
-					retained: error.retainedDiffBudgetExceeded, diagnostics: error.diagnostics,
+					diagnostics: error.diagnostics,
 				}, {
-					file: true, observation: true, retained: false,
+					file: true, observation: true,
 					diagnostics: { fileInputBytes: 512 * 1024 + 1, observationInputBytes: 4 * 1024 * 1024 + 512 * 1024 + 1 },
 				});
 				return true;
@@ -991,7 +1084,7 @@ suite('Agent Host Request Diff Survival', () => {
 			await f.end('oversized');
 			assert.deepStrictEqual({
 				record: terminalShape(f.log.characterObservations[0]), reads: f.git.showBlob.callCount, computations: computation.callCount,
-			}, { record: { ...terminal, flags: [1, 0, 0] }, reads: 0, computations: 0 });
+			}, { record: { ...terminal, flags: [1, 0] }, reads: 0, computations: 0 });
 		});
 
 		test('rejects the first byte past the cumulative observation limit', () => {
@@ -1021,7 +1114,7 @@ suite('Agent Host Request Diff Survival', () => {
 				reads: f.git.showBlob.callCount,
 			}, {
 				base: [{ index: 0, status: 'measured' }, { index: 1, status: 'budgetExceeded' }],
-				terminal: { ...terminal, flags: [0, 1, 0] },
+				terminal: { ...terminal, flags: [0, 1] },
 				diagnostics: { fileInputBytes: 2, observationInputBytes: 4 },
 				comparisons: 7, reads: 3,
 			});
@@ -1042,46 +1135,7 @@ suite('Agent Host Request Diff Survival', () => {
 			}, { status: 'measured', complete: true, reads: 2 });
 		});
 
-		test('shares retained admission across chats, accepts equality, and releases on eviction', async () => {
-			const path = `${URI.file('/repo').toString()}#file`;
-			const retainedBytes = 256 + 256 + 4 + 2 * path.length + 128 + 2 * (path.length + 2);
-			sinon.stub(requestDiffSurvivalLimits, 'maximumRetainedDiffBytes').value(retainedBytes);
-			const f = fixture();
-			await f.end('first', 'first-chat');
-			await f.end('rejected', 'second-chat');
-			f.context.evict('first-chat');
-			await f.end('admitted', 'third-chat');
-			assert.deepStrictEqual({
-				statuses: f.log.characterObservations.map(record => record.status),
-				rejected: terminalShape(f.log.characterObservations[1]),
-			}, {
-				statuses: ['measured', 'budgetExceeded', 'measured'],
-				rejected: { ...terminal, flags: [0, 0, 1] },
-			});
-		});
-
-		test('rolls back partial retained construction when reserving a change exceeds the limit', async () => {
-			const path = `${URI.file('/repo').toString()}#file`;
-			const retainedBytes = 256 + 256 + 4 + 2 * path.length + 128 + 2 * (path.length + 2);
-			sinon.stub(requestDiffSurvivalLimits, 'maximumRetainedDiffBytes').value(retainedBytes - 1);
-			const f = fixture();
-			await f.end('rejected');
-			f.git.computeFileDiffsBetweenRefs.resolves([]);
-			await f.end('empty', 'another-chat');
-			assert.deepStrictEqual({
-				statuses: f.log.characterObservations.map(record => record.status),
-				rejected: terminalShape(f.log.characterObservations[0]),
-				reads: f.git.showBlob.callCount,
-				proposed: f.log.characterObservations[0].budgetDiagnostics?.proposedRetainedDiffBytes,
-			}, {
-				statuses: ['budgetExceeded', 'measured'], rejected: { ...terminal, flags: [0, 0, 1] }, reads: 1,
-				proposed: retainedBytes,
-			});
-		});
-
-		test('concurrent chats reserve against one host-wide counter', async () => {
-			const path = `${URI.file('/repo').toString()}#file`;
-			sinon.stub(requestDiffSurvivalLimits, 'maximumRetainedDiffBytes').value(256 + 256 + 4 + 2 * path.length + 128 + 2 * (path.length + 2));
+		test('concurrent chats have independent observation input allowances', async () => {
 			const f = fixture();
 			const gate = new DeferredPromise<number>();
 			const ready = new DeferredPromise<void>();
@@ -1097,12 +1151,10 @@ suite('Agent Host Request Diff Survival', () => {
 			await ready.p;
 			await gate.complete(2);
 			await Promise.all([first, second]);
-			assert.deepStrictEqual(f.log.characterObservations.map(record => record.status).sort(), ['budgetExceeded', 'measured']);
+			assert.deepStrictEqual(f.log.characterObservations.map(record => record.status).sort(), ['measured', 'measured']);
 		});
 
-		test('eviction cancels in-flight work, releases reservations and cannot recreate old state', async () => {
-			const path = `${URI.file('/repo').toString()}#file`;
-			sinon.stub(requestDiffSurvivalLimits, 'maximumRetainedDiffBytes').value(256 + 256 + 4 + 2 * path.length + 128 + 2 * (path.length + 2));
+		test('eviction cancels in-flight work and cannot recreate old state', async () => {
 			const f = fixture();
 			const gate = new DeferredPromise<VSBuffer>();
 			const reading = new DeferredPromise<void>();
@@ -1152,7 +1204,7 @@ suite('Agent Host Request Diff Survival', () => {
 					status: event.status, started: event.startedFileCount, cpu: event.cpuTotalMs, cpuStatus: event.cpuMeasurementStatus,
 				})),
 			}, {
-				record: { ...terminal, flags: [0, 1, 0] }, reads: 0, computations: 0,
+				record: { ...terminal, flags: [0, 1] }, reads: 0, computations: 0,
 				diagnostics: { fileInputBytes: 2, observationInputBytes: 6 },
 				summary: [{ status: 'budgetRejected', started: 0, cpu: null, cpuStatus: 'notStarted' }],
 			});
@@ -1169,7 +1221,7 @@ suite('Agent Host Request Diff Survival', () => {
 			assert.deepStrictEqual({
 				record: terminalShape(f.log.characterObservations[0]), reads: f.git.showBlob.callCount,
 				repositories: f.git.computeFileDiffsBetweenRefs.callCount,
-			}, { record: { ...terminal, flags: [0, 1, 0] }, reads: 0, repositories: 2 });
+			}, { record: { ...terminal, flags: [0, 1] }, reads: 0, repositories: 2 });
 		});
 
 		test('a late oversized file rejects before computing even the earlier small files', async () => {
@@ -1184,8 +1236,8 @@ suite('Agent Host Request Diff Survival', () => {
 			assert.deepStrictEqual({
 				terminal: terminalShape(f.log.characterObservations[0]),
 				reads: f.git.showBlob.callCount, computations: computation.callCount,
-				admissions: f.log.sizeObservations.filter(event => event.phase === 'admission').length,
-			}, { terminal: { ...terminal, flags: [1, 0, 0] }, reads: 0, computations: 0, admissions: 0 });
+				phases: [...new Set(f.log.sizeObservations.map(event => event.phase))],
+			}, { terminal: { ...terminal, flags: [1, 0] }, reads: 0, computations: 0, phases: ['inputCheck', 'budgetRejection', 'retirement', 'observation'] });
 		});
 
 		test('the live-run 272-file accepted prefix rejects on size metadata with no character work', async () => {
@@ -1207,14 +1259,14 @@ suite('Agent Host Request Diff Survival', () => {
 					accepted: event.observationInputBytes, proposed: event.proposedObservationInputBytes,
 				})),
 			}, {
-				terminal: { ...terminal, flags: [0, 1, 0] },
+				terminal: { ...terminal, flags: [0, 1] },
 				diagnostics: { fileInputBytes: 518_545, observationInputBytes: 4_607_472 },
 				reads: 0, computations: 0, input: [{ accepted: 4_088_927, proposed: 4_607_472 }],
 			});
 		});
 
-		test('preflights both follow-up comparisons before starting either character comparison', async () => {
-			sinon.stub(requestDiffSurvivalLimits, 'maximumObservationInputBytes').value(3);
+		test('preflights all three follow-up comparisons before starting any worker comparison', async () => {
+			sinon.stub(requestDiffSurvivalLimits, 'maximumObservationInputBytes').value(5);
 			const f = fixture();
 			await f.end('base');
 			f.git.showBlob.resetHistory();
@@ -1233,13 +1285,13 @@ suite('Agent Host Request Diff Survival', () => {
 					.map(event => event.comparisonKind),
 			}, {
 				rejected: { status: 'budgetRejected', calls: 0, cpu: null },
-				terminal: { ...terminal, flags: [0, 1, 0] },
+				terminal: { ...terminal, flags: [0, 1] },
 				reads: 1, computations: 1, roles: ['requestResultToLatest'],
 			});
 		});
 
 		test('preflight counts repeated comparison input without charging it again during materialization', async () => {
-			sinon.stub(requestDiffSurvivalLimits, 'maximumObservationInputBytes').value(4);
+			sinon.stub(requestDiffSurvivalLimits, 'maximumObservationInputBytes').value(6);
 			const f = fixture();
 			await f.end('base');
 			f.git.getBlobSize.resetHistory();
@@ -1255,11 +1307,11 @@ suite('Agent Host Request Diff Survival', () => {
 					event.originatingRequestId === 'base' && event.observationIndex === 1 && event.phase === 'observation')
 					.map(event => event.observationInputBytes),
 			}, {
-				status: 'measured', complete: true, order: ['size', 'size', 'blob', 'blob', 'size', 'blob'], input: [4],
+				status: 'measured', complete: true, order: ['size', 'size', 'size', 'blob', 'blob', 'blob', 'size', 'blob'], input: [6],
 			});
 		});
 
-		test('separate compute events reuse survival identity and aggregate two follow-up comparisons', async () => {
+		test('separate compute events reuse survival identity and aggregate three follow-up comparisons', async () => {
 			const f = fixture();
 			await f.end('base');
 			await f.end('later');
@@ -1279,15 +1331,15 @@ suite('Agent Host Request Diff Survival', () => {
 			}, {
 				files: [
 					{ base: 'base', request: 'base', index: 0, comparison: 'originalRequest', repository: 0, file: 0 },
+					{ base: 'base', request: 'later', index: 1, comparison: 'originalRequest', repository: 0, file: 0 },
 					{ base: 'base', request: 'later', index: 1, comparison: 'baselineToLatest', repository: 0, file: 0 },
 					{ base: 'base', request: 'later', index: 1, comparison: 'requestResultToLatest', repository: 0, file: 0 },
 					{ base: 'later', request: 'later', index: 0, comparison: 'originalRequest', repository: 0, file: 0 },
 				],
-				followUpCount: 2, aggregateMatches: true,
+				followUpCount: 3, aggregateMatches: true,
 				cpuStatuses: [typeof process.threadCpuUsage === 'function' ? 'available' : 'unsupported'],
 				reuse: [
 					{ comparison: 'baselineToLatest', index: 0, elapsed: null, cpu: null },
-					{ comparison: 'originalRequest', index: 1, elapsed: null, cpu: null },
 				],
 			});
 		});
@@ -1305,84 +1357,57 @@ suite('Agent Host Request Diff Survival', () => {
 					fileBytes: rejected.fileInputBytes, accepted: rejected.observationInputBytes, proposed: rejected.proposedObservationInputBytes,
 				},
 				compute: { status: notStarted.status, elapsed: notStarted.elapsedMs, cpu: notStarted.cpuTotalMs },
-				release: f.log.sizeObservations.filter(event => event.originatingRequestId === 'base' && event.phase === 'release').map(event => ({
-					index: event.observationIndex, reason: event.reason, trackerBytes: event.trackerEstimatedRetainedBytes, hostBytes: event.hostEstimatedRetainedBytes,
+				retirement: f.log.sizeObservations.filter(event => event.originatingRequestId === 'base' && event.phase === 'retirement').map(event => ({
+					index: event.observationIndex, reason: event.reason,
 				})),
 			}, {
 				rejected: { base: 'base', request: 'later', index: 1, fileBytes: 2, accepted: 2, proposed: 4 },
 				compute: { status: 'budgetRejected', elapsed: null, cpu: null },
-				release: [{ index: 1, reason: 'budgetRejected', trackerBytes: 0, hostBytes: 0 }],
+				retirement: [{ index: 1, reason: 'budgetRejected' }],
 			});
 		});
 
-		test('retained rejection snapshots precede release and no duplicate release event is emitted', async () => {
-			const path = `${URI.file('/repo').toString()}#file`;
-			const retainedBytes = 256 + 256 + 4 + 2 * path.length + 128 + 2 * (path.length + 2);
-			sinon.stub(requestDiffSurvivalLimits, 'maximumRetainedDiffBytes').value(retainedBytes - 1);
-			const f = fixture();
-			await f.end('base');
-			const rejected = f.log.sizeObservations.find(event => event.phase === 'budgetRejection')!;
-			assert.deepStrictEqual({
-				beforeRelease: rejected.hostEstimatedRetainedBytes,
-				proposed: rejected.proposedHostEstimatedRetainedBytes,
-				releases: f.log.sizeObservations.filter(event => event.phase === 'release').map(event => ({
-					base: event.originatingRequestId, index: event.observationIndex, hostBytes: event.hostEstimatedRetainedBytes, delta: event.retainedBytesDelta,
-				})),
-				compute: f.log.computeObservations.filter(event => event.phase === 'file').map(event => ({ status: event.status, started: event.computationStarted })),
-			}, {
-				beforeRelease: 256 + 256 + 4 + 2 * path.length, proposed: retainedBytes,
-				releases: [{ base: 'base', index: 0, hostBytes: 0, delta: -(256 + 256 + 4 + 2 * path.length) }],
-				compute: [{ status: 'budgetRejected', started: true }],
-			});
-		});
-
-		test('eviction logs host-wide release totals using the last associated request/index', async () => {
+		test('eviction logs retirement once using the last associated request/index', async () => {
 			const f = fixture();
 			await f.end('one', 'one-chat');
 			await f.end('two', 'two-chat');
-			const admissions = f.log.sizeObservations.filter(event => event.phase === 'admission' && event.status === 'completed');
-			const firstBytes = admissions[0].trackerEstimatedRetainedBytes;
 			f.context.evict('one-chat');
 			f.context.evict('two-chat');
+			f.context.evict('two-chat');
 			assert.deepStrictEqual({
-				hostAdmissions: admissions.map(event => event.hostEstimatedRetainedBytes),
-				releases: f.log.sizeObservations.filter(event => event.phase === 'release').map(event => ({
-					base: event.originatingRequestId, index: event.observationIndex, reason: event.reason, host: event.hostEstimatedRetainedBytes, delta: event.retainedBytesDelta,
+				retirements: f.log.sizeObservations.filter(event => event.phase === 'retirement').map(event => ({
+					base: event.originatingRequestId, index: event.observationIndex, reason: event.reason,
 				})),
 			}, {
-				hostAdmissions: [firstBytes, 2 * firstBytes],
-				releases: [
-					{ base: 'one', index: 0, reason: 'stateDisposed', host: firstBytes, delta: -firstBytes },
-					{ base: 'two', index: 0, reason: 'stateDisposed', host: 0, delta: -firstBytes },
+				retirements: [
+					{ base: 'one', index: 0, reason: 'stateDisposed' },
+					{ base: 'two', index: 0, reason: 'stateDisposed' },
 				],
 			});
 		});
 
-		test('missing metadata remains unavailable and failed construction rolls back before recording error retention', async () => {
+		test('missing metadata remains unavailable without retained-state accounting', async () => {
 			const f = fixture();
 			f.git.getBlobSize.resolves(undefined);
 			await f.end('missing');
 			const missing = f.log.sizeObservations.find(event => event.phase === 'inputCheck')!;
-			const rollbacks = f.log.sizeObservations.filter(event => event.phase === 'rollback');
 			assert.deepStrictEqual({
 				input: missing.fileInputBytes, accepted: missing.observationInputBytes, status: missing.status,
 				compute: f.log.computeObservations.find(event => event.phase === 'file')?.computationStarted,
-				rollbacks: rollbacks.map(event => ({ delta: event.retainedBytesDelta, tracker: event.trackerEstimatedRetainedBytes })),
-			}, { input: null, accepted: 0, status: 'failed', compute: false, rollbacks: [{ delta: 0, tracker: 256 }] });
+				phases: [...new Set(f.log.sizeObservations.map(event => event.phase))],
+			}, { input: null, accepted: 0, status: 'failed', compute: false, phases: ['inputCheck', 'fileConstruction', 'observation'] });
 		});
 
-		test('failed blob loading rolls back file retention before retaining the error record', async () => {
+		test('failed blob loading records an explicit error and eviction retires the tracker', async () => {
 			const f = fixture();
 			f.git.showBlob.rejects(new Error('blob failed'));
 			await f.end('failed');
-			const path = `${URI.file('/repo').toString()}#file`;
-			const rolledBack = f.log.sizeObservations.find(event => event.phase === 'rollback')!;
 			f.context.evict('chat');
 			assert.deepStrictEqual({
-				rollback: { delta: rolledBack.retainedBytesDelta, tracker: rolledBack.trackerEstimatedRetainedBytes },
 				fileStatus: f.log.computeObservations.find(event => event.phase === 'file')?.status,
-				releases: f.log.sizeObservations.filter(event => event.phase === 'release').map(event => event.hostEstimatedRetainedBytes),
-			}, { rollback: { delta: -(256 + 4 + 2 * path.length), tracker: 256 }, fileStatus: 'failed', releases: [0] });
+				errors: f.log.characterObservations[0].diffs?.originalRequest.errors,
+				retirements: f.log.sizeObservations.filter(event => event.phase === 'retirement').map(event => event.reason),
+			}, { fileStatus: 'failed', errors: ['Failed to materialize file:///repo/file: blob failed'], retirements: ['stateDisposed'] });
 		});
 
 		test('diagnostics work with survival disabled and never capture checkpoints or compute diffs', async () => {
@@ -1480,10 +1505,8 @@ suite('Agent Host Request Diff Survival', () => {
 			}, { survival: [], compute: [], sizes: [], gitCalls: 0 });
 		});
 
-		test('releases retained bytes at the follow-up horizon before admitting the next origin', async () => {
+		test('retires at the follow-up horizon before admitting the next origin', async () => {
 			sinon.stub(requestDiffSurvivalLimits, 'maximumFollowUpCount').value(1);
-			const path = `${URI.file('/repo').toString()}#file`;
-			sinon.stub(requestDiffSurvivalLimits, 'maximumRetainedDiffBytes').value(256 + 256 + 4 + 2 * path.length + 128 + 2 * (path.length + 2));
 			const f = fixture();
 			const fileDiffs = f.git.computeFileDiffsBetweenRefs;
 			fileDiffs.callsFake(async (_repository: URI, options: { fromRef: string; toRef: string }) =>
@@ -1573,6 +1596,7 @@ interface IRecordedObservation {
 }
 
 interface IRecordedCharacterObservation extends IRecordedObservation {
+	readonly storageStrategy: string;
 	readonly unit: string;
 	readonly complete: boolean;
 	readonly survival: ReturnType<typeof computeRequestCharacterDiffSurvivalMetric>;
@@ -1581,7 +1605,6 @@ interface IRecordedCharacterObservation extends IRecordedObservation {
 	readonly unavailableReason?: string;
 	readonly fileInputBudgetExceeded: number;
 	readonly observationInputBudgetExceeded: number;
-	readonly retainedDiffBudgetExceeded: number;
 	readonly budgetDiagnostics?: RequestDiffSurvivalBudgetError['diagnostics'];
 	readonly diffs?: {
 		readonly originalRequest: IRequestCharacterRepositoryDiff;
@@ -1591,6 +1614,8 @@ interface IRecordedCharacterObservation extends IRecordedObservation {
 }
 
 interface IRecordedComputeObservation {
+	readonly schemaVersion: number;
+	readonly storageStrategy: string;
 	readonly originatingRequestId: string;
 	readonly observationRequestId: string;
 	readonly observationIndex: number;
@@ -1607,6 +1632,8 @@ interface IRecordedComputeObservation {
 }
 
 interface IRecordedSizeObservation extends IRequestDiffSurvivalSizeDetails {
+	readonly schemaVersion: number;
+	readonly storageStrategy: string;
 	readonly originatingRequestId: string;
 	readonly observationRequestId: string;
 	readonly observationIndex: number;
@@ -1734,6 +1761,10 @@ class TestContributionContext implements IAgentHostChatContributionContext {
 	readonly contributionId = RequestDiffSurvivalContribution.id;
 	private readonly _values = new Map<string, ISettableObservable<unknown>>();
 	private readonly _cleanups = new Map<string, { resource: ProtocolURI; dispose: () => void }>();
+
+	snapshot(): string {
+		return JSON.stringify([...this._values.values()].map(value => value.get()), (key, value) => key === '_logService' ? undefined : value);
+	}
 
 	memento<T, TExtra extends readonly MementoSegment[]>(
 		key: IChatMementoKey<T, TExtra> | ISessionMementoKey<T, TExtra>,

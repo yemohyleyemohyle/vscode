@@ -68,12 +68,12 @@ suite('Agent Host Request Diff Survival Cost', () => {
 			status: event.status, elapsed: event.elapsedMs, serviceElapsed: event.serviceCallElapsedMs, cpu: event.cpuTotalMs,
 			schema: event.schemaVersion, engine: event.engine, scope: event.measurementScope,
 		})), [
-			{ phase: 'file', comparison: 'originalRequest', base: 'base', index: 3, status: 'completed', elapsed: 7, serviceElapsed: 100, cpu: 5, schema: 2, engine: 'worker-hybrid', scope: 'diffAndOffsetMapping' },
-			{ phase: 'comparison', comparison: 'originalRequest', base: 'base', index: 3, status: 'completed', elapsed: 7, serviceElapsed: 100, cpu: 5, schema: 2, engine: 'worker-hybrid', scope: 'diffAndOffsetMapping' },
-			{ phase: 'file', comparison: 'baselineToLatest', base: 'base', index: 3, status: 'completed', elapsed: 3, serviceElapsed: 100, cpu: 2.5, schema: 2, engine: 'worker-hybrid', scope: 'diffAndOffsetMapping' },
-			{ phase: 'comparison', comparison: 'baselineToLatest', base: 'base', index: 3, status: 'completed', elapsed: 3, serviceElapsed: 100, cpu: 2.5, schema: 2, engine: 'worker-hybrid', scope: 'diffAndOffsetMapping' },
-			{ phase: 'comparison', comparison: 'requestResultToLatest', base: 'base', index: 3, status: 'reused', elapsed: null, serviceElapsed: null, cpu: null, schema: 2, engine: 'worker-hybrid', scope: 'diffAndOffsetMapping' },
-			{ phase: 'observation', comparison: undefined, base: 'base', index: 3, status: 'completed', elapsed: 10, serviceElapsed: 200, cpu: 7.5, schema: 2, engine: 'worker-hybrid', scope: 'diffAndOffsetMapping' },
+			{ phase: 'file', comparison: 'originalRequest', base: 'base', index: 3, status: 'completed', elapsed: 7, serviceElapsed: 100, cpu: 5, schema: 3, engine: 'worker-hybrid', scope: 'diffAndOffsetMapping' },
+			{ phase: 'comparison', comparison: 'originalRequest', base: 'base', index: 3, status: 'completed', elapsed: 7, serviceElapsed: 100, cpu: 5, schema: 3, engine: 'worker-hybrid', scope: 'diffAndOffsetMapping' },
+			{ phase: 'file', comparison: 'baselineToLatest', base: 'base', index: 3, status: 'completed', elapsed: 3, serviceElapsed: 100, cpu: 2.5, schema: 3, engine: 'worker-hybrid', scope: 'diffAndOffsetMapping' },
+			{ phase: 'comparison', comparison: 'baselineToLatest', base: 'base', index: 3, status: 'completed', elapsed: 3, serviceElapsed: 100, cpu: 2.5, schema: 3, engine: 'worker-hybrid', scope: 'diffAndOffsetMapping' },
+			{ phase: 'comparison', comparison: 'requestResultToLatest', base: 'base', index: 3, status: 'reused', elapsed: null, serviceElapsed: null, cpu: null, schema: 3, engine: 'worker-hybrid', scope: 'diffAndOffsetMapping' },
+			{ phase: 'observation', comparison: undefined, base: 'base', index: 3, status: 'completed', elapsed: 10, serviceElapsed: 200, cpu: 7.5, schema: 3, engine: 'worker-hybrid', scope: 'diffAndOffsetMapping' },
 		]);
 	});
 

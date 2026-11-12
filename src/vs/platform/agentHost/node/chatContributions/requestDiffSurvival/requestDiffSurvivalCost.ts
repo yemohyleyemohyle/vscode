@@ -37,17 +37,13 @@ export interface IRequestDiffSurvivalFileCost {
 }
 
 export interface IRequestDiffSurvivalSizeDetails {
-	readonly phase: 'inputCheck' | 'fileConstruction' | 'admission' | 'rollback' | 'budgetRejection' | 'release' | 'observation';
+	readonly phase: 'inputCheck' | 'fileConstruction' | 'budgetRejection' | 'retirement' | 'observation';
 	readonly status: RequestDiffSurvivalCostOutcome | 'started';
 	readonly comparisonKind?: RequestDiffSurvivalComparison;
 	readonly repositoryIndex?: number;
 	readonly fileIndex?: number;
 	readonly fileInputBytes?: number | null;
-	readonly trackerEstimatedRetainedBytes: number;
-	readonly hostEstimatedRetainedBytes: number;
-	readonly retainedBytesDelta?: number;
 	readonly proposedObservationInputBytes?: number | null;
-	readonly proposedHostEstimatedRetainedBytes?: number | null;
 	readonly reason?: 'horizon' | 'budgetRejected' | 'failed' | 'cancelled' | 'stateDisposed' | 'idleExpired' | 'maximumAgeExceeded';
 }
 
@@ -181,8 +177,8 @@ export class RequestDiffSurvivalCostObservation {
 
 	size(details: IRequestDiffSurvivalSizeDetails): void {
 		const event = {
-			...this._identity, schemaVersion: 1, recordKind: 'requestCharacterDiffSizeObservation',
-			timestamp: new Date().toISOString(), unit: 'accountedBytes',
+			...this._identity, schemaVersion: 2, recordKind: 'requestCharacterDiffSizeObservation', storageStrategy: 'checkpointIds',
+			timestamp: new Date().toISOString(), unit: 'bytes',
 			observationInputBytes: this.inputBudget.inputBytes, limits: requestDiffSurvivalLimits,
 			...details,
 		};
@@ -219,7 +215,7 @@ export class RequestDiffSurvivalCostObservation {
 		const measured = totals.startedFileCount > 0;
 		const cpuAvailable = measured && this._cpuStatus === 'available';
 		this._write(RequestDiffSurvivalCostObservation.computeLogPrefix, {
-			...this._identity, schemaVersion: 2, recordKind: 'requestCharacterDiffComputeObservation',
+			...this._identity, schemaVersion: 3, recordKind: 'requestCharacterDiffComputeObservation', storageStrategy: 'checkpointIds',
 			engine: 'worker-hybrid', algorithm: 'hybrid',
 			executionLocation: 'worker',
 			measurementScope: 'diffAndOffsetMapping',

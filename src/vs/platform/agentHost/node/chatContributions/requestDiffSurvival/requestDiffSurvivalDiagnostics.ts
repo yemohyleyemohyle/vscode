@@ -81,7 +81,8 @@ type DiagnosticDetails =
 
 export type RequestDiffSurvivalDiagnosticRecord = DiagnosticDetails & {
 	readonly recordKind: 'requestDiffSurvivalDiagnostics';
-	readonly schemaVersion: 1;
+	readonly schemaVersion: 2;
+	readonly storageStrategy: 'checkpointIds';
 	readonly diagnosticsRunId: string;
 	readonly sequence: number;
 	readonly timestamp: string;
@@ -248,7 +249,7 @@ export class RequestDiffSurvivalDiagnostics extends Disposable {
 
 	private _write(details: DiagnosticDetails): void {
 		const record: RequestDiffSurvivalDiagnosticRecord = {
-			recordKind: 'requestDiffSurvivalDiagnostics', schemaVersion: 1, diagnosticsRunId: this._runId,
+			recordKind: 'requestDiffSurvivalDiagnostics', schemaVersion: 2, storageStrategy: 'checkpointIds', diagnosticsRunId: this._runId,
 			sequence: ++this._sequence, timestamp: new Date().toISOString(), timeUnit: 'ms', timingKind: 'elapsed',
 			engine: this._engine, ...details,
 		};

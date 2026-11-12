@@ -36,17 +36,15 @@ export interface IRequestCharacterRepositoryDiff {
 
 export function materializeRequestCharacterDiffFile(
 	beforePath: string | undefined, afterPath: string | undefined, before: string, after: string,
-	changes: readonly ISurvivalDiffChange[], reserveChange?: (path: string, textLength: number) => void,
+	changes: readonly ISurvivalDiffChange[],
 ): IRequestCharacterDiffFile {
 	const minus: IRequestCharacterChange[] = [];
 	const plus: IRequestCharacterChange[] = [];
 	for (const change of changes) {
 		if (change.originalLength > 0) {
-			reserveChange?.(beforePath ?? afterPath ?? '', change.originalLength);
 			minus.push({ path: beforePath ?? afterPath ?? '', offset: change.originalStart, length: change.originalLength, text: before.slice(change.originalStart, change.originalStart + change.originalLength) });
 		}
 		if (change.modifiedLength > 0) {
-			reserveChange?.(afterPath ?? beforePath ?? '', change.modifiedLength);
 			plus.push({ path: afterPath ?? beforePath ?? '', offset: change.modifiedStart, length: change.modifiedLength, text: after.slice(change.modifiedStart, change.modifiedStart + change.modifiedLength) });
 		}
 	}

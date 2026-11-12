@@ -6,7 +6,6 @@
 export const requestDiffSurvivalLimits = {
 	maximumFileInputBytes: 512 * 1024,
 	maximumObservationInputBytes: 4 * 1024 * 1024,
-	maximumRetainedDiffBytes: 16 * 1024 * 1024,
 	maximumFollowUpCount: 10,
 	idleExpiryMs: 60 * 60 * 1000,
 	maximumTrackerAgeMs: 24 * 60 * 60 * 1000,
@@ -16,11 +15,9 @@ export class RequestDiffSurvivalBudgetError extends Error {
 	constructor(
 		readonly fileInputBudgetExceeded: boolean,
 		readonly observationInputBudgetExceeded: boolean,
-		readonly retainedDiffBudgetExceeded: boolean,
 		readonly diagnostics: {
 			readonly fileInputBytes?: number;
 			readonly observationInputBytes?: number;
-			readonly proposedRetainedDiffBytes?: number;
 		},
 	) {
 		super('Request character-diff survival budget exceeded');
@@ -39,7 +36,7 @@ export class RequestDiffSurvivalInputBudget {
 		const fileExceeded = fileInputBytes > requestDiffSurvivalLimits.maximumFileInputBytes;
 		const observationExceeded = proposedInputBytes > requestDiffSurvivalLimits.maximumObservationInputBytes;
 		if (fileExceeded || observationExceeded) {
-			throw new RequestDiffSurvivalBudgetError(fileExceeded, observationExceeded, false, {
+			throw new RequestDiffSurvivalBudgetError(fileExceeded, observationExceeded, {
 				fileInputBytes, observationInputBytes: proposedInputBytes,
 			});
 		}
