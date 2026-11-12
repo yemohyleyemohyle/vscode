@@ -97,6 +97,48 @@ pnpm run test-node --run src/vs/platform/agentHost/test/node/survivalDiff.test.t
 
 The engine suite verifies real worker messaging/measurements/disposal, exact reconstruction (including deterministic mixed-newline edits), unchanged worker-character ranges, A/B coordinate intersections, timeout results, and CPU-read failure isolation. Contribution tests verify preflight-before-dispatch, reuse/cadence, timeout retirement, and stale-result cleanup.
 
+## Request-survival responsiveness diagnostics
+
+The independent local collector in [requestDiffSurvivalDiagnostics.ts](../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalDiagnostics.ts) is enabled only with `VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_DIAGNOSTICS=1`. It does not enable survival tracking, change thresholds/scheduling, add product telemetry, or start synthetic operations. Leave the flag enabled in all comparison lanes:
+
+| Lane | Environment |
+| --- | --- |
+| Disabled-survival baseline | Diagnostics flag `1`; survival `LOG` flag absent or `0` |
+| Character worker | Diagnostics flag `1`, `VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG=1`, `VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE=worker-character` |
+| Hybrid worker | Diagnostics flag `1`, `VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG=1`, `VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE=worker-hybrid` |
+
+Restart the Agent Host after changing flags. Baseline records explicitly carry `engine: "disabled"` and create no survival checkpoints or diff jobs. Without the diagnostics opt-in, no collector, event-loop monitor, periodic timer, or diagnostic records are created.
+
+### Identifying and extracting records
+
+Every diagnostic record is one info-level JSON log line prefixed with **`[RequestDiffSurvivalDiagnostics] `**, with `recordKind: "requestDiffSurvivalDiagnostics"` and `schemaVersion: 1`. It is separate from the existing survival, compute, and size streams. All records carry `diagnosticsRunId` (unique per collector), increasing `sequence`, UTC `timestamp`, `engine`, `timeUnit: "ms"`, and **`timingKind: "elapsed"`**. None of the new duration fields is CPU time.
+
+Extract pure JSONL from an Agent Host log using standard `sed`:
+
+```bash
+sed -n 's/^.*\[RequestDiffSurvivalDiagnostics\] //p' "$LOG"
+```
+
+Save stdout to a chosen results file, not the workload. Include rotated logs if present, group by `diagnosticsRunId`, and order each group by `sequence`; do not combine separate host runs accidentally. The `lifecycle/started` record confirms activation. A `lifecycle/stopped` record is best-effort on orderly disposal, not guaranteed after a crash or forced termination.
+
+| `phase` | Main fields | Meaning |
+| --- | --- | --- |
+| `lifecycle` | `status: started/stopped`, `windowIntervalMs`, `loopResolutionMs`, `unfinishedTaskCount`, `unfinishedObservationCount` | Configuration and shutdown snapshot. Unfinished counts are not silently completed or zeroed in the final log. |
+| `window` | `windowElapsedMs`, `eventLoop.{status,sampleCount,resolutionMs,p95Ms,maxMs}`, `host`, `chats` | Nominal one-second host-main-thread sampling windows, with actual elapsed length. Histogram nanoseconds are converted to milliseconds. Empty samples use `status: noSamples` and null p95/max, not zero or the histogram sentinel. |
+| `task` | `taskId`, `taskKind`, `status`, session/chat/request IDs, `queueWaitMs`, `processingElapsedMs`, `totalElapsedMs`, `host`, `chat` | Lifecycle records for each actual queued background task: `queued`, `started`, then `completed/failed/cancelled`. `taskKind` distinguishes `turnStart`, `turnEnd`, and immediate `expiry` work. Null timing means that phase has not happened; cancelling a task before start leaves queue wait and processing null. |
+| `observation` | `taskId`, existing survival identity, `observationBoundary`, `status`, `processingElapsedMs`, `sinceTaskEnqueuedMs` | One finished observation: initial or follow-up, including rejected/failed/cancelled attempts. Includes preflight, blob reads, awaited diffing, result processing, and observation-log construction; not CPU. Join by session/chat/originating request/index and use boundary to distinguish expiry. |
+| `drain` | `scope: survivalBackgroundWork`, `busyPeriodElapsedMs`, `sinceLastEnqueueMs`, `sinceLastEligibleTurnEndMs`, zero pending/running counts | Background work reached zero after a busy period. This is not a declaration that all agent turns ended or future expiry is disabled. A driver must select the drain after its foreground cutoff for an experiment-level drain result. |
+
+Task `queueWaitMs` is enqueue-to-start; task processing is start-to-finish; total is enqueue-to-finish. A turn-end task may await checkpoints and process several origins, so pending **tasks are not pending observations or files**. `sinceTaskEnqueuedMs` is the delay until an individual observation starts, including queue wait, checkpoint wait, and preceding observations in that batch. Do not label it pure queue wait. Expiry task processing also includes fresh-state capture; observation processing begins afterward. A terminal survival record written without attempting a computation (for example unsafe expiry) has no diagnostic observation duration: inspect the existing survival stream for complete terminal coverage. A completed task means its orchestration returned normally, not that every observation succeeded: inspect observation statuses and the existing survival/compute outcomes.
+
+The `host`/`chat` snapshots contain `queuedTaskCount`, `runningTaskCount`, `runningObservationCount`, and `peakPendingTaskCount`. Pending tasks = queued + running. Host peak is cumulative for the collector lifetime; chat peak applies to the current busy lifetime and idle chat entries are removed. A missing chat in a window means no active work for it, not missing tracker retention. Use maxima, never sums, for peaks and point-in-time counters. Snapshots overlap by design.
+
+Event-loop samples use a 10 ms monitor resolution, so values include the normal timer interval and scheduling delay; they are not exact main-thread blocking durations. Compare identical instrumentation against the disabled-survival baseline. Each window's p95 describes only that window: do not average window p95s and call it run p95. Run maximum can be obtained from the maximum sampled `maxMs`, with sample coverage reported. Allow recovery windows after the edits so delayed monitor callbacks can be observed; immediate shutdown or a hard crash can miss a final stall.
+
+For a small manual run, display every finished task's queue wait and every observation's processing duration rather than p95 over a handful of observations. Do not sum task durations with their nested observation durations or combine these elapsed times with existing diff CPU. The collector does not yet measure ordinary-diff/control probe latency, exact shared-worker queue wait, peak heap/RSS, heartbeat threshold counts, or load-driver cutoff/deadline. Those require the separate automated experiment; missing data is not zero overhead.
+
+Focused validation uses [requestDiffSurvivalDiagnostics.test.ts](./requestDiffSurvivalDiagnostics.test.ts) for deterministic clocks, window samples, queue/processing separation, multi-chat accounting, cancellation, drain, shutdown, and a real event-loop monitor. [requestDiffSurvival.test.ts](./requestDiffSurvival.test.ts) covers independent opt-in/baseline behavior, real contribution task/observation joins, expiry, budget rejection, and eviction. These are collector correctness tests, not evidence that collection has negligible performance overhead.
+
 ## Request-survival attribution coverage
 
 Every experimental `requestCharacterDiffSurvivalObservation` includes `originalRequestUsedEditTool`. The contribution collects provider-owned tool outcomes synchronously within the originating request, including parent and nested-subagent tools, and freezes the value at success, cancellation, or non-resumable error. Later observations repeat that value; a resumable error does not finalize it. This field does not filter requests or change the observation horizon, diff metrics, telemetry consent, or experiment opt-in.

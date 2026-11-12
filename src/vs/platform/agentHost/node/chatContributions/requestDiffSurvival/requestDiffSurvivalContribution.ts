@@ -21,6 +21,7 @@ import { AgentHostStateManager, IAgentHostStateManager } from '../../agentHostSt
 import { computeRequestCharacterDiffFile, computeRequestCharacterDiffSurvivalMetric, materializeRequestCharacterDiffFile, type IRequestCharacterRepositoryDiff } from './requestCharacterDiffSurvival.js';
 import { RequestDiffSurvivalBudgetError, RequestDiffSurvivalInputBudget, requestDiffSurvivalLimits } from './requestDiffSurvivalLimits.js';
 import { getRequestDiffSurvivalCostOutcome, RequestDiffSurvivalComputationError, RequestDiffSurvivalCostObservation, type IRequestDiffSurvivalFileCost, type IRequestDiffSurvivalSizeDetails, type RequestDiffSurvivalComparison, type RequestDiffSurvivalCostOutcome, type RequestDiffSurvivalEngine } from './requestDiffSurvivalCost.js';
+import { RequestDiffSurvivalDiagnostics } from './requestDiffSurvivalDiagnostics.js';
 
 const CHARACTER_DIFF_LOG_PREFIX = '[RequestCharacterDiffSurvivalObservation] ';
 const ENABLED_ENVIRONMENT_VARIABLE = 'VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG';
@@ -94,6 +95,7 @@ interface IRequestDiffSurvivalState {
 	session?: ProtocolURI;
 	lastActivity: number;
 	isDisposed: boolean;
+	diagnosticTaskId?: number;
 }
 
 interface IRequestEditToolEvidence {
@@ -146,6 +148,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 
 	private readonly _enabled = process.env[ENABLED_ENVIRONMENT_VARIABLE] === '1';
 	private readonly _engine: RequestDiffSurvivalEngine;
+	private readonly _diagnostics: RequestDiffSurvivalDiagnostics | undefined;
 	private readonly _observations = new SequencerByKey<ProtocolURI>();
 	private readonly _states = new Map<ProtocolURI, IRequestDiffSurvivalState>();
 	protected readonly _expiryScheduler = this._register(this._createExpiryScheduler(() => this._expireTrackers()));
@@ -201,6 +204,9 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 			throw new Error(`Invalid VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE: ${engine}`);
 		}
 		this._engine = engine;
+		if (process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_DIAGNOSTICS === '1') {
+			this._diagnostics = this._register(new RequestDiffSurvivalDiagnostics(this._enabled ? engine : 'disabled', this._logService));
+		}
 		if (this._enabled) {
 			this._logService.info(`[RequestDiffSurvival] Enabled for Agent Host chats; engine=${this._engine}`);
 		}
@@ -225,7 +231,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		}
 		const observationModel = turn.message.model?.id ?? turn.effectiveModel?.id ?? null;
 		const observationTimestamp = new Date().toISOString();
-		this._schedule(turn.chat, state, async () => {
+		this._schedule(turn.session, turn.chat, state, turn.turnId, 'turnStart', async () => {
 			const start = await this._checkpointService.getTurnStartCheckpointState(URI.parse(turn.session), URI.parse(turn.chat), turn.turnId);
 			this._assertActive(state);
 			if (!start) {
@@ -298,9 +304,10 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 			return;
 		}
 		const turnId = turn.turnId;
+		this._diagnostics?.noteEligibleTurnEnd();
 		const originalRequestUsedEditTool = this._finishEvidence(turn.channel, turnId);
 		const observationTimestamp = new Date().toISOString();
-		this._schedule(turn.channel, state, async () => {
+		this._schedule(turn.session, turn.channel, state, turnId, 'turnEnd', async () => {
 			const start = state.starts.get(turnId);
 			if (!start) {
 				return;
@@ -373,10 +380,22 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 			|| (turn.reason.kind === 'error' && !turn.reason.resumable);
 	}
 
-	private _schedule(chat: ProtocolURI, state: IRequestDiffSurvivalState, task: () => Promise<void>): void {
+	private _schedule(sessionId: ProtocolURI, chat: ProtocolURI, state: IRequestDiffSurvivalState, requestId: string, taskKind: 'turnStart' | 'turnEnd', task: () => Promise<void>): void {
+		const diagnosticTask = this._diagnostics?.enqueueTask({ sessionId, chatId: chat, requestId, taskKind });
 		void this._observations.queue(chat, async () => {
-			this._assertActive(state);
-			await task();
+			diagnosticTask?.start();
+			state.diagnosticTaskId = diagnosticTask?.id;
+			let outcome: RequestDiffSurvivalCostOutcome = 'completed';
+			try {
+				this._assertActive(state);
+				await task();
+			} catch (error) {
+				outcome = getRequestDiffSurvivalCostOutcome(error);
+				throw error;
+			} finally {
+				state.diagnosticTaskId = undefined;
+				diagnosticTask?.finish(outcome);
+			}
 		}).catch(error => this._handleObservationError(chat, error));
 	}
 
@@ -509,6 +528,25 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 	}
 
 	private async _finalizeExpiry(state: IRequestDiffSurvivalState, chat: ProtocolURI, tracker: IRequestDiffSurvivalTracker, reason: ExpiryReason): Promise<void> {
+		if (!state.session) {
+			throw new Error('Missing session for request survival expiry');
+		}
+		const diagnosticTask = this._diagnostics?.enqueueTask({
+			sessionId: state.session, chatId: chat, requestId: tracker.lastObservationRequestId, taskKind: 'expiry',
+		});
+		diagnosticTask?.start();
+		let outcome: RequestDiffSurvivalCostOutcome = 'completed';
+		try {
+			await this._captureAndFinalizeExpiry(state, chat, tracker, reason, diagnosticTask?.id);
+		} catch (error) {
+			outcome = getRequestDiffSurvivalCostOutcome(error);
+			throw error;
+		} finally {
+			diagnosticTask?.finish(outcome);
+		}
+	}
+
+	private async _captureAndFinalizeExpiry(state: IRequestDiffSurvivalState, chat: ProtocolURI, tracker: IRequestDiffSurvivalTracker, reason: ExpiryReason, diagnosticTaskId?: number): Promise<void> {
 		if (tracker.isRetired) {
 			return;
 		}
@@ -533,7 +571,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 			throw new Error('Missing session for request survival expiry');
 		}
 		await this._emitObservation(session, chat, tracker.lastObservationRequestId, tracker.lastObservationModel,
-			new Date().toISOString(), latest, tracker, state, reason);
+			new Date().toISOString(), latest, tracker, state, reason, diagnosticTaskId);
 	}
 
 	private async _captureExpiryState(state: IRequestDiffSurvivalState, tracker: IRequestDiffSurvivalTracker, reason: ExpiryReason): Promise<readonly IRepositoryState[] | UnavailableReason> {
@@ -657,6 +695,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		tracker: IRequestDiffSurvivalTracker,
 		state: IRequestDiffSurvivalState,
 		expiryReason?: ExpiryReason,
+		diagnosticTaskId = state.diagnosticTaskId,
 	): Promise<void> {
 		if (tracker.isRetired || tracker.expiryReason !== expiryReason) {
 			return;
@@ -670,6 +709,10 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		}, undefined, this._engine);
 		let outcome: RequestDiffSurvivalCostOutcome = 'failed';
 		let attemptedWrite = false;
+		const finishDiagnostics = this._diagnostics?.startObservation({
+			sessionId: session, chatId: chat, originatingRequestId: tracker.originatingRequestId,
+			observationRequestId, observationIndex: tracker.observationCount, observationBoundary: expiryReason ? 'expiry' : 'requestEnd',
+		}, diagnosticTaskId);
 		try {
 			const budget = cost.inputBudget;
 			const originalInput = !tracker.originalRequest
@@ -746,6 +789,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 			this._sizeEvent(tracker, { phase: 'observation', status: outcome });
 			tracker.isObserving = false;
 			this._scheduleExpiry();
+			finishDiagnostics?.(outcome);
 		}
 	}
 

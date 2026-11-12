@@ -25,13 +25,17 @@ import { createNoopGitService } from '../common/sessionTestHelpers.js';
 import { type computeRequestCharacterDiffSurvivalMetric, type IRequestCharacterRepositoryDiff } from '../../node/chatContributions/requestDiffSurvival/requestCharacterDiffSurvival.js';
 import { InProcessDiffComputeService } from './inProcessDiffComputeService.js';
 import { computeSurvivalDiff } from '../../node/survivalDiff.js';
+import { RequestDiffSurvivalDiagnostics, type RequestDiffSurvivalDiagnosticRecord } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalDiagnostics.js';
 
 suite('Agent Host Request Diff Survival', () => {
 	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
 	let previousEngine: string | undefined;
+	let previousDiagnostics: string | undefined;
 	setup(() => {
 		previousEngine = process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE;
+		previousDiagnostics = process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_DIAGNOSTICS;
 		delete process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE;
+		delete process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_DIAGNOSTICS;
 	});
 	teardown(() => {
 		sinon.restore();
@@ -39,6 +43,11 @@ suite('Agent Host Request Diff Survival', () => {
 			delete process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE;
 		} else {
 			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE = previousEngine;
+		}
+		if (previousDiagnostics === undefined) {
+			delete process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_DIAGNOSTICS;
+		} else {
+			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_DIAGNOSTICS = previousDiagnostics;
 		}
 	});
 
@@ -634,6 +643,24 @@ suite('Agent Host Request Diff Survival', () => {
 					unavailable: record.unavailableReason, complete: record.complete, ratio: record.survival.ratio,
 				};
 			}
+
+			test('diagnostics include expiry capture tasks and correlate their terminal observations', async () => {
+				process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_DIAGNOSTICS = '1';
+				const f = lifetimeFixture();
+				const ended = f.log.whenDiagnosticTaskEnds('base');
+				await f.end('base');
+				await ended;
+				const expired = f.log.whenDiagnosticTaskEnds('base', 'expiry');
+				f.clock.advance(requestDiffSurvivalLimits.idleExpiryMs);
+				await expired;
+				const task = f.log.diagnostics.filter(record => record.phase === 'task').find(record => record.taskKind === 'expiry');
+				const observation = f.log.diagnostics.find(record => record.phase === 'observation' && record.observationBoundary === 'expiry');
+				assert.deepStrictEqual({
+					task: task?.phase === 'task' ? task.taskKind : undefined,
+					observation: observation?.phase === 'observation' ? [observation.originatingRequestId, observation.observationIndex, observation.status, observation.taskId === task?.taskId] : undefined,
+					captures: f.capture.callCount,
+				}, { task: 'expiry', observation: ['base', 1, 'completed', true], captures: 1 });
+			});
 
 			test('uses centralized production durations and expires at the exact idle deadline without another request', async () => {
 				const f = lifetimeFixture();
@@ -1367,6 +1394,91 @@ suite('Agent Host Request Diff Survival', () => {
 			}, { rollback: { delta: -(256 + 4 + 2 * path.length), tracker: 256 }, fileStatus: 'failed', releases: [0] });
 		});
 
+		test('diagnostics work with survival disabled and never capture checkpoints or compute diffs', async () => {
+			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG = '0';
+			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_DIAGNOSTICS = '1';
+			const f = fixture();
+			const checkpoint = sinon.spy(f.checkpoint, 'getTurnStartCheckpointState');
+			f.begin('disabled');
+			f.contribution.dispose();
+			assert.deepStrictEqual({
+				phases: f.log.diagnostics.map(record => [record.phase, record.engine]),
+				checkpoints: checkpoint.callCount, gitCalls: f.git.computeFileDiffsBetweenRefs.callCount,
+				survival: f.log.characterObservations.length,
+			}, {
+				phases: [['lifecycle', 'disabled'], ['window', 'disabled'], ['lifecycle', 'disabled']],
+				checkpoints: 0, gitCalls: 0, survival: 0,
+			});
+		});
+
+		test('diagnostics correlate each observation with its queued turn-end batch', async () => {
+			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_DIAGNOSTICS = '1';
+			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_ENGINE = 'worker-hybrid';
+			const f = fixture();
+			const first = f.log.whenDiagnosticTaskEnds('base');
+			await f.end('base');
+			await first;
+			const next = f.log.whenDiagnosticTaskEnds('later');
+			await f.end('later');
+			await next;
+			const tasks = f.log.diagnostics.filter(record => record.phase === 'task').filter(record => record.status === 'completed');
+			const observations = f.log.diagnostics.filter(record => record.phase === 'observation');
+			const drains = f.log.diagnostics.filter(record => record.phase === 'drain');
+			assert.deepStrictEqual({
+				tasks: tasks.map(record => [record.requestId, record.taskKind]),
+				observations: observations.map(record => [record.originatingRequestId, record.observationRequestId, record.observationIndex, record.status]),
+				joined: observations.every(record => tasks.some(task => task.taskId === record.taskId && task.taskKind === 'turnEnd' && task.requestId === record.observationRequestId)),
+				lastDrain: drains.at(-1)?.pendingTaskCount,
+				engines: [...new Set(f.log.diagnostics.map(record => record.engine))],
+			}, {
+				tasks: [['base', 'turnStart'], ['base', 'turnEnd'], ['later', 'turnStart'], ['later', 'turnEnd']],
+				observations: [['base', 'base', 0, 'completed'], ['base', 'later', 1, 'completed'], ['later', 'later', 0, 'completed']],
+				joined: true, lastDrain: 0, engines: ['worker-hybrid'],
+			});
+		});
+
+		test('diagnostics distinguish budget-rejected observations from completed orchestration tasks', async () => {
+			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_DIAGNOSTICS = '1';
+			sinon.stub(requestDiffSurvivalLimits, 'maximumObservationInputBytes').value(1);
+			const f = fixture();
+			const ended = f.log.whenDiagnosticTaskEnds('rejected');
+			await f.end('rejected');
+			await ended;
+			assert.deepStrictEqual({
+				observations: f.log.diagnostics.filter(record => record.phase === 'observation').map(record => record.status),
+				tasks: f.log.diagnostics.filter(record => record.phase === 'task').filter(record => record.status !== 'queued' && record.status !== 'started').map(record => record.status),
+			}, { observations: ['budgetRejected'], tasks: ['completed', 'completed'] });
+		});
+
+		test('diagnostics settle cancelled queued work after chat eviction without reviving tracking', async () => {
+			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_DIAGNOSTICS = '1';
+			const f = fixture();
+			const entered = new DeferredPromise<void>();
+			const release = new DeferredPromise<void>();
+			f.checkpoint.getTurnStartCheckpointState = async () => {
+				entered.complete();
+				await release.p;
+				return [{ repository: URI.file('/repo'), tree: 'before' }];
+			};
+			const ended = f.log.whenDiagnosticTaskEnds('evicted');
+			f.begin('evicted');
+			await entered.p;
+			f.context.evict('chat');
+			release.complete();
+			await ended;
+			assert.deepStrictEqual({
+				statuses: f.log.diagnostics.filter(record => record.phase === 'task').filter(record => record.status === 'cancelled').map(record => record.taskKind),
+				observations: f.log.characterObservations.length,
+				drained: f.log.diagnostics.some(record => record.phase === 'drain'),
+			}, { statuses: ['turnStart', 'turnEnd'], observations: 0, drained: true });
+		});
+
+		test('without diagnostic opt-in there are no diagnostic events', async () => {
+			const f = fixture();
+			await f.end('base');
+			assert.deepStrictEqual(f.log.diagnostics, []);
+		});
+
 		test('disabled experiment emits no compute or size events and does no extra work', async () => {
 			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG = '0';
 			const f = fixture();
@@ -1512,12 +1624,20 @@ interface IRecordedSizeObservation extends IRequestDiffSurvivalSizeDetails {
 }
 
 class RecordingObservationLogService extends NullLogService {
+	readonly diagnostics: RequestDiffSurvivalDiagnosticRecord[] = [];
 	readonly characterObservations: IRecordedCharacterObservation[] = [];
 	readonly computeObservations: IRecordedComputeObservation[] = [];
 	readonly sizeObservations: IRecordedSizeObservation[] = [];
 	private readonly _requestEnds = new Map<string, DeferredPromise<void>>();
 	private readonly _expiries = new Map<string, DeferredPromise<void>>();
 	private readonly _computeEnds = new Map<string, DeferredPromise<void>>();
+	private readonly _diagnosticTaskEnds = new Map<string, DeferredPromise<void>>();
+
+	whenDiagnosticTaskEnds(requestId: string, taskKind = 'turnEnd'): Promise<void> {
+		const ended = new DeferredPromise<void>();
+		this._diagnosticTaskEnds.set(`${taskKind}:${requestId}`, ended);
+		return ended.p;
+	}
 
 	whenComputeEnds(requestId: string): Promise<void> {
 		const ended = new DeferredPromise<void>();
@@ -1538,6 +1658,16 @@ class RecordingObservationLogService extends NullLogService {
 	}
 
 	override info(message: string): void {
+		if (message.startsWith(RequestDiffSurvivalDiagnostics.logPrefix)) {
+			const record: RequestDiffSurvivalDiagnosticRecord = JSON.parse(message.slice(RequestDiffSurvivalDiagnostics.logPrefix.length));
+			this.diagnostics.push(record);
+			if (record.phase === 'task' && record.status !== 'queued' && record.status !== 'started') {
+				const key = `${record.taskKind}:${record.requestId}`;
+				this._diagnosticTaskEnds.get(key)?.complete();
+				this._diagnosticTaskEnds.delete(key);
+			}
+			return;
+		}
 		if (message.startsWith(RequestDiffSurvivalCostObservation.computeLogPrefix)) {
 			const observation: IRecordedComputeObservation = JSON.parse(message.slice(RequestDiffSurvivalCostObservation.computeLogPrefix.length));
 			this.computeObservations.push(observation);
