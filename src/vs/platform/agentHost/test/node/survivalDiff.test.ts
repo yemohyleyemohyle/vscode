@@ -70,16 +70,13 @@ suite('Agent Host Hybrid Survival Diff', () => {
 		});
 	});
 
-	workerTest('runs through the real shared worker and returns thread measurements', async () => {
+	workerTest('runs through the real shared worker without diagnostic measurements', async () => {
 		const service = disposables.add(new NodeWorkerDiffComputeService(new NullLogService()));
 		const results = await Promise.all(samples.map(([before, after]) => service.computeSurvivalDiff(before, after)));
 		assert.deepStrictEqual({
 			texts: results.map((result, index) => reconstruct(samples[index][0], samples[index][1], result)),
-			measured: results.every(result => result.measurement.elapsedMs >= 0
-				&& (result.measurement.cpuMeasurementStatus === 'available'
-					? result.measurement.cpuUserMs !== null && result.measurement.cpuSystemMs !== null
-					: result.measurement.cpuUserMs === null && result.measurement.cpuSystemMs === null)),
-		}, { texts: samples.map(([, after]) => after), measured: true });
+			resultKeys: [...new Set(results.map(result => Object.keys(result).sort().join(',')))],
+		}, { texts: samples.map(([, after]) => after), resultKeys: ['changes,status'] });
 	});
 
 	test('hybrid newline-only edits retain the shared LF rather than replacing entire lines', () => {
@@ -104,15 +101,6 @@ suite('Agent Host Hybrid Survival Diff', () => {
 			return [before, after];
 		});
 		assert.deepStrictEqual(cases.map(([before, after]) => reconstruct(before, after, computeSurvivalDiff(before, after, 5000))), cases.map(([, after]) => after));
-	});
-
-	test('failed thread CPU reading does not change successful output', () => {
-		const result = computeSurvivalDiff('a', 'b', 5000, {
-			now: () => 0, cpuUsage: () => { throw new Error('cpu failed'); },
-		});
-		assert.deepStrictEqual({
-			status: result.status, cpu: result.measurement,
-		}, { status: 'completed', cpu: { elapsedMs: 0, cpuMeasurementStatus: 'failed', cpuUserMs: null, cpuSystemMs: null, cpuMeasurementError: 'cpu failed' } });
 	});
 
 	workerTest('disposing the worker rejects pending work and prevents worker resurrection', async () => {

@@ -27,23 +27,13 @@ export interface ISurvivalDiffChange {
 	readonly modifiedLength: number;
 }
 
-export interface ISurvivalDiffMeasurement {
-	readonly elapsedMs: number;
-	readonly cpuMeasurementStatus: 'available' | 'unsupported' | 'failed';
-	readonly cpuUserMs: number | null;
-	readonly cpuSystemMs: number | null;
-	readonly cpuMeasurementError?: string;
-}
-
 export type ISurvivalDiffResult = {
-	readonly measurement: ISurvivalDiffMeasurement;
-} & ({
 	readonly status: 'completed';
 	readonly changes: readonly ISurvivalDiffChange[];
 } | {
 	readonly status: 'failed' | 'timedOut';
 	readonly error: string;
-});
+};
 
 export interface IDetailedDiffResult {
 	added: number;
@@ -97,7 +87,7 @@ export const DEFAULT_DIFF_TIMEOUT_MS = 5000;
 export interface IDiffComputeService {
 	readonly _serviceBrand: undefined;
 
-	/** Computes hybrid UTF-16 changes and thread-local cost for the opt-in survival experiment. */
+	/** Computes hybrid UTF-16 changes for the opt-in survival experiment. */
 	computeSurvivalDiff(original: string, modified: string, timeoutMs?: number): Promise<ISurvivalDiffResult>;
 
 	/**

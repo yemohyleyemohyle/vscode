@@ -4,45 +4,20 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { DefaultLinesDiffComputer } from '../../../editor/common/diff/defaultLinesDiffComputer/defaultLinesDiffComputer.js';
-import type { ISurvivalDiffChange, ISurvivalDiffMeasurement, ISurvivalDiffResult } from '../common/diffComputeService.js';
+import type { ISurvivalDiffChange, ISurvivalDiffResult } from '../common/diffComputeService.js';
 
-export interface ISurvivalDiffClock {
-	readonly now: () => number;
-	readonly cpuUsage?: (previous?: NodeJS.CpuUsage) => NodeJS.CpuUsage;
-}
-
-/** Measures only synchronous diff computation and exact-offset mapping on the executing thread. */
-export function computeSurvivalDiff(original: string, modified: string, timeoutMs: number, clock: ISurvivalDiffClock = {
-	now: () => performance.now(),
-	cpuUsage: typeof process.threadCpuUsage === 'function' ? previous => process.threadCpuUsage(previous) : undefined,
-}): ISurvivalDiffResult {
-	let cpuMeasurementStatus: ISurvivalDiffMeasurement['cpuMeasurementStatus'] = clock.cpuUsage ? 'available' : 'unsupported';
-	let cpuMeasurementError: string | undefined;
-	const readCpu = (previous?: NodeJS.CpuUsage) => {
-		if (cpuMeasurementStatus !== 'available') {
-			return undefined;
-		}
-		try {
-			return clock.cpuUsage?.(previous);
-		} catch (error) {
-			cpuMeasurementStatus = 'failed';
-			cpuMeasurementError = error instanceof Error ? error.message : String(error);
-			return undefined;
-		}
-	};
-	const cpuBefore = readCpu();
-	const started = clock.now();
-	let outcome: Omit<Extract<ISurvivalDiffResult, { status: 'completed' }>, 'measurement'> | Omit<Extract<ISurvivalDiffResult, { status: 'failed' | 'timedOut' }>, 'measurement'>;
+/** Computes exact UTF-16 changes using hybrid line alignment and character refinement. */
+export function computeSurvivalDiff(original: string, modified: string, timeoutMs: number): ISurvivalDiffResult {
 	try {
 		if (original === modified) {
-			outcome = { status: 'completed', changes: [] };
+			return { status: 'completed', changes: [] };
 		} else {
 			const originalStarts = lineStarts(original);
 			const modifiedStarts = lineStarts(modified);
 			const result = new DefaultLinesDiffComputer().computeDiffWithRawChanges(original.split(/\r\n|\r|\n/), modified.split(/\r\n|\r|\n/), {
 				ignoreTrimWhitespace: false, computeMoves: false, maxComputationTimeMs: timeoutMs,
 			});
-			outcome = result.diff.hitTimeout
+			return result.diff.hitTimeout
 				? { status: 'timedOut', error: 'Hybrid diff timed out' }
 				: {
 					status: 'completed', changes: exactHybridChanges(original, modified, result.rawChanges.map(mapping => ({
@@ -54,16 +29,8 @@ export function computeSurvivalDiff(original: string, modified: string, timeoutM
 				};
 		}
 	} catch (error) {
-		outcome = { status: 'failed', error: error instanceof Error ? error.message : String(error) };
+		return { status: 'failed', error: error instanceof Error ? error.message : String(error) };
 	}
-	const elapsedMs = clock.now() - started;
-	const cpu = cpuBefore ? readCpu(cpuBefore) : undefined;
-	return {
-		...outcome, measurement: {
-			elapsedMs, cpuMeasurementStatus, cpuUserMs: cpu ? cpu.user / 1000 : null, cpuSystemMs: cpu ? cpu.system / 1000 : null,
-			...(cpuMeasurementError ? { cpuMeasurementError } : {}),
-		}
-	};
 }
 
 function lineStarts(text: string): number[] {

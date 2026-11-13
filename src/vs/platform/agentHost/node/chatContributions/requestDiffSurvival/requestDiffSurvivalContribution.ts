@@ -12,7 +12,7 @@ import { ILogService } from '../../../../log/common/log.js';
 import { IAgentHostCheckpointService } from '../../../common/agentHostCheckpointService.js';
 import { createChatMementoKey, type IAgentHostChatContribution, type IAgentHostChatContributionContext, type IDispatchedAction, type IOutgoingTurn, type ITurnEnd } from '../../../common/agentHostChatContributionsService.js';
 import { IAgentHostGitService } from '../../../common/agentHostGitService.js';
-import { DEFAULT_DIFF_TIMEOUT_MS, IDiffComputeService } from '../../../common/diffComputeService.js';
+import { DEFAULT_DIFF_TIMEOUT_MS, IDiffComputeService, type ISurvivalDiffResult } from '../../../common/diffComputeService.js';
 import { CLAUDE_AGENT_PROVIDER_ID, COPILOT_CLI_AGENT_PROVIDER_ID } from '../../../common/agent.js';
 import { readToolCallMeta } from '../../../common/meta/agentToolCallMeta.js';
 import { ActionType } from '../../../common/state/sessionActions.js';
@@ -20,14 +20,14 @@ import type { ISessionFileDiff, URI as ProtocolURI } from '../../../common/state
 import { AgentHostStateManager, IAgentHostStateManager } from '../../agentHostStateManager.js';
 import { computeRequestCharacterDiffSurvivalMetric, materializeRequestCharacterDiffFile, type IRequestCharacterRepositoryDiff } from './requestCharacterDiffSurvival.js';
 import { RequestDiffSurvivalBudgetError, RequestDiffSurvivalInputBudget, requestDiffSurvivalLimits } from './requestDiffSurvivalLimits.js';
-import { getRequestDiffSurvivalCostOutcome, RequestDiffSurvivalComputationError, RequestDiffSurvivalCostObservation, type IRequestDiffSurvivalFileCost, type IRequestDiffSurvivalSizeDetails, type RequestDiffSurvivalComparison, type RequestDiffSurvivalCostOutcome } from './requestDiffSurvivalCost.js';
-import { RequestDiffSurvivalDiagnostics } from './requestDiffSurvivalDiagnostics.js';
 
 const CHARACTER_DIFF_LOG_PREFIX = '[RequestCharacterDiffSurvivalObservation] ';
 const ENABLED_ENVIRONMENT_VARIABLE = 'VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG';
 
 type ExpiryReason = 'idleExpired' | 'maximumAgeExceeded';
 type UnavailableReason = 'repositoryBusy' | 'repositoryActivity' | 'captureFailed' | 'computationFailed' | 'initialObservationIncomplete' | 'observationInProgress';
+
+class RequestDiffSurvivalComputationError extends Error { }
 
 /** Couples deadline scheduling with a monotonic clock; tests override this dependency. */
 export class RequestDiffSurvivalExpiryScheduler extends RunOnceScheduler {
@@ -54,7 +54,6 @@ interface IPreparedComparison {
 		readonly beforeRef: string;
 		readonly afterRef: string;
 		readonly diff: ISessionFileDiff;
-		readonly cost: IRequestDiffSurvivalFileCost;
 		readonly input: IPreparedFileInput | Error;
 	}[];
 	readonly errors: string[];
@@ -76,7 +75,6 @@ interface IRequestDiffSurvivalTracker {
 	readonly baseEndTimestamp: string;
 	readonly originalRequestUsedEditTool: boolean | null;
 	observationCount: number;
-	cost: RequestDiffSurvivalCostObservation;
 	readonly endedAt: number;
 	lastObservationRequestId: string;
 	lastObservationModel: string | null;
@@ -94,7 +92,6 @@ interface IRequestDiffSurvivalState {
 	session?: ProtocolURI;
 	lastActivity: number;
 	isDisposed: boolean;
-	diagnosticTaskId?: number;
 }
 
 interface IRequestEditToolEvidence {
@@ -146,7 +143,6 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 	readonly order = 150;
 
 	private readonly _enabled = process.env[ENABLED_ENVIRONMENT_VARIABLE] === '1';
-	private readonly _diagnostics: RequestDiffSurvivalDiagnostics | undefined;
 	private readonly _observations = new SequencerByKey<ProtocolURI>();
 	private readonly _states = new Map<ProtocolURI, IRequestDiffSurvivalState>();
 	protected readonly _expiryScheduler = this._register(this._createExpiryScheduler(() => this._expireTrackers()));
@@ -167,7 +163,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 			}
 		}
 		for (const tracker of [...state.trackers]) {
-			this._retireTracker(state, tracker, 'stateDisposed');
+			this._retireTracker(state, tracker);
 		}
 		state.starts.clear();
 		state.requestEvidence.clear();
@@ -196,12 +192,6 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		@IDiffComputeService private readonly _diffComputeService: IDiffComputeService,
 	) {
 		super();
-		if (process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_DIAGNOSTICS === '1') {
-			this._diagnostics = this._register(new RequestDiffSurvivalDiagnostics(this._enabled ? 'worker-hybrid' : 'disabled', this._logService));
-		}
-		if (this._enabled) {
-			this._logService.info('[RequestDiffSurvival] Enabled for Agent Host chats; engine=worker-hybrid');
-		}
 	}
 
 	onOutgoingTurn(turn: IOutgoingTurn): undefined {
@@ -223,7 +213,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		}
 		const observationModel = turn.message.model?.id ?? turn.effectiveModel?.id ?? null;
 		const observationTimestamp = new Date().toISOString();
-		this._schedule(turn.session, turn.chat, state, turn.turnId, 'turnStart', async () => {
+		this._schedule(turn.chat, state, async () => {
 			const start = await this._checkpointService.getTurnStartCheckpointState(URI.parse(turn.session), URI.parse(turn.chat), turn.turnId);
 			this._assertActive(state);
 			if (!start) {
@@ -296,10 +286,9 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 			return;
 		}
 		const turnId = turn.turnId;
-		this._diagnostics?.noteEligibleTurnEnd();
 		const originalRequestUsedEditTool = this._finishEvidence(turn.channel, turnId);
 		const observationTimestamp = new Date().toISOString();
-		this._schedule(turn.session, turn.channel, state, turnId, 'turnEnd', async () => {
+		this._schedule(turn.channel, state, async () => {
 			const start = state.starts.get(turnId);
 			if (!start) {
 				return;
@@ -330,10 +319,6 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 				lastObservationModel: start.model,
 				isObserving: false,
 				isRetired: false,
-				cost: new RequestDiffSurvivalCostObservation(this._logService, {
-					sessionId: turn.session, chatId: turn.channel, originatingRequestId: turnId,
-					observationRequestId: turnId, observationIndex: 0,
-				}),
 			};
 			state.trackers.push(tracker);
 			this._expireTrackers();
@@ -371,22 +356,10 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 			|| (turn.reason.kind === 'error' && !turn.reason.resumable);
 	}
 
-	private _schedule(sessionId: ProtocolURI, chat: ProtocolURI, state: IRequestDiffSurvivalState, requestId: string, taskKind: 'turnStart' | 'turnEnd', task: () => Promise<void>): void {
-		const diagnosticTask = this._diagnostics?.enqueueTask({ sessionId, chatId: chat, requestId, taskKind });
+	private _schedule(chat: ProtocolURI, state: IRequestDiffSurvivalState, task: () => Promise<void>): void {
 		void this._observations.queue(chat, async () => {
-			diagnosticTask?.start();
-			state.diagnosticTaskId = diagnosticTask?.id;
-			let outcome: RequestDiffSurvivalCostOutcome = 'completed';
-			try {
-				this._assertActive(state);
-				await task();
-			} catch (error) {
-				outcome = getRequestDiffSurvivalCostOutcome(error);
-				throw error;
-			} finally {
-				state.diagnosticTaskId = undefined;
-				diagnosticTask?.finish(outcome);
-			}
+			this._assertActive(state);
+			await task();
 		}).catch(error => this._handleObservationError(chat, error));
 	}
 
@@ -452,18 +425,15 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 				tracker.expiryReason = reason;
 				try {
 					if (tracker.isObserving || !tracker.initialObservationReady || this._repositoryBusy(tracker.baseline)) {
-						if (!tracker.isObserving) {
-							this._prepareExpiryCost(state, chat, tracker);
-						}
 						this._writeUnavailableExpiry(state, chat, tracker, tracker.isObserving ? 'observationInProgress'
 							: !tracker.initialObservationReady ? 'initialObservationIncomplete' : 'repositoryBusy');
 					} else {
-						void this._finalizeExpiry(state, chat, tracker, reason)
-							.finally(() => this._retireTracker(state, tracker, reason))
+						void this._captureAndFinalizeExpiry(state, chat, tracker, reason)
+							.finally(() => this._retireTracker(state, tracker))
 							.catch(error => this._handleObservationError(chat, error));
 					}
 				} catch (error) {
-					this._retireTracker(state, tracker, reason);
+					this._retireTracker(state, tracker);
 					this._handleObservationError(chat, error);
 				}
 			}
@@ -492,16 +462,6 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		return false;
 	}
 
-	private _prepareExpiryCost(state: IRequestDiffSurvivalState, chat: ProtocolURI, tracker: IRequestDiffSurvivalTracker): void {
-		if (!state.session) {
-			throw new Error('Missing session for request survival expiry');
-		}
-		tracker.cost = new RequestDiffSurvivalCostObservation(this._logService, {
-			sessionId: state.session, chatId: chat, originatingRequestId: tracker.originatingRequestId,
-			observationRequestId: tracker.lastObservationRequestId, observationIndex: tracker.observationCount,
-		});
-	}
-
 	private _writeUnavailableExpiry(state: IRequestDiffSurvivalState, chat: ProtocolURI, tracker: IRequestDiffSurvivalTracker, reason: UnavailableReason): void {
 		try {
 			if (!state.session || !tracker.expiryReason) {
@@ -510,38 +470,14 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 			this._writeObservation(state.session, chat, tracker.lastObservationRequestId, tracker.lastObservationModel,
 				new Date().toISOString(), tracker, undefined, undefined, tracker.expiryReason, reason);
 		} finally {
-			if (!tracker.isObserving) {
-				tracker.cost.finishObservation('failed');
-				this._sizeEvent(tracker, { phase: 'observation', status: 'failed' });
-			}
-			this._retireTracker(state, tracker, tracker.expiryReason ?? 'failed');
+			this._retireTracker(state, tracker);
 		}
 	}
 
-	private async _finalizeExpiry(state: IRequestDiffSurvivalState, chat: ProtocolURI, tracker: IRequestDiffSurvivalTracker, reason: ExpiryReason): Promise<void> {
-		if (!state.session) {
-			throw new Error('Missing session for request survival expiry');
-		}
-		const diagnosticTask = this._diagnostics?.enqueueTask({
-			sessionId: state.session, chatId: chat, requestId: tracker.lastObservationRequestId, taskKind: 'expiry',
-		});
-		diagnosticTask?.start();
-		let outcome: RequestDiffSurvivalCostOutcome = 'completed';
-		try {
-			await this._captureAndFinalizeExpiry(state, chat, tracker, reason, diagnosticTask?.id);
-		} catch (error) {
-			outcome = getRequestDiffSurvivalCostOutcome(error);
-			throw error;
-		} finally {
-			diagnosticTask?.finish(outcome);
-		}
-	}
-
-	private async _captureAndFinalizeExpiry(state: IRequestDiffSurvivalState, chat: ProtocolURI, tracker: IRequestDiffSurvivalTracker, reason: ExpiryReason, diagnosticTaskId?: number): Promise<void> {
+	private async _captureAndFinalizeExpiry(state: IRequestDiffSurvivalState, chat: ProtocolURI, tracker: IRequestDiffSurvivalTracker, reason: ExpiryReason): Promise<void> {
 		if (tracker.isRetired) {
 			return;
 		}
-		this._prepareExpiryCost(state, chat, tracker);
 		let latest: readonly IRepositoryState[] | UnavailableReason;
 		try {
 			latest = await this._captureExpiryState(state, tracker, reason);
@@ -562,7 +498,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 			throw new Error('Missing session for request survival expiry');
 		}
 		await this._emitObservation(session, chat, tracker.lastObservationRequestId, tracker.lastObservationModel,
-			new Date().toISOString(), latest, tracker, state, reason, diagnosticTaskId);
+			new Date().toISOString(), latest, tracker, state, reason);
 	}
 
 	private async _captureExpiryState(state: IRequestDiffSurvivalState, tracker: IRequestDiffSurvivalTracker, reason: ExpiryReason): Promise<readonly IRepositoryState[] | UnavailableReason> {
@@ -588,31 +524,13 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 
 	private _retireTracker(
 		state: IRequestDiffSurvivalState, tracker: IRequestDiffSurvivalTracker,
-		reason: NonNullable<IRequestDiffSurvivalSizeDetails['reason']>,
 	): void {
 		const index = state.trackers.indexOf(tracker);
 		if (index >= 0) {
 			state.trackers.splice(index, 1);
 		}
 		tracker.isRetired = true;
-		if (index >= 0) {
-			this._sizeEvent(tracker, { phase: 'retirement', status: 'completed', reason });
-		}
 		this._scheduleExpiry();
-	}
-
-	private _sizeEvent(
-		tracker: IRequestDiffSurvivalTracker,
-		details: IRequestDiffSurvivalSizeDetails,
-	): void {
-		tracker.cost.size(details);
-	}
-
-	private _fileSizeDetails(file?: IRequestDiffSurvivalFileCost) {
-		return file ? {
-			comparisonKind: file.comparisonKind, repositoryIndex: file.repositoryIndex,
-			fileIndex: file.fileIndex, fileInputBytes: file.fileInputBytes,
-		} : {};
 	}
 
 	private async _getTurnResultState(
@@ -666,7 +584,6 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		tracker: IRequestDiffSurvivalTracker,
 		state: IRequestDiffSurvivalState,
 		expiryReason?: ExpiryReason,
-		diagnosticTaskId = state.diagnosticTaskId,
 	): Promise<void> {
 		if (tracker.isRetired || tracker.expiryReason !== expiryReason) {
 			return;
@@ -674,79 +591,62 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		tracker.lastObservationRequestId = observationRequestId;
 		tracker.lastObservationModel = observationModel;
 		tracker.isObserving = true;
-		const cost = expiryReason || tracker.observationCount === 0 ? tracker.cost : tracker.cost = new RequestDiffSurvivalCostObservation(this._logService, {
-			sessionId: session, chatId: chat, originatingRequestId: tracker.originatingRequestId,
-			observationRequestId, observationIndex: tracker.observationCount,
-		});
-		let outcome: RequestDiffSurvivalCostOutcome = 'failed';
 		let attemptedWrite = false;
-		const finishDiagnostics = this._diagnostics?.startObservation({
-			sessionId: session, chatId: chat, originatingRequestId: tracker.originatingRequestId,
-			observationRequestId, observationIndex: tracker.observationCount, observationBoundary: expiryReason ? 'expiry' : 'requestEnd',
-		}, diagnosticTaskId);
 		try {
-			const budget = cost.inputBudget;
-			const originalInput = await this._preflightDiff(session, tracker.baseline, tracker.requestResult, budget, state, tracker, 'originalRequest');
+			const budget = new RequestDiffSurvivalInputBudget();
+			const originalInput = await this._preflightDiff(session, tracker.baseline, tracker.requestResult, budget, state, tracker);
 			const baselineInput = tracker.observationCount > 0
-				? await this._preflightDiff(session, tracker.baseline, latest, budget, state, tracker, 'baselineToLatest')
+				? await this._preflightDiff(session, tracker.baseline, latest, budget, state, tracker)
 				: undefined;
 			const resultInput = tracker.observationCount > 0
-				? await this._preflightDiff(session, tracker.requestResult, latest, budget, state, tracker, 'requestResultToLatest')
+				? await this._preflightDiff(session, tracker.requestResult, latest, budget, state, tracker)
 				: undefined;
 			this._assertTrackerActive(state, tracker, expiryReason);
-			const originalRequest = await this._computeDiff(originalInput, state, tracker, 'originalRequest');
+			const originalRequest = await this._computeDiff(originalInput, state, tracker);
 			const baselineToLatest = baselineInput
-				? await this._computeDiff(baselineInput, state, tracker, 'baselineToLatest')
+				? await this._computeDiff(baselineInput, state, tracker)
 				: originalRequest;
 			const requestResultToLatest = resultInput
-				? await this._computeDiff(resultInput, state, tracker, 'requestResultToLatest')
+				? await this._computeDiff(resultInput, state, tracker)
 				: { files: [], errors: [] };
-			if (tracker.observationCount === 0) {
-				cost.finishComparison('baselineToLatest', 'reused');
-				cost.finishComparison('requestResultToLatest', 'empty');
-			}
 			this._assertTrackerActive(state, tracker, expiryReason);
-			outcome = [originalRequest, baselineToLatest, requestResultToLatest].some(diff => diff.errors.length > 0) ? 'failed' : 'completed';
+			const incomplete = [originalRequest, baselineToLatest, requestResultToLatest].some(diff => diff.errors.length > 0);
 			attemptedWrite = true;
 			this._writeObservation(session, chat, observationRequestId, observationModel, observationTimestamp, tracker, {
 				originalRequest, baselineToLatest, requestResultToLatest,
-			}, undefined, expiryReason, expiryReason && outcome === 'failed' ? 'computationFailed' : undefined);
+			}, undefined, expiryReason, expiryReason && incomplete ? 'computationFailed' : undefined);
 			tracker.initialObservationReady = true;
 			tracker.observationCount++;
 			if (expiryReason || tracker.observationCount > requestDiffSurvivalLimits.maximumFollowUpCount) {
-				this._retireTracker(state, tracker, expiryReason ?? 'horizon');
+				this._retireTracker(state, tracker);
 			}
 		} catch (error) {
-			outcome = getRequestDiffSurvivalCostOutcome(error);
 			if (isCancellationError(error) && (tracker.isRetired || tracker.expiryReason !== expiryReason)) {
 				return;
 			}
 			if (expiryReason && attemptedWrite) {
-				this._retireTracker(state, tracker, expiryReason);
+				this._retireTracker(state, tracker);
 				throw error;
 			}
 			if (error instanceof RequestDiffSurvivalBudgetError) {
 				this._assertActive(state);
 				this._writeObservation(session, chat, observationRequestId, observationModel, observationTimestamp, tracker, undefined, error, expiryReason);
-				this._retireTracker(state, tracker, 'budgetRejected');
+				this._retireTracker(state, tracker);
 			} else if (error instanceof RequestDiffSurvivalComputationError && !state.isDisposed && !tracker.isRetired) {
 				this._logService.warn(`[RequestDiffSurvival] Worker computation failed for ${chat}`, error);
 				this._writeObservation(session, chat, observationRequestId, observationModel, observationTimestamp, tracker, undefined, undefined, expiryReason, 'computationFailed');
-				this._retireTracker(state, tracker, expiryReason ?? 'failed');
+				this._retireTracker(state, tracker);
 			} else if (expiryReason && !state.isDisposed && !this._store.isDisposed) {
 				this._logService.warn(`[RequestDiffSurvival] Expiry computation failed for ${chat}`, error);
 				this._writeObservation(session, chat, observationRequestId, observationModel, observationTimestamp, tracker, undefined, undefined, expiryReason, 'computationFailed');
-				this._retireTracker(state, tracker, expiryReason);
+				this._retireTracker(state, tracker);
 			} else {
-				this._retireTracker(state, tracker, isCancellationError(error) ? 'cancelled' : 'failed');
+				this._retireTracker(state, tracker);
 				throw error;
 			}
 		} finally {
-			cost.finishObservation(outcome);
-			this._sizeEvent(tracker, { phase: 'observation', status: outcome });
 			tracker.isObserving = false;
 			this._scheduleExpiry();
-			finishDiagnostics?.(outcome);
 		}
 	}
 
@@ -809,59 +709,49 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		budget: RequestDiffSurvivalInputBudget,
 		state: IRequestDiffSurvivalState,
 		tracker: IRequestDiffSurvivalTracker,
-		comparison: RequestDiffSurvivalComparison,
 	): Promise<IPreparedComparison> {
-		const cost = tracker.cost;
 		const expiryReason = tracker.expiryReason;
 		const prepared: IPreparedComparison = { files: [], errors: [] };
-		try {
-			const afterByRepository = new Map(after.map(state => [state.repository.toString(), state.ref]));
-			for (const [repositoryIndex, beforeRepository] of before.entries()) {
-				const afterRef = afterByRepository.get(beforeRepository.repository.toString());
-				if (!afterRef) {
-					prepared.errors.push(`Missing latest state for repository ${beforeRepository.repository.toString()}`);
-					continue;
-				}
-				const diffs = await this._gitService.computeFileDiffsBetweenRefs(beforeRepository.repository, {
-					sessionUri: session,
-					fromRef: beforeRepository.ref,
-					toRef: afterRef,
-				});
-				this._assertTrackerActive(state, tracker, expiryReason);
-				if (!diffs) {
-					prepared.errors.push(`Failed to compute diff for repository ${beforeRepository.repository.toString()}`);
-					continue;
-				}
-				for (const [fileIndex, diff] of diffs.entries()) {
-					const fileCost = cost.createFile(comparison, repositoryIndex, fileIndex);
-					let input: IPreparedFileInput | Error;
-					try {
-						input = await this._preflightFileInput(beforeRepository.repository, beforeRepository.ref, afterRef, diff, budget, state, tracker, fileCost, expiryReason);
-					} catch (error) {
-						if (error instanceof RequestDiffSurvivalBudgetError || isCancellationError(error)) {
-							cost.fileNotStarted(fileCost, getRequestDiffSurvivalCostOutcome(error));
-							throw error;
-						}
-						this._assertTrackerActive(state, tracker, expiryReason);
-						input = error instanceof Error ? error : new Error(String(error));
-						this._sizeEvent(tracker, { phase: 'inputCheck', status: 'failed', ...this._fileSizeDetails(fileCost) });
-					}
-					prepared.files.push({
-						repository: beforeRepository.repository, beforeRef: beforeRepository.ref, afterRef, diff, cost: fileCost, input,
-					});
-				}
+		const afterByRepository = new Map(after.map(state => [state.repository.toString(), state.ref]));
+		for (const beforeRepository of before) {
+			const afterRef = afterByRepository.get(beforeRepository.repository.toString());
+			if (!afterRef) {
+				prepared.errors.push(`Missing latest state for repository ${beforeRepository.repository.toString()}`);
+				continue;
 			}
-			return prepared;
-		} catch (error) {
-			cost.finishComparison(comparison, getRequestDiffSurvivalCostOutcome(error));
-			throw error;
+			const diffs = await this._gitService.computeFileDiffsBetweenRefs(beforeRepository.repository, {
+				sessionUri: session,
+				fromRef: beforeRepository.ref,
+				toRef: afterRef,
+			});
+			this._assertTrackerActive(state, tracker, expiryReason);
+			if (!diffs) {
+				prepared.errors.push(`Failed to compute diff for repository ${beforeRepository.repository.toString()}`);
+				continue;
+			}
+			for (const diff of diffs) {
+				let input: IPreparedFileInput | Error;
+				try {
+					input = await this._preflightFileInput(beforeRepository.repository, beforeRepository.ref, afterRef, diff, budget, state, tracker, expiryReason);
+				} catch (error) {
+					if (error instanceof RequestDiffSurvivalBudgetError || isCancellationError(error)) {
+						throw error;
+					}
+					this._assertTrackerActive(state, tracker, expiryReason);
+					input = error instanceof Error ? error : new Error(String(error));
+				}
+				prepared.files.push({
+					repository: beforeRepository.repository, beforeRef: beforeRepository.ref, afterRef, diff, input,
+				});
+			}
 		}
+		return prepared;
 	}
 
 	private async _preflightFileInput(
 		repository: URI, beforeRef: string, afterRef: string, diff: ISessionFileDiff,
 		budget: RequestDiffSurvivalInputBudget, state: IRequestDiffSurvivalState,
-		tracker: IRequestDiffSurvivalTracker, fileCost: IRequestDiffSurvivalFileCost,
+		tracker: IRequestDiffSurvivalTracker,
 		expiryReason?: ExpiryReason,
 	): Promise<IPreparedFileInput> {
 		const beforePath = diff.before ? relativePath(repository, URI.parse(diff.before.uri)) : undefined;
@@ -877,20 +767,7 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		if (beforeSize === undefined || afterSize === undefined || !Number.isSafeInteger(beforeSize) || !Number.isSafeInteger(afterSize) || beforeSize < 0 || afterSize < 0) {
 			throw new Error('Unable to read Git blob size');
 		}
-		const fileInputBytes = beforeSize + afterSize;
-		fileCost.fileInputBytes = fileInputBytes;
-		try {
-			budget.consume(fileInputBytes);
-		} catch (error) {
-			if (error instanceof RequestDiffSurvivalBudgetError) {
-				this._sizeEvent(tracker, {
-					phase: 'budgetRejection', status: 'budgetRejected', ...this._fileSizeDetails(fileCost),
-					proposedObservationInputBytes: error.diagnostics.observationInputBytes,
-				});
-			}
-			throw error;
-		}
-		this._sizeEvent(tracker, { phase: 'inputCheck', status: 'completed', ...this._fileSizeDetails(fileCost) });
+		budget.consume(beforeSize + afterSize);
 		return { beforePath, afterPath, beforeSize, afterSize };
 	}
 
@@ -898,54 +775,32 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		prepared: IPreparedComparison,
 		state: IRequestDiffSurvivalState,
 		tracker: IRequestDiffSurvivalTracker,
-		comparison: RequestDiffSurvivalComparison,
 	): Promise<IRequestCharacterRepositoryDiff> {
-		const cost = tracker.cost;
 		const expiryReason = tracker.expiryReason;
-		cost.beginComparison(comparison);
-		let outcome: RequestDiffSurvivalCostOutcome = 'failed';
 		const files = [];
-		const errors: string[] = [];
-		try {
-			for (const error of prepared.errors) {
-				errors.push(error);
-			}
-			for (const file of prepared.files) {
-				this._assertTrackerActive(state, tracker, expiryReason);
-				const fileCost = file.cost;
-				try {
-					if (file.input instanceof Error) {
-						throw file.input;
-					}
-					files.push(await this._materializeFileDiff(file.repository, file.beforeRef, file.afterRef, file.input, state, tracker, fileCost, expiryReason));
-					this._sizeEvent(tracker, { phase: 'fileConstruction', status: 'completed', ...this._fileSizeDetails(fileCost) });
-				} catch (error) {
-					const fileOutcome = getRequestDiffSurvivalCostOutcome(error);
-					if (!fileCost.computationStarted) {
-						cost.fileNotStarted(fileCost, fileOutcome);
-					}
-					this._sizeEvent(tracker, { phase: 'fileConstruction', status: fileOutcome, ...this._fileSizeDetails(fileCost) });
-					if (error instanceof RequestDiffSurvivalBudgetError || error instanceof RequestDiffSurvivalComputationError || isCancellationError(error)) {
-						throw error;
-					}
-					this._assertTrackerActive(state, tracker, expiryReason);
-					errors.push(`Failed to materialize ${file.diff.after?.uri ?? file.diff.before?.uri ?? 'unknown file'}: ${error instanceof Error ? error.message : String(error)}`);
+		const errors = [...prepared.errors];
+		for (const file of prepared.files) {
+			this._assertTrackerActive(state, tracker, expiryReason);
+			try {
+				if (file.input instanceof Error) {
+					throw file.input;
 				}
+				files.push(await this._materializeFileDiff(file.repository, file.beforeRef, file.afterRef, file.input, state, tracker, expiryReason));
+			} catch (error) {
+				if (error instanceof RequestDiffSurvivalBudgetError || error instanceof RequestDiffSurvivalComputationError || isCancellationError(error)) {
+					throw error;
+				}
+				this._assertTrackerActive(state, tracker, expiryReason);
+				errors.push(`Failed to materialize ${file.diff.after?.uri ?? file.diff.before?.uri ?? 'unknown file'}: ${error instanceof Error ? error.message : String(error)}`);
 			}
-			outcome = errors.length > 0 ? 'failed' : 'completed';
-			return { files, errors };
-		} catch (error) {
-			outcome = getRequestDiffSurvivalCostOutcome(error);
-			throw error;
-		} finally {
-			cost.finishComparison(comparison, outcome);
 		}
+		return { files, errors };
 	}
 
 	private async _materializeFileDiff(
 		repository: URI, beforeRef: string, afterRef: string, input: IPreparedFileInput,
 		state: IRequestDiffSurvivalState, tracker: IRequestDiffSurvivalTracker,
-		fileCost: IRequestDiffSurvivalFileCost, expiryReason?: ExpiryReason,
+		expiryReason?: ExpiryReason,
 	) {
 		const { beforePath, afterPath, beforeSize, afterSize } = input;
 		const originalPath = beforePath ? `${repository.toString()}#${beforePath}` : undefined;
@@ -966,13 +821,19 @@ export class RequestDiffSurvivalContribution extends Disposable implements IAgen
 		}
 		const originalText = before?.toString() ?? '';
 		const modifiedText = after?.toString() ?? '';
-		fileCost.beforeUtf16Length = originalText.length;
-		fileCost.afterUtf16Length = modifiedText.length;
-		return tracker.cost.measureWorkerFile(fileCost,
-			() => this._diffComputeService.computeSurvivalDiff(originalText, modifiedText, DEFAULT_DIFF_TIMEOUT_MS),
-			changes => {
-				this._assertTrackerActive(state, tracker, expiryReason);
-				return materializeRequestCharacterDiffFile(originalPath, modifiedPath, originalText, modifiedText, changes);
-			});
+		let result: ISurvivalDiffResult;
+		try {
+			result = await this._diffComputeService.computeSurvivalDiff(originalText, modifiedText, DEFAULT_DIFF_TIMEOUT_MS);
+		} catch (error) {
+			if (isCancellationError(error)) {
+				throw error;
+			}
+			throw new RequestDiffSurvivalComputationError(error instanceof Error ? error.message : String(error));
+		}
+		if (result.status !== 'completed') {
+			throw new RequestDiffSurvivalComputationError(result.error);
+		}
+		this._assertTrackerActive(state, tracker, expiryReason);
+		return materializeRequestCharacterDiffFile(originalPath, modifiedPath, originalText, modifiedText, result.changes);
 	}
 }

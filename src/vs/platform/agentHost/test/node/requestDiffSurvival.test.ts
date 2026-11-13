@@ -19,12 +19,10 @@ import { ActionType, type ChatAction } from '../../common/state/sessionActions.j
 import { AgentHostStateManager } from '../../node/agentHostStateManager.js';
 import { RequestDiffSurvivalContribution, RequestDiffSurvivalExpiryScheduler } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalContribution.js';
 import { RequestDiffSurvivalBudgetError, RequestDiffSurvivalInputBudget, requestDiffSurvivalLimits } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalLimits.js';
-import { RequestDiffSurvivalCostObservation, type IRequestDiffSurvivalSizeDetails } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalCost.js';
 import { createNoopGitService as createBaseGitService } from '../common/sessionTestHelpers.js';
 import { type computeRequestCharacterDiffSurvivalMetric, type IRequestCharacterRepositoryDiff } from '../../node/chatContributions/requestDiffSurvival/requestCharacterDiffSurvival.js';
 import { InProcessDiffComputeService } from './inProcessDiffComputeService.js';
 import { computeSurvivalDiff } from '../../node/survivalDiff.js';
-import { RequestDiffSurvivalDiagnostics, type RequestDiffSurvivalDiagnosticRecord } from '../../node/chatContributions/requestDiffSurvival/requestDiffSurvivalDiagnostics.js';
 
 function createNoopGitService(): IAgentHostGitService {
 	return {
@@ -545,7 +543,7 @@ suite('Agent Host Request Diff Survival', () => {
 			survival: [-1, -1, -1, -1, -1, -1, -1], hasDiffs: false,
 		};
 
-		test('hybrid uses the service for initial and follow-up comparisons with correlated costs', async () => {
+		test('hybrid uses the service for initial and follow-up comparisons with the same timeout', async () => {
 			const f = fixture();
 			const calls = sinon.spy(f.diffService, 'computeSurvivalDiff');
 			await f.end('base');
@@ -556,6 +554,26 @@ suite('Agent Host Request Diff Survival', () => {
 			}, {
 				timeouts: Array(5).fill(5000),
 				observations: [['base', 0, true], ['base', 1, true], ['later', 0, true]],
+			});
+		});
+
+		test('only survival records remain even with the obsolete diagnostics flag enabled', async () => {
+			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_DIAGNOSTICS = '1';
+			const f = fixture([URI.file('/repo')], true);
+			assert.ok(f.clock);
+			await f.end('base');
+			await f.end('later');
+			const expired = f.log.whenExpires('later');
+			f.clock.advance(requestDiffSurvivalLimits.idleExpiryMs);
+			await expired;
+			await timeout(0);
+			f.contribution.dispose();
+			assert.deepStrictEqual({
+				prefixes: [...new Set(f.log.messages.map(message => message.slice(0, message.indexOf(']') + 1)))],
+				records: f.log.characterObservations.map(record => [record.originatingRequestId, record.observationBoundary]),
+			}, {
+				prefixes: ['[RequestCharacterDiffSurvivalObservation]'],
+				records: [['base', 'requestEnd'], ['base', 'requestEnd'], ['later', 'requestEnd'], ['base', 'expiry'], ['later', 'expiry']],
 			});
 		});
 
@@ -595,14 +613,12 @@ suite('Agent Host Request Diff Survival', () => {
 				sameOriginal: followUp.diffs!.originalRequest,
 				ready: snapshot.includes('"initialObservationReady":true'),
 				retainsDiff: /"(?:files|retainedBytes|plus|minus)"\s*:/.test(snapshot),
-				schemas: [
-					followUp, f.log.computeObservations[0], f.log.sizeObservations[0],
-				].map(record => [record.schemaVersion, record.storageStrategy]),
+				schema: [followUp.schemaVersion, followUp.storageStrategy],
 			}, {
 				resolutions: ['base-end^{tree}', 'later-end^{tree}'],
 				pairs: [['base-start', 'b-tree'], ['base-start', 'c-tree'], ['b-tree', 'c-tree'], ['later-start', 'c-tree']],
 				sameOriginal: initial, ready: true, retainsDiff: false,
-				schemas: [[6, 'checkpointIds'], [3, 'checkpointIds'], [2, 'checkpointIds']],
+				schema: [6, 'checkpointIds'],
 			});
 		});
 
@@ -621,8 +637,7 @@ suite('Agent Host Request Diff Survival', () => {
 			assert.deepStrictEqual({
 				ready: f.context.snapshot().includes('"initialObservationReady":true'),
 				trackersEmpty: f.context.snapshot().includes('"trackers":[]'),
-				retirements: f.log.sizeObservations.filter(event => event.phase === 'retirement').map(event => event.reason),
-			}, { ready: false, trackersEmpty: true, retirements: ['failed'] });
+			}, { ready: false, trackersEmpty: true });
 		});
 
 		test('unresolvable end checkpoint is explicit and does not create a tracker', async () => {
@@ -664,7 +679,6 @@ suite('Agent Host Request Diff Survival', () => {
 				} else {
 					compute.resolves({
 						status: outcome, error: 'computation failed',
-						measurement: { elapsedMs: 5, cpuMeasurementStatus: 'available', cpuUserMs: 3, cpuSystemMs: 1 },
 					});
 				}
 				await f.end('base');
@@ -674,13 +688,13 @@ suite('Agent Host Request Diff Survival', () => {
 						status: record.status, complete: record.complete, reason: record.unavailableReason, final: record.isFinalObservation,
 						survival: Object.values(record.survival), hasDiffs: Object.hasOwn(record, 'diffs'),
 					})),
-					retired: f.log.sizeObservations.filter(event => event.phase === 'retirement').length,
+					retired: f.context.snapshot().includes('"trackers":[]'),
 				}, {
 					observations: [{
 						status: 'unavailable', complete: false, reason: 'computationFailed', final: true,
 						survival: [-1, -1, -1, -1, -1, -1, -1], hasDiffs: false,
 					}],
-					retired: 2,
+					retired: true,
 				});
 			});
 		}
@@ -694,16 +708,15 @@ suite('Agent Host Request Diff Survival', () => {
 				await finish.p;
 				return computeSurvivalDiff(before, after, timeoutMs ?? 5000);
 			});
-			const ended = f.log.whenComputeEnds('base');
 			f.begin('base');
 			await dispatched.p;
 			f.context.evict('chat');
 			await finish.complete();
-			await ended;
+			await timeout(0);
 			assert.deepStrictEqual({
 				observations: f.log.characterObservations.length,
-				retired: f.log.sizeObservations.filter(event => event.phase === 'retirement').length,
-			}, { observations: 0, retired: 1 });
+				state: f.context.snapshot(),
+			}, { observations: 0, state: '[]' });
 		});
 
 		suite('tracker lifetime', () => {
@@ -728,24 +741,6 @@ suite('Agent Host Request Diff Survival', () => {
 				};
 			}
 
-			test('diagnostics include expiry capture tasks and correlate their terminal observations', async () => {
-				process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_DIAGNOSTICS = '1';
-				const f = lifetimeFixture();
-				const ended = f.log.whenDiagnosticTaskEnds('base');
-				await f.end('base');
-				await ended;
-				const expired = f.log.whenDiagnosticTaskEnds('base', 'expiry');
-				f.clock.advance(requestDiffSurvivalLimits.idleExpiryMs);
-				await expired;
-				const task = f.log.diagnostics.filter(record => record.phase === 'task').find(record => record.taskKind === 'expiry');
-				const observation = f.log.diagnostics.find(record => record.phase === 'observation' && record.observationBoundary === 'expiry');
-				assert.deepStrictEqual({
-					task: task?.phase === 'task' ? task.taskKind : undefined,
-					observation: observation?.phase === 'observation' ? [observation.originatingRequestId, observation.observationIndex, observation.status, observation.taskId === task?.taskId] : undefined,
-					captures: f.capture.callCount,
-				}, { task: 'expiry', observation: ['base', 1, 'completed', true], captures: 1 });
-			});
-
 			test('uses centralized production durations and expires at the exact idle deadline without another request', async () => {
 				const f = lifetimeFixture();
 				await f.end('base');
@@ -762,14 +757,14 @@ suite('Agent Host Request Diff Survival', () => {
 				assert.deepStrictEqual({
 					record: expiryShape(record), captures: f.capture.callCount,
 					refs: comparisonRefs.map(ref => [ref.fromRef, ref.toRef]),
-					retirements: f.log.sizeObservations.filter(record => record.reason === 'idleExpired').map(record => record.observationIndex),
+					retired: !f.context.snapshot().includes('"originatingRequestId":"base"'),
 				}, {
 					record: {
 						index: 1, request: 'base', boundary: 'expiry', final: true, status: 'measured',
 						reason: 'idleExpired', unavailable: undefined, complete: true, ratio: 1
 					},
 					captures: 1, refs: [['base-start', 'base-end'], ['base-start', 'expiry-tree'], ['base-end', 'expiry-tree']],
-					retirements: [1],
+					retired: true,
 				});
 				f.clock.advance(requestDiffSurvivalLimits.maximumTrackerAgeMs);
 				await f.end('later');
@@ -852,8 +847,8 @@ suite('Agent Host Request Diff Survival', () => {
 				await warning.p;
 				assert.deepStrictEqual({
 					attempts: info.getCalls().filter(call => call.args[0].startsWith('[RequestCharacterDiffSurvivalObservation] ')).length,
-					retirements: f.log.sizeObservations.filter(event => event.phase === 'retirement').length, scheduled: f.clock.isScheduled(),
-				}, { attempts: 1, retirements: 1, scheduled: false });
+					retired: !f.context.snapshot().includes('"originatingRequestId":"base"'), scheduled: f.clock.isScheduled(),
+				}, { attempts: 1, retired: true, scheduled: false });
 			});
 
 			test('maximum age wins over idle expiry when both are overdue', async () => {
@@ -924,10 +919,10 @@ suite('Agent Host Request Diff Survival', () => {
 						status: f.log.characterObservations[1].status, unavailable: f.log.characterObservations[1].unavailableReason,
 						survival: Object.values(f.log.characterObservations[1].survival),
 						diffs: f.log.characterObservations[1].diffs,
-						retired: f.log.sizeObservations.at(-1)?.phase, scheduled: f.clock.isScheduled(),
+						retired: !f.context.snapshot().includes('"originatingRequestId":"base"'), scheduled: f.clock.isScheduled(),
 					}, {
 						status: 'unavailable', unavailable: 'captureFailed', survival: [-1, -1, -1, -1, -1, -1, -1],
-						diffs: undefined, retired: 'retirement', scheduled: false
+						diffs: undefined, retired: true, scheduled: false
 					});
 				});
 			}
@@ -1015,8 +1010,8 @@ suite('Agent Host Request Diff Survival', () => {
 				assert.deepStrictEqual({
 					records: f.log.characterObservations.filter(record => record.originatingRequestId === 'base').map(record => record.observationBoundary),
 					unavailable: f.log.characterObservations[1].unavailableReason,
-					releases: f.log.sizeObservations.filter(record => record.originatingRequestId === 'base' && record.phase === 'retirement').length,
-				}, { records: ['requestEnd', 'expiry'], unavailable: 'observationInProgress', releases: 1 });
+					retired: !f.context.snapshot().includes('"originatingRequestId":"base"'),
+				}, { records: ['requestEnd', 'expiry'], unavailable: 'observationInProgress', retired: true });
 			});
 
 			test('the ordinary ten-follow-up horizon cancels expiry for that origin', async () => {
@@ -1053,8 +1048,8 @@ suite('Agent Host Request Diff Survival', () => {
 					await timeout(0);
 					assert.deepStrictEqual({
 						records: f.log.characterObservations.length, captures: f.capture.callCount,
-						scheduled: f.clock.isScheduled(), retired: f.log.sizeObservations.at(-1)?.phase,
-					}, { records: 1, captures: disposal === 'capturing' ? 1 : 0, scheduled: false, retired: 'retirement' });
+						scheduled: f.clock.isScheduled(), retired: !f.context.snapshot().includes('"originatingRequestId":"base"'),
+					}, { records: 1, captures: disposal === 'capturing' ? 1 : 0, scheduled: false, retired: true });
 				});
 			}
 		});
@@ -1200,13 +1195,9 @@ suite('Agent Host Request Diff Survival', () => {
 				record: terminalShape(f.log.characterObservations[0]), reads: f.git.showBlob.callCount,
 				diagnostics: f.log.characterObservations[0].budgetDiagnostics,
 				computations: computation.callCount,
-				summary: f.log.computeObservations.filter(event => event.phase === 'observation').map(event => ({
-					status: event.status, started: event.startedFileCount, cpu: event.cpuTotalMs, cpuStatus: event.cpuMeasurementStatus,
-				})),
 			}, {
 				record: { ...terminal, flags: [0, 1] }, reads: 0, computations: 0,
 				diagnostics: { fileInputBytes: 2, observationInputBytes: 6 },
-				summary: [{ status: 'budgetRejected', started: 0, cpu: null, cpuStatus: 'notStarted' }],
 			});
 		});
 
@@ -1236,8 +1227,7 @@ suite('Agent Host Request Diff Survival', () => {
 			assert.deepStrictEqual({
 				terminal: terminalShape(f.log.characterObservations[0]),
 				reads: f.git.showBlob.callCount, computations: computation.callCount,
-				phases: [...new Set(f.log.sizeObservations.map(event => event.phase))],
-			}, { terminal: { ...terminal, flags: [1, 0] }, reads: 0, computations: 0, phases: ['inputCheck', 'budgetRejection', 'retirement', 'observation'] });
+			}, { terminal: { ...terminal, flags: [1, 0] }, reads: 0, computations: 0 });
 		});
 
 		test('the live-run 272-file accepted prefix rejects on size metadata with no character work', async () => {
@@ -1255,13 +1245,10 @@ suite('Agent Host Request Diff Survival', () => {
 				terminal: terminalShape(f.log.characterObservations[0]),
 				diagnostics: f.log.characterObservations[0].budgetDiagnostics,
 				reads: f.git.showBlob.callCount, computations: computation.callCount,
-				input: f.log.sizeObservations.filter(event => event.phase === 'budgetRejection').map(event => ({
-					accepted: event.observationInputBytes, proposed: event.proposedObservationInputBytes,
-				})),
 			}, {
 				terminal: { ...terminal, flags: [0, 1] },
 				diagnostics: { fileInputBytes: 518_545, observationInputBytes: 4_607_472 },
-				reads: 0, computations: 0, input: [{ accepted: 4_088_927, proposed: 4_607_472 }],
+				reads: 0, computations: 0,
 			});
 		});
 
@@ -1274,19 +1261,13 @@ suite('Agent Host Request Diff Survival', () => {
 			const ended = f.log.whenRequestEnds('later');
 			f.begin('later');
 			await ended;
-			const rejected = f.log.computeObservations.find(event =>
-				event.originatingRequestId === 'base' && event.observationIndex === 1 && event.phase === 'observation');
 			assert.deepStrictEqual({
-				rejected: { status: rejected?.status, calls: rejected?.startedFileCount, cpu: rejected?.cpuTotalMs },
 				terminal: terminalShape(f.log.characterObservations[1]),
 				reads: f.git.showBlob.callCount, computations: computation.callCount,
-				roles: f.log.sizeObservations.filter(event =>
-					event.originatingRequestId === 'base' && event.observationIndex === 1 && event.phase === 'budgetRejection')
-					.map(event => event.comparisonKind),
+				rejectedInput: f.log.characterObservations[1].budgetDiagnostics,
 			}, {
-				rejected: { status: 'budgetRejected', calls: 0, cpu: null },
 				terminal: { ...terminal, flags: [0, 1] },
-				reads: 1, computations: 1, roles: ['requestResultToLatest'],
+				reads: 1, computations: 1, rejectedInput: { fileInputBytes: 2, observationInputBytes: 6 },
 			});
 		});
 
@@ -1303,99 +1284,9 @@ suite('Agent Host Request Diff Survival', () => {
 			const record = f.log.characterObservations.find(record => record.originatingRequestId === 'base' && record.observationIndex === 1)!;
 			assert.deepStrictEqual({
 				status: record.status, complete: record.complete, order,
-				input: f.log.sizeObservations.filter(event =>
-					event.originatingRequestId === 'base' && event.observationIndex === 1 && event.phase === 'observation')
-					.map(event => event.observationInputBytes),
 			}, {
-				status: 'measured', complete: true, order: ['size', 'size', 'size', 'blob', 'blob', 'blob', 'size', 'blob'], input: [6],
+				status: 'measured', complete: true, order: ['size', 'size', 'size', 'blob', 'blob', 'blob', 'size', 'blob'],
 			});
-		});
-
-		test('separate compute events reuse survival identity and aggregate three follow-up comparisons', async () => {
-			const f = fixture();
-			await f.end('base');
-			await f.end('later');
-			const files = f.log.computeObservations.filter(event => event.phase === 'file');
-			const followUp = f.log.computeObservations.find(event => event.originatingRequestId === 'base' && event.observationIndex === 1 && event.phase === 'observation')!;
-			assert.deepStrictEqual({
-				files: files.map(event => ({
-					base: event.originatingRequestId, request: event.observationRequestId, index: event.observationIndex,
-					comparison: event.comparisonKind, repository: event.repositoryIndex, file: event.fileIndex,
-				})),
-				followUpCount: followUp.startedFileCount,
-				aggregateMatches: followUp.elapsedMs === files.filter(event => event.originatingRequestId === 'base' && event.observationIndex === 1).reduce((sum, event) => sum + event.elapsedMs!, 0),
-				cpuStatuses: [...new Set(files.map(event => event.cpuMeasurementStatus))],
-				reuse: f.log.computeObservations.filter(event => event.originatingRequestId === 'base' && event.phase === 'comparison' && event.status === 'reused').map(event => ({
-					comparison: event.comparisonKind, index: event.observationIndex, elapsed: event.elapsedMs, cpu: event.cpuTotalMs,
-				})),
-			}, {
-				files: [
-					{ base: 'base', request: 'base', index: 0, comparison: 'originalRequest', repository: 0, file: 0 },
-					{ base: 'base', request: 'later', index: 1, comparison: 'originalRequest', repository: 0, file: 0 },
-					{ base: 'base', request: 'later', index: 1, comparison: 'baselineToLatest', repository: 0, file: 0 },
-					{ base: 'base', request: 'later', index: 1, comparison: 'requestResultToLatest', repository: 0, file: 0 },
-					{ base: 'later', request: 'later', index: 0, comparison: 'originalRequest', repository: 0, file: 0 },
-				],
-				followUpCount: 3, aggregateMatches: true,
-				cpuStatuses: [typeof process.threadCpuUsage === 'function' ? 'available' : 'unsupported'],
-				reuse: [
-					{ comparison: 'baselineToLatest', index: 0, elapsed: null, cpu: null },
-				],
-			});
-		});
-
-		test('size events distinguish accepted from rejected input and retain the originating index', async () => {
-			sinon.stub(requestDiffSurvivalLimits, 'maximumObservationInputBytes').value(3);
-			const f = fixture();
-			await f.end('base');
-			await f.end('later');
-			const rejected = f.log.sizeObservations.find(event => event.originatingRequestId === 'base' && event.phase === 'budgetRejection')!;
-			const notStarted = f.log.computeObservations.find(event => event.originatingRequestId === 'base' && event.observationIndex === 1 && event.phase === 'file' && !event.computationStarted)!;
-			assert.deepStrictEqual({
-				rejected: {
-					base: rejected.originatingRequestId, request: rejected.observationRequestId, index: rejected.observationIndex,
-					fileBytes: rejected.fileInputBytes, accepted: rejected.observationInputBytes, proposed: rejected.proposedObservationInputBytes,
-				},
-				compute: { status: notStarted.status, elapsed: notStarted.elapsedMs, cpu: notStarted.cpuTotalMs },
-				retirement: f.log.sizeObservations.filter(event => event.originatingRequestId === 'base' && event.phase === 'retirement').map(event => ({
-					index: event.observationIndex, reason: event.reason,
-				})),
-			}, {
-				rejected: { base: 'base', request: 'later', index: 1, fileBytes: 2, accepted: 2, proposed: 4 },
-				compute: { status: 'budgetRejected', elapsed: null, cpu: null },
-				retirement: [{ index: 1, reason: 'budgetRejected' }],
-			});
-		});
-
-		test('eviction logs retirement once using the last associated request/index', async () => {
-			const f = fixture();
-			await f.end('one', 'one-chat');
-			await f.end('two', 'two-chat');
-			f.context.evict('one-chat');
-			f.context.evict('two-chat');
-			f.context.evict('two-chat');
-			assert.deepStrictEqual({
-				retirements: f.log.sizeObservations.filter(event => event.phase === 'retirement').map(event => ({
-					base: event.originatingRequestId, index: event.observationIndex, reason: event.reason,
-				})),
-			}, {
-				retirements: [
-					{ base: 'one', index: 0, reason: 'stateDisposed' },
-					{ base: 'two', index: 0, reason: 'stateDisposed' },
-				],
-			});
-		});
-
-		test('missing metadata remains unavailable without retained-state accounting', async () => {
-			const f = fixture();
-			f.git.getBlobSize.resolves(undefined);
-			await f.end('missing');
-			const missing = f.log.sizeObservations.find(event => event.phase === 'inputCheck')!;
-			assert.deepStrictEqual({
-				input: missing.fileInputBytes, accepted: missing.observationInputBytes, status: missing.status,
-				compute: f.log.computeObservations.find(event => event.phase === 'file')?.computationStarted,
-				phases: [...new Set(f.log.sizeObservations.map(event => event.phase))],
-			}, { input: null, accepted: 0, status: 'failed', compute: false, phases: ['inputCheck', 'fileConstruction', 'observation'] });
 		});
 
 		test('failed blob loading records an explicit error and eviction retires the tracker', async () => {
@@ -1404,105 +1295,22 @@ suite('Agent Host Request Diff Survival', () => {
 			await f.end('failed');
 			f.context.evict('chat');
 			assert.deepStrictEqual({
-				fileStatus: f.log.computeObservations.find(event => event.phase === 'file')?.status,
+				complete: f.log.characterObservations[0].complete,
 				errors: f.log.characterObservations[0].diffs?.originalRequest.errors,
-				retirements: f.log.sizeObservations.filter(event => event.phase === 'retirement').map(event => event.reason),
-			}, { fileStatus: 'failed', errors: ['Failed to materialize file:///repo/file: blob failed'], retirements: ['stateDisposed'] });
+				retired: !f.context.snapshot().includes('"originatingRequestId":"failed"'),
+			}, { complete: false, errors: ['Failed to materialize file:///repo/file: blob failed'], retired: true });
 		});
 
-		test('diagnostics work with survival disabled and never capture checkpoints or compute diffs', async () => {
+		test('disabled experiment emits no observations and does no extra work even with the obsolete diagnostics flag', async () => {
 			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG = '0';
 			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_DIAGNOSTICS = '1';
-			const f = fixture();
-			const checkpoint = sinon.spy(f.checkpoint, 'getTurnStartCheckpointState');
-			f.begin('disabled');
-			f.contribution.dispose();
-			assert.deepStrictEqual({
-				phases: f.log.diagnostics.map(record => [record.phase, record.engine]),
-				checkpoints: checkpoint.callCount, gitCalls: f.git.computeFileDiffsBetweenRefs.callCount,
-				survival: f.log.characterObservations.length,
-			}, {
-				phases: [['lifecycle', 'disabled'], ['window', 'disabled'], ['lifecycle', 'disabled']],
-				checkpoints: 0, gitCalls: 0, survival: 0,
-			});
-		});
-
-		test('diagnostics correlate each observation with its queued turn-end batch', async () => {
-			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_DIAGNOSTICS = '1';
-			const f = fixture();
-			const first = f.log.whenDiagnosticTaskEnds('base');
-			await f.end('base');
-			await first;
-			const next = f.log.whenDiagnosticTaskEnds('later');
-			await f.end('later');
-			await next;
-			const tasks = f.log.diagnostics.filter(record => record.phase === 'task').filter(record => record.status === 'completed');
-			const observations = f.log.diagnostics.filter(record => record.phase === 'observation');
-			const drains = f.log.diagnostics.filter(record => record.phase === 'drain');
-			assert.deepStrictEqual({
-				tasks: tasks.map(record => [record.requestId, record.taskKind]),
-				observations: observations.map(record => [record.originatingRequestId, record.observationRequestId, record.observationIndex, record.status]),
-				joined: observations.every(record => tasks.some(task => task.taskId === record.taskId && task.taskKind === 'turnEnd' && task.requestId === record.observationRequestId)),
-				lastDrain: drains.at(-1)?.pendingTaskCount,
-				engines: [...new Set(f.log.diagnostics.map(record => record.engine))],
-			}, {
-				tasks: [['base', 'turnStart'], ['base', 'turnEnd'], ['later', 'turnStart'], ['later', 'turnEnd']],
-				observations: [['base', 'base', 0, 'completed'], ['base', 'later', 1, 'completed'], ['later', 'later', 0, 'completed']],
-				joined: true, lastDrain: 0, engines: ['worker-hybrid'],
-			});
-		});
-
-		test('diagnostics distinguish budget-rejected observations from completed orchestration tasks', async () => {
-			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_DIAGNOSTICS = '1';
-			sinon.stub(requestDiffSurvivalLimits, 'maximumObservationInputBytes').value(1);
-			const f = fixture();
-			const ended = f.log.whenDiagnosticTaskEnds('rejected');
-			await f.end('rejected');
-			await ended;
-			assert.deepStrictEqual({
-				observations: f.log.diagnostics.filter(record => record.phase === 'observation').map(record => record.status),
-				tasks: f.log.diagnostics.filter(record => record.phase === 'task').filter(record => record.status !== 'queued' && record.status !== 'started').map(record => record.status),
-			}, { observations: ['budgetRejected'], tasks: ['completed', 'completed'] });
-		});
-
-		test('diagnostics settle cancelled queued work after chat eviction without reviving tracking', async () => {
-			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_DIAGNOSTICS = '1';
-			const f = fixture();
-			const entered = new DeferredPromise<void>();
-			const release = new DeferredPromise<void>();
-			f.checkpoint.getTurnStartCheckpointState = async () => {
-				entered.complete();
-				await release.p;
-				return [{ repository: URI.file('/repo'), tree: 'before' }];
-			};
-			const ended = f.log.whenDiagnosticTaskEnds('evicted');
-			f.begin('evicted');
-			await entered.p;
-			f.context.evict('chat');
-			release.complete();
-			await ended;
-			assert.deepStrictEqual({
-				statuses: f.log.diagnostics.filter(record => record.phase === 'task').filter(record => record.status === 'cancelled').map(record => record.taskKind),
-				observations: f.log.characterObservations.length,
-				drained: f.log.diagnostics.some(record => record.phase === 'drain'),
-			}, { statuses: ['turnStart', 'turnEnd'], observations: 0, drained: true });
-		});
-
-		test('without diagnostic opt-in there are no diagnostic events', async () => {
-			const f = fixture();
-			await f.end('base');
-			assert.deepStrictEqual(f.log.diagnostics, []);
-		});
-
-		test('disabled experiment emits no compute or size events and does no extra work', async () => {
-			process.env.VSCODE_AGENT_HOST_REQUEST_DIFF_SURVIVAL_LOG = '0';
 			const f = fixture();
 			f.begin('disabled');
 			await timeout(0);
 			assert.deepStrictEqual({
-				survival: f.log.characterObservations, compute: f.log.computeObservations, sizes: f.log.sizeObservations,
+				messages: f.log.messages,
 				gitCalls: f.git.computeFileDiffsBetweenRefs.callCount,
-			}, { survival: [], compute: [], sizes: [], gitCalls: 0 });
+			}, { messages: [], gitCalls: 0 });
 		});
 
 		test('retires at the follow-up horizon before admitting the next origin', async () => {
@@ -1613,54 +1421,11 @@ interface IRecordedCharacterObservation extends IRecordedObservation {
 	};
 }
 
-interface IRecordedComputeObservation {
-	readonly schemaVersion: number;
-	readonly storageStrategy: string;
-	readonly originatingRequestId: string;
-	readonly observationRequestId: string;
-	readonly observationIndex: number;
-	readonly phase: string;
-	readonly status: string;
-	readonly comparisonKind?: string;
-	readonly repositoryIndex?: number;
-	readonly fileIndex?: number;
-	readonly computationStarted?: boolean;
-	readonly startedFileCount: number;
-	readonly elapsedMs: number | null;
-	readonly cpuMeasurementStatus: string;
-	readonly cpuTotalMs: number | null;
-}
-
-interface IRecordedSizeObservation extends IRequestDiffSurvivalSizeDetails {
-	readonly schemaVersion: number;
-	readonly storageStrategy: string;
-	readonly originatingRequestId: string;
-	readonly observationRequestId: string;
-	readonly observationIndex: number;
-	readonly observationInputBytes: number;
-}
-
 class RecordingObservationLogService extends NullLogService {
-	readonly diagnostics: RequestDiffSurvivalDiagnosticRecord[] = [];
+	readonly messages: string[] = [];
 	readonly characterObservations: IRecordedCharacterObservation[] = [];
-	readonly computeObservations: IRecordedComputeObservation[] = [];
-	readonly sizeObservations: IRecordedSizeObservation[] = [];
 	private readonly _requestEnds = new Map<string, DeferredPromise<void>>();
 	private readonly _expiries = new Map<string, DeferredPromise<void>>();
-	private readonly _computeEnds = new Map<string, DeferredPromise<void>>();
-	private readonly _diagnosticTaskEnds = new Map<string, DeferredPromise<void>>();
-
-	whenDiagnosticTaskEnds(requestId: string, taskKind = 'turnEnd'): Promise<void> {
-		const ended = new DeferredPromise<void>();
-		this._diagnosticTaskEnds.set(`${taskKind}:${requestId}`, ended);
-		return ended.p;
-	}
-
-	whenComputeEnds(requestId: string): Promise<void> {
-		const ended = new DeferredPromise<void>();
-		this._computeEnds.set(requestId, ended);
-		return ended.p;
-	}
 
 	whenExpires(requestId: string): Promise<void> {
 		const expired = new DeferredPromise<void>();
@@ -1675,29 +1440,7 @@ class RecordingObservationLogService extends NullLogService {
 	}
 
 	override info(message: string): void {
-		if (message.startsWith(RequestDiffSurvivalDiagnostics.logPrefix)) {
-			const record: RequestDiffSurvivalDiagnosticRecord = JSON.parse(message.slice(RequestDiffSurvivalDiagnostics.logPrefix.length));
-			this.diagnostics.push(record);
-			if (record.phase === 'task' && record.status !== 'queued' && record.status !== 'started') {
-				const key = `${record.taskKind}:${record.requestId}`;
-				this._diagnosticTaskEnds.get(key)?.complete();
-				this._diagnosticTaskEnds.delete(key);
-			}
-			return;
-		}
-		if (message.startsWith(RequestDiffSurvivalCostObservation.computeLogPrefix)) {
-			const observation: IRecordedComputeObservation = JSON.parse(message.slice(RequestDiffSurvivalCostObservation.computeLogPrefix.length));
-			this.computeObservations.push(observation);
-			if (observation.phase === 'observation') {
-				this._computeEnds.get(observation.originatingRequestId)?.complete();
-				this._computeEnds.delete(observation.originatingRequestId);
-			}
-			return;
-		}
-		if (message.startsWith(RequestDiffSurvivalCostObservation.sizeLogPrefix)) {
-			this.sizeObservations.push(JSON.parse(message.slice(RequestDiffSurvivalCostObservation.sizeLogPrefix.length)));
-			return;
-		}
+		this.messages.push(message);
 		const prefix = '[RequestCharacterDiffSurvivalObservation] ';
 		if (!message.startsWith(prefix)) {
 			return;
@@ -1763,7 +1506,7 @@ class TestContributionContext implements IAgentHostChatContributionContext {
 	private readonly _cleanups = new Map<string, { resource: ProtocolURI; dispose: () => void }>();
 
 	snapshot(): string {
-		return JSON.stringify([...this._values.values()].map(value => value.get()), (key, value) => key === '_logService' ? undefined : value);
+		return JSON.stringify([...this._values.values()].map(value => value.get()));
 	}
 
 	memento<T, TExtra extends readonly MementoSegment[]>(
