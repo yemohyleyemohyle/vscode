@@ -576,6 +576,7 @@ function createConfigurationService(enabled: boolean, disposables: DisposableSto
 	const rootConfigChange = disposables.add(new Emitter<void>());
 	return {
 		_serviceBrand: undefined,
+		copilotM365EnabledAtStartup: false,
 		onDidRootConfigChange: rootConfigChange.event,
 		onDidSessionConfigChange: Event.None,
 		onDidChatConfigChange: Event.None,
@@ -594,6 +595,8 @@ function createConfigurationService(enabled: boolean, disposables: DisposableSto
 		getSessionConfigValues: () => undefined,
 		resolveConfigurationOwner: session => session,
 		getSessionSandboxPolicy: () => undefined,
+		getSessionSandboxPaths: () => undefined,
+		setSessionSandboxPaths: () => { },
 		getSessionSandboxEnabled: () => undefined,
 		setSessionSandboxPolicy: () => { },
 		getChatSandboxEnabled: () => undefined,
